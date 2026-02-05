@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+import sys
+import sqlite3
+import argparse
+
+def main():
+    parser = argparse.ArgumentParser(description='SQLite merge driver')
+    parser.add_argument('base', metavar='%O', help='Base file')
+    parser.add_argument('ours', metavar='%A', help='Ours file')
+    parser.add_argument('theirs', metavar='%B', help='Theirs file')
+    parser.add_argument('conflict_marker_size', metavar='%L', type=int, help='Conflict marker size')
+    parser.add_argument('pathname', metavar='%P', help='Pathname of file being merged')
+    args = parser.parse_args()
+
+    
+    
+    # TODO: Implement merge logic
+    
+    # Exit code: 0 = success, 1 = unresolved conflicts
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()

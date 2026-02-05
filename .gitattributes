@@ -1,0 +1,2 @@
+*.db merge=sqlite
+*.sqlite merge=sqlite
