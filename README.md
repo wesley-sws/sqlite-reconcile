@@ -20,6 +20,8 @@ cd sqlite-reconcile
 ./setup.sh
 ```
 
+If your system package manager installs `sqlite3` but not `sqldiff`, `setup.sh` automatically builds a local fallback at `tools/bin/sqldiff`. No shell profile (`.zshrc`) update is required for the merge driver.
+
 Requirements:
 - Python 3.10 or higher
 - SQLite 3.x
