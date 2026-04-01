@@ -77,6 +77,12 @@ def get_key_values_and_column_to_literal(
     assert all(v is not None for v in primary_values)
     return tuple(primary_values), column_to_literal # type: ignore
 
+def add_to_res_match(res_match, build_with_base_to_ours, lookup_list_i, table_list_i):
+    res_match.append(table_list_i if build_with_base_to_ours else lookup_list_i)
+
+def add_to_conflict_stmts(confict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
+    confict_stmts.append((table_list_i, lookup_list_i) if build_with_base_to_ours else (lookup_list_i, table_list_i))
+
 def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
         base_to_theirs_parsed: list[Expression],
@@ -104,7 +110,12 @@ def check_conflict_and_return_final_diff(
         ] = defaultdict(dict)
     # build hashed table
     table_name_to_key_column_to_index = defaultdict(dict)
-    for i, expr in enumerate(base_to_ours_parsed):
+    to_build, to_lookup = base_to_ours_parsed, base_to_theirs_parsed
+    build_with_base_to_ours = True
+    if len(base_to_theirs_parsed) < len(base_to_ours_parsed):
+        to_build, to_lookup = to_lookup, to_build
+        build_with_base_to_ours = False
+    for i, expr in enumerate(to_build):
         table = expr.find(expressions.Table)
         assert table is not None
         key_values_to_data = table_name_to_key_value_to_data[table.name]
@@ -133,12 +144,14 @@ def check_conflict_and_return_final_diff(
     extra_stmts_base_to_ours = []
     extra_stmts_base_to_theirs = []
     conflict_stmts_pair = [] # (base_to_ours index, base_to_theirs index)
-    for i, expr in enumerate(base_to_theirs_parsed):
+    list_to_add_for_failed_lookup = extra_stmts_base_to_theirs \
+        if build_with_base_to_ours \
+        else extra_stmts_base_to_ours
+    for i, expr in enumerate(to_lookup):
         table = expr.find(expressions.Table)
         assert table is not None
         if table.name not in table_name_to_key_column_to_index:
-            # no stmts from base_to_ours on this table
-            extra_stmts_base_to_theirs.append(i)
+            list_to_add_for_failed_lookup.append(i)
             continue
         key_column_to_index = table_name_to_key_column_to_index[table.name]
         key_values_to_data = table_name_to_key_value_to_data[table.name]
@@ -149,13 +162,13 @@ def check_conflict_and_return_final_diff(
         if isinstance(expr, expressions.Delete):
             assert key_values is not None
             if key_values not in key_values_to_data:
-                extra_stmts_base_to_theirs.append(i)
+                list_to_add_for_failed_lookup.append(i)
             else:
                 i2, t, column_to_literal = key_values_to_data[key_values]
                 if t is expressions.Delete:
-                    res_match.append(i2)
+                    add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
-                    conflict_stmts_pair.append((i2, i))
+                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
 
         elif isinstance(expr, expressions.Insert):
@@ -163,35 +176,38 @@ def check_conflict_and_return_final_diff(
                 primary_values_tuple, curr_column_to_literal = \
                     get_key_values_and_column_to_literal(row, expr.this, key_column_to_index)
                 if primary_values_tuple not in key_values_to_data:
-                    extra_stmts_base_to_theirs.append(i)
+                    list_to_add_for_failed_lookup.append(i)
                 else:
                     i2, t, column_to_literal = key_values_to_data[primary_values_tuple]
                     assert t is expressions.Insert
                     if column_to_literal == curr_column_to_literal:
-                        res_match.append(i2)
+                        add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        conflict_stmts_pair.append((i2, i))
+                        add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                     key_values_to_data.pop(primary_values_tuple)
         elif isinstance(expr, expressions.Update):
             assert key_values is not None
             if key_values not in key_values_to_data:
-                extra_stmts_base_to_theirs.append(i)
+                list_to_add_for_failed_lookup.append(i)
             else:
                 i2, t, column_to_literal = key_values_to_data[key_values]
                 if t is expressions.Delete:
-                    res_match.append(i2)
+                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
                     curr_column_to_literal = {}
                     assert key_values is not None
                     for e in expr.args.get("expressions") or []:
                         curr_column_to_literal[e.this.name] = e.expression
                     if curr_column_to_literal == column_to_literal:
-                        res_match.append(i2)
+                        add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        conflict_stmts_pair.append((i2, i))
+                        add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
+    list_to_add_for_remaining_table_entries = extra_stmts_base_to_ours \
+        if build_with_base_to_ours \
+        else extra_stmts_base_to_theirs
     for key_value_to_data in table_name_to_key_value_to_data.values():
-        extra_stmts_base_to_ours.extend(data[0] for data in key_value_to_data.values())
+        list_to_add_for_remaining_table_entries.extend(data[0] for data in key_value_to_data.values())
     return DiffBuckets(res_match, extra_stmts_base_to_ours, extra_stmts_base_to_theirs, conflict_stmts_pair)
 
 def main():
