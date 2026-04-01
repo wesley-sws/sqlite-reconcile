@@ -253,8 +253,8 @@ pip install -q -r "$REPO_ROOT/requirements.txt"
 chmod +x "$REPO_ROOT/src/sqlite-reconcile"
 
 # Configure git merge driver for this repository (for testing/development)
-git config merge.sqlite.name "SQLite merge driver" # --global for driver to work across all repos
-git config merge.sqlite.driver "env PATH=$REPO_ROOT/tools/bin:$PATH $REPO_ROOT/venv/bin/python $REPO_ROOT/src/sqlite-reconcile %O %A %B %L %P"
+git config merge.sqlite-reconcile.name "SQLite merge driver" # --global for driver to work across all repos
+git config merge.sqlite-reconcile.driver "PATH=\"$REPO_ROOT/tools/bin:\$PATH\" \"$REPO_ROOT/venv/bin/python\" \"$REPO_ROOT/src/sqlite-reconcile\" %O %A %B %L %P"
 
 echo "✓ Setup complete!"
 echo "  Virtual environment: $REPO_ROOT/venv"
