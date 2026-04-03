@@ -111,8 +111,12 @@ The practical rule is simple: if the merged result would leave a child row point
 
 ### Near Term
 
+- Unique index conflict handling (baseline non-partial, non-expression indexes)
+- Partial unique index handling (`WHERE`-filtered uniqueness)
+- Expression unique index handling (for example `lower(email)`)
+- SQLite `NULL` behavior under `UNIQUE` constraints (multiple `NULL`s allowed)
 - Integrity checks as merge guardrails (`foreign_key_check`, `integrity_check`)
-- Collation-sequence-aware string comparison for row value matching
+- Collation-aware uniqueness and value comparison semantics (later in this phase)
 - Better diagnostics in conflict JSON output (more actionable conflict context)
 - Schema guardrails (detect PK/schema drift early and fail clearly)
 

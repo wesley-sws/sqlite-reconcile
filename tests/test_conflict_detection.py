@@ -19,7 +19,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         assert len(diffs.conflict_pairs) == 0
@@ -38,7 +38,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         assert len(diffs.conflict_pairs) == 1
@@ -55,7 +55,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         assert len(diffs.conflict_pairs) == 0
@@ -74,7 +74,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         assert len(diffs.conflict_pairs) == 1
@@ -92,7 +92,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         assert len(diffs.conflict_pairs) == 0
@@ -113,7 +113,7 @@ class TestConflictDetection:
         base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
         
         diffs = merge_driver.check_conflict_and_return_final_diff(
-            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data
+            base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
         
         # One conflict (insert with different values), one match (identical update)

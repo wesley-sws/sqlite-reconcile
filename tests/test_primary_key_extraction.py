@@ -56,7 +56,7 @@ class TestInsertExtraction:
         row = expr.expression.expressions[0]  # First (and only) row
         key_column_to_index = {"id": 0}
         
-        pk, cols = merge_driver.get_key_values_and_column_to_literal(row, schema, key_column_to_index)
+        pk, cols = merge_driver.get_key_values_and_column_to_literal_insert(row, schema, key_column_to_index)
         
         assert len(pk) == 1
         assert pk[0].this == "3"
@@ -73,7 +73,7 @@ class TestInsertExtraction:
         row = expr.expression.expressions[0]
         key_column_to_index = {"user_id": 0, "product_id": 1}
         
-        pk, cols = merge_driver.get_key_values_and_column_to_literal(row, schema, key_column_to_index)
+        pk, cols = merge_driver.get_key_values_and_column_to_literal_insert(row, schema, key_column_to_index)
         
         assert len(pk) == 2
         assert pk[0].this == "3"
