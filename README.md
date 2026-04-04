@@ -58,6 +58,8 @@ Primary-key conflicts are about two branches modifying the same logical row.
 - Update-Delete: one branch updated a row and the other deleted that same row.
 - Delete-Delete: both branches removed the same row, so this is usually safe.
 
+SQLite has an important exception here: on ordinary rowid tables, composite `PRIMARY KEY` columns can still contain `NULL` unless the schema also declares `NOT NULL` or the table is `WITHOUT ROWID` / `STRICT`. `sqlite-reconcile` currently treats primary keys as stable row identifiers and does not special-case `NULL` primary-key parts yet.
+
 Primary-key changes are conservative by design. If `sqldiff` represents a primary-key edit as `DELETE` + `INSERT`, the merge driver treats that as two operations instead of guessing that it was a rename.
 
 ### Unique Indices
@@ -69,6 +71,8 @@ Two branches can touch different rows and still collide if the merged result wou
 - Insert-Insert: both branches create rows that want the same unique value.
 - Insert-Update: one branch inserts a unique value while the other branch updates a different row to that same value.
 - Update-Update: both branches change different rows toward the same unique value.
+
+SQLite allows multiple `NULL` values in a `UNIQUE` index, and that behavior does not change just because a table is `STRICT`, `WITHOUT ROWID`, or has an `INTEGER PRIMARY KEY`. The rule only changes if the indexed columns are explicitly declared `NOT NULL`. In other words, `NULL` does not collide with `NULL` for uniqueness purposes.
 
 Unlike primary-key conflicts, unique-index conflicts are often detected at merge-apply time as a constraint problem, because the conflict is caused by the final merged table state rather than by the same row identity on both sides.
 
@@ -95,13 +99,13 @@ The practical rule is simple: if the merged result would leave a child row point
 ### Implemented
 
 - Primary-key-based semantic merge for row-level `INSERT` / `UPDATE` / `DELETE`
+- Baseline unique-index conflict handling (including composite unique indexes, excluding partial/expression indexes)
 - Conflict detection for incompatible row operations (including update-vs-delete)
 - Deterministic merge output assembly from matched and non-conflicting changes
 - JSON conflict report generation for unresolved conflicts
 - End-to-end Git merge-driver wiring (`%O %A %B %L %P`)
 
 ### In Progress (Current Focus)
-- **Unique index handling**
 - **Foreign-key-aware conflict handling**
 	- Goal: detect and handle parent-child cross-branch conflicts (for example child insert/update vs parent delete)
 	- Direction: salvage-oriented strategy with deterministic policy and explicit rejected/accepted statement reporting
@@ -111,10 +115,8 @@ The practical rule is simple: if the merged result would leave a child row point
 
 ### Near Term
 
-- Unique index conflict handling (baseline non-partial, non-expression indexes)
 - Partial unique index handling (`WHERE`-filtered uniqueness)
 - Expression unique index handling (for example `lower(email)`)
-- SQLite `NULL` behavior under `UNIQUE` constraints (multiple `NULL`s allowed)
 - Integrity checks as merge guardrails (`foreign_key_check`, `integrity_check`)
 - Collation-aware uniqueness and value comparison semantics (later in this phase)
 - Better diagnostics in conflict JSON output (more actionable conflict context)
@@ -138,6 +140,8 @@ The practical rule is simple: if the merged result would leave a child row point
 - Cascading deletes treated as independent operations
 - Semantic rename/move inference is intentionally conservative; ambiguous delete+insert similarity is not auto-merged into an inferred update
 - Unique-constraint conflicts are handled conservatively and may surface as unresolved conflicts even when a manual rename would be safe
+- Current unique-index checks assume each input snapshot already satisfies its own unique constraints; pre-existing unique violations are out of scope and can lead to undefined conflict classification
+- Composite primary-key `NULL` edge cases are intentionally not special-cased yet
 - Foreign-key validation is a post-merge guardrail, not a full semantic dependency solver
 - Tested on <100MB files
 

@@ -25,13 +25,14 @@ class DiffBuckets:
 empty_set = set()
 empty_list = []
 KeyValueData = tuple[int, type, dict[str, Expression] | None]
+KeyTuple = tuple[Expression, ...]
 
 @dataclass
 class TableConflictState:
     primary_key_columns_to_index: dict[str, int]
-    primary_key_value_to_data: dict[tuple[expressions.Literal, ...], KeyValueData]
+    primary_key_value_to_data: dict[KeyTuple, KeyValueData]
     unique_key_column_names: set[str]
-    unique_indexes: list[tuple[tuple[str], dict[tuple[expressions.Literal, ...], int]]]
+    unique_indexes: list[tuple[tuple[str], dict[tuple[Expression, ...], int]]]
 
 transaction_begin = "BEGIN TRANSACTION;"
 transaction_end = "COMMIT;"
@@ -57,36 +58,61 @@ def apply_sql_to_temp_db(source_db_path, sql_script):
             os.remove(temp_db_path)
         raise
 
+def get_target_table(expr: Expression) -> expressions.Table:
+    """
+    Return the top-level target table for INSERT / UPDATE / DELETE.
+    Avoids expr.find(expressions.Table), which can accidentally match nested
+    tables in subqueries.
+    """
+    table_expr: Expression | None = None
+    if isinstance(expr, expressions.Insert):
+        target = expr.this
+        # INSERT INTO t (a, b) ... parses target as Schema(this=Table(...), expressions=[...])
+        table_expr = target.this if isinstance(target, expressions.Schema) else target
+    elif isinstance(expr, (expressions.Update, expressions.Delete)):
+        table_expr = expr.this
+    else:
+        raise TypeError(f"Unsupported DML type: {type(expr).__name__}")
+    if not isinstance(table_expr, expressions.Table):
+        raise ValueError(
+            f"Could not resolve target table for {type(expr).__name__}: {expr.sql()}"
+        )
+    return table_expr
+
 def table_primary_keys(table_name: str, cursor: sqlite3.Cursor) -> dict[str, int]:
     rows = cursor.execute(f"SELECT pk, name FROM pragma_table_info('{table_name}') WHERE pk <> 0").fetchall()
     key_column_to_index: dict[str, int] = {name: index-1 for (index, name) in rows}
     return key_column_to_index
 
 def get_unique_indexes_column_names_and_data(table_name: str, cursor: sqlite3.Cursor
-    )-> tuple[set[str], list[tuple[tuple[str], dict[tuple[expressions.Literal, ...], int]]]]:
+    )-> tuple[set[str], list[tuple[tuple[str], dict[tuple[Expression, ...], int]]]]:
     rows = cursor.execute("SELECT il.name AS index_name, ii.name as column_name " 
                          f"FROM pragma_index_list('{table_name}') as il "
                          "JOIN pragma_index_info(il.name) AS ii "
                          "WHERE il.'unique' AND il.origin != 'pk'" \
-                         "ORDER BY il.seq").fetchall()
+                         "ORDER BY il.name").fetchall()
     if len(rows) == 0:
         return empty_set, empty_list
     columns_set: set[str] = {column_name for _, column_name in rows}
     unique_indexes = []
     for _, g in groupby(rows, key=lambda x: x[0]):
-        cols = tuple(r[1] for r in g)   # keeps ii.seqno order
+        cols = tuple(r[1] for r in g)
         unique_indexes.append((cols, {}))
     return columns_set, unique_indexes
 
-def get_primary_key_values_from_where(key_column_to_index: dict[str, int], expr: Expression) -> None | tuple[expressions.Literal, ...]:
-    primary_values = [None for _ in range(len(key_column_to_index))]
-    where = expr.find(expressions.Where)
+def get_primary_key_values_from_where(key_column_to_index: dict[str, int], expr: Expression) -> None | KeyTuple:
+    primary_values: list[Expression | None] = [None for _ in range(len(key_column_to_index))]
+    where = expr.args.get("where")
     if where is None:
         return None
-    for eq in where.find_all(expressions.EQ):
-        assert isinstance(eq.this, expressions.Column) and isinstance(eq.expression, expressions.Literal)
-        assert eq.this.name in key_column_to_index
-        primary_values[key_column_to_index[eq.this.name]] = eq.expression # type: ignore
+    for predicate in where.find_all(expressions.EQ, expressions.Is):
+        assert isinstance(predicate.this, expressions.Column)
+        assert predicate.this.name in key_column_to_index
+        if isinstance(predicate, expressions.Is):
+            assert isinstance(predicate.expression, expressions.Null)
+        else:
+            assert isinstance(predicate.expression, expressions.Literal)
+        primary_values[key_column_to_index[predicate.this.name]] = predicate.expression
     assert all(v is not None for v in primary_values)
     return tuple(primary_values) # type: ignore
 
@@ -102,6 +128,66 @@ def get_key_values_and_column_to_literal_insert(
             column_to_literal[ident.name] = lit
     assert all(v is not None for v in primary_values)
     return tuple(primary_values), column_to_literal # type: ignore
+
+def add_or_check_unique_indexes_value(
+    unique_indexes: list[tuple[tuple[str], dict[tuple[Expression, ...], int]]],
+    primary_key_columns_to_index: dict[str, int],
+    i: int,
+    table_name: str, 
+    expr: Expression,
+    cursor: sqlite3.Cursor,
+    isAdd: bool,
+    unique_index_columns_updated: set[str] = empty_set) -> None | tuple[int, tuple[str]]:
+    # only take insert or update type
+    if len(unique_indexes) == 0:
+        return
+    if type(expr) is expressions.Update:
+        where = expr.args.get("where")
+        assert where is not None
+    elif type(expr) is expressions.Insert:
+        # Made use of assumption that sqldiff emits INSERT INTO table(column, ...) VALUES (...)
+        # so sqlglot parses expr.this as Schema. If this stops being true, normalize
+        # Insert target shape in one helper instead of duplicating logic here.
+        assert isinstance(expr.this, expressions.Schema)
+        assert expr.expression is not None
+        # sqldiff emits one VALUES row per INSERT statement for row-level diffs.
+        values_rows = expr.expression.expressions
+        assert len(values_rows) == 1
+        insert_row = values_rows[0]
+
+        predicates: list[Expression] = []
+        for ident, literal in zip(expr.this.expressions, insert_row.expressions):
+            if ident.name not in primary_key_columns_to_index:
+                continue
+            column_expr = expressions.Column(this=expressions.Identifier(this=ident.name))
+            if isinstance(literal, expressions.Null):
+                predicates.append(expressions.Is(this=column_expr, expression=expressions.Null()))
+            else:
+                predicates.append(expressions.EQ(this=column_expr, expression=literal.copy()))
+
+        assert len(predicates) > 0
+        where_predicate = predicates[0]
+        for predicate in predicates[1:]:
+            where_predicate = expressions.And(this=where_predicate, expression=predicate)
+        where = expressions.Where(this=where_predicate)
+    else:
+        return
+    assert where is not None
+    row = cursor.execute(f"SELECT * FROM {table_name} {where.sql()}").fetchone()
+    for column_names, key_columns_to_index in unique_indexes:
+        curr_unique_index_columns_updated_and_non_null = False
+        unique_index_columns_values = []
+        for column_name in column_names:
+            curr_unique_index_columns_updated_and_non_null |= column_name in unique_index_columns_updated
+            if row[column_name] is None:
+                curr_unique_index_columns_updated_and_non_null = False
+                break
+            unique_index_columns_values.append(row[column_name])
+        if curr_unique_index_columns_updated_and_non_null or type(expr) is expressions.Insert:
+            tupled_unique_index_columns_values = tuple(unique_index_columns_values)
+            if not isAdd and tupled_unique_index_columns_values in key_columns_to_index:
+                return (key_columns_to_index[tupled_unique_index_columns_values], column_names)
+            key_columns_to_index[tupled_unique_index_columns_values] = i
 
 def add_to_res_match(res_match, build_with_base_to_ours, lookup_list_i, table_list_i):
     res_match.append(table_list_i if build_with_base_to_ours else lookup_list_i)
@@ -131,9 +217,13 @@ def check_conflict_and_return_final_diff(
     with sqldiff, the update and delete will always have its primary key value
     in the where clause
     '''
-    base_cursor = sqlite3.connect(base_dir).cursor()
-    build_cursor = ours_cursor = sqlite3.connect(ours_dir).cursor()
-    lookup_cursor = theirs_cursor = sqlite3.connect(theirs_dir).cursor()
+    base_con = sqlite3.connect(base_dir)
+    ours_con, theirs_con = sqlite3.connect(ours_dir), sqlite3.connect(theirs_dir)
+    ours_con.row_factory = sqlite3.Row
+    theirs_con.row_factory = sqlite3.Row
+    base_cursor = base_con.cursor()
+    build_cursor = ours_cursor = ours_con.cursor()
+    lookup_cursor = theirs_cursor = theirs_con.cursor()
     table_name_to_table_conflict_state: dict[str, TableConflictState] = {}
     # build hashed table
     to_build, to_lookup = base_to_ours_parsed, base_to_theirs_parsed
@@ -143,7 +233,7 @@ def check_conflict_and_return_final_diff(
         build_cursor, lookup_cursor = lookup_cursor, build_cursor
         build_with_base_to_ours = False
     for i, expr in enumerate(to_build):
-        table = expr.find(expressions.Table)
+        table = get_target_table(expr)
         assert table is not None
         if table.name not in table_name_to_table_conflict_state:
             table_name_to_table_conflict_state[table.name] = TableConflictState(
@@ -166,12 +256,34 @@ def check_conflict_and_return_final_diff(
                 primary_values_tuple, column_to_literal = \
                     get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
                 key_values_to_data[tuple(primary_values_tuple)] = (i, expressions.Insert, column_to_literal) # type: ignore
+            add_or_check_unique_indexes_value(
+                table_conflict_state.unique_indexes,
+                table_conflict_state.primary_key_columns_to_index,
+                i, 
+                table.name, 
+                expr, 
+                build_cursor,
+                True)
         elif isinstance(expr, expressions.Update):
             column_to_literal = {}
             assert key_values is not None
-            for e in expr.args.get("expressions") or []:
+            are_unique_index_column_updated = False
+            unique_index_columns_updated = set()
+            for e in expr.args["expressions"]:
                 column_to_literal[e.this.name] = e.expression
+                are_unique_index_column_updated |= e.this.name in table_conflict_state.unique_key_column_names
+                unique_index_columns_updated.add(e.this.name)
             key_values_to_data[key_values] = (i, expressions.Update, column_to_literal)
+            if are_unique_index_column_updated:
+                add_or_check_unique_indexes_value(
+                    table_conflict_state.unique_indexes,
+                    table_conflict_state.primary_key_columns_to_index,
+                    i, 
+                    table.name, 
+                    expr, 
+                    build_cursor,
+                    True,
+                    unique_index_columns_updated)
     res_match = [] # using index from base_to_ours
     extra_stmts_base_to_ours = []
     extra_stmts_base_to_theirs = []
@@ -180,7 +292,7 @@ def check_conflict_and_return_final_diff(
         if build_with_base_to_ours \
         else extra_stmts_base_to_ours
     for i, expr in enumerate(to_lookup):
-        table = expr.find(expressions.Table)
+        table = get_target_table(expr)
         assert table is not None
         if table.name not in table_name_to_table_conflict_state:
             list_to_add_for_failed_lookup.append(i)
@@ -204,37 +316,71 @@ def check_conflict_and_return_final_diff(
                 key_values_to_data.pop(key_values)
 
         elif isinstance(expr, expressions.Insert):
+            check_entry = add_or_check_unique_indexes_value(
+                table_conflict_state.unique_indexes,
+                table_conflict_state.primary_key_columns_to_index,
+                i, 
+                table.name, 
+                expr, 
+                lookup_cursor,
+                False)
+            if check_entry is not None:
+                add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, check_entry[0])
             for row in expr.expression.expressions:
                 primary_values_tuple, curr_column_to_literal = \
                     get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
                 if primary_values_tuple not in key_values_to_data:
-                    list_to_add_for_failed_lookup.append(i)
+                    if check_entry is None:
+                        list_to_add_for_failed_lookup.append(i)
                 else:
                     i2, t, column_to_literal = key_values_to_data[primary_values_tuple]
                     assert t is expressions.Insert
                     if column_to_literal == curr_column_to_literal:
-                        add_to_res_match(res_match, build_with_base_to_ours, i, i2)
+                        if check_entry is None:
+                            add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
                         add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                     key_values_to_data.pop(primary_values_tuple)
         elif isinstance(expr, expressions.Update):
             assert key_values is not None
+            curr_column_to_literal = {}
+            are_unique_index_column_updated = False
+            check_entry = None
+            unique_index_columns_updated = set()
+            for e in expr.args["expressions"]:
+                curr_column_to_literal[e.this.name] = e.expression
+                are_unique_index_column_updated |= e.this.name in table_conflict_state.unique_key_column_names
+                unique_index_columns_updated.add(e.this.name)
+            if are_unique_index_column_updated:
+                check_entry = add_or_check_unique_indexes_value(
+                    table_conflict_state.unique_indexes,
+                    table_conflict_state.primary_key_columns_to_index,
+                    i, 
+                    table.name, 
+                    expr, 
+                    lookup_cursor,
+                    False,
+                    unique_index_columns_updated)
+                if check_entry is not None:
+                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, check_entry[0])
             if key_values not in key_values_to_data:
-                list_to_add_for_failed_lookup.append(i)
+                if check_entry is None:
+                    list_to_add_for_failed_lookup.append(i)
             else:
                 i2, t, column_to_literal = key_values_to_data[key_values]
                 if t is expressions.Delete:
                     add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
-                    curr_column_to_literal = {}
-                    assert key_values is not None
-                    for e in expr.args.get("expressions") or []:
-                        curr_column_to_literal[e.this.name] = e.expression
                     if curr_column_to_literal == column_to_literal:
-                        add_to_res_match(res_match, build_with_base_to_ours, i, i2)
+                        if check_entry is None:
+                            add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
                         add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
+            
+    base_con.close()
+    ours_con.close()
+    theirs_con.close()
     list_to_add_for_remaining_table_entries = extra_stmts_base_to_ours \
         if build_with_base_to_ours \
         else extra_stmts_base_to_theirs
@@ -260,7 +406,6 @@ def main():
     base_to_theirs = utils.subprocess_run_wrapper(
         ["sqldiff", "--primarykey", args.base, args.theirs], text=True, capture_output=True
         ).stdout.strip().split('\n')
-    
     base_to_ours_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_ours]
     base_to_theirs_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_theirs]
     diffs = check_conflict_and_return_final_diff(base_to_ours_parsed, base_to_theirs_parsed, args.base, args.ours, args.theirs)
