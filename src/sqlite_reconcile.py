@@ -9,18 +9,17 @@ import tempfile
 import os
 import sqlglot
 from sqlglot import (Expression, expressions)
-from collections import defaultdict
-from enum import Enum
 from dataclasses import dataclass
 import json
 from itertools import groupby
+import conflict_pairs
 
 @dataclass
 class DiffBuckets:
     matched_ours_indices: list[int]
     extra_ours_indices: list[int]
     extra_theirs_indices: list[int]
-    conflict_pairs: list[tuple[int, int]]
+    conflict_pairs: list[conflict_pairs.ConflictPairs]
 
 empty_set = set()
 empty_list = []
@@ -32,7 +31,7 @@ class TableConflictState:
     primary_key_columns_to_index: dict[str, int]
     primary_key_value_to_data: dict[KeyTuple, KeyValueData]
     unique_key_column_names: set[str]
-    unique_indexes: list[tuple[tuple[str], dict[tuple[Expression, ...], int]]]
+    unique_indexes: list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]]
 
 transaction_begin = "BEGIN TRANSACTION;"
 transaction_end = "COMMIT;"
@@ -48,7 +47,6 @@ def apply_sql_to_temp_db(source_db_path, sql_script):
             text=True,
             capture_output=True
         )
-        print(proc.stdout)
         if proc.returncode != 0:
             raise RuntimeError(f"sqlite3 failed: {proc.stderr.strip()}")
 
@@ -85,7 +83,7 @@ def table_primary_keys(table_name: str, cursor: sqlite3.Cursor) -> dict[str, int
     return key_column_to_index
 
 def get_unique_indexes_column_names_and_data(table_name: str, cursor: sqlite3.Cursor
-    )-> tuple[set[str], list[tuple[tuple[str], dict[tuple[Expression, ...], int]]]]:
+    )-> tuple[set[str], list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]]]:
     rows = cursor.execute("SELECT il.name AS index_name, ii.name as column_name " 
                          f"FROM pragma_index_list('{table_name}') as il "
                          "JOIN pragma_index_info(il.name) AS ii "
@@ -95,9 +93,9 @@ def get_unique_indexes_column_names_and_data(table_name: str, cursor: sqlite3.Cu
         return empty_set, empty_list
     columns_set: set[str] = {column_name for _, column_name in rows}
     unique_indexes = []
-    for _, g in groupby(rows, key=lambda x: x[0]):
+    for index_name, g in groupby(rows, key=lambda x: x[0]):
         cols = tuple(r[1] for r in g)
-        unique_indexes.append((cols, {}))
+        unique_indexes.append((index_name, cols, {}))
     return columns_set, unique_indexes
 
 def get_primary_key_values_from_where(key_column_to_index: dict[str, int], expr: Expression) -> None | KeyTuple:
@@ -130,14 +128,14 @@ def get_key_values_and_column_to_literal_insert(
     return tuple(primary_values), column_to_literal # type: ignore
 
 def add_or_check_unique_indexes_value(
-    unique_indexes: list[tuple[tuple[str], dict[tuple[Expression, ...], int]]],
+    unique_indexes: list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]],
     primary_key_columns_to_index: dict[str, int],
     i: int,
     table_name: str, 
     expr: Expression,
     cursor: sqlite3.Cursor,
     isAdd: bool,
-    unique_index_columns_updated: set[str] = empty_set) -> None | tuple[int, tuple[str]]:
+    unique_index_columns_updated: set[str] = empty_set) -> None | list[tuple[int, str, tuple[str]]]:
     # only take insert or update type
     if len(unique_indexes) == 0:
         return
@@ -174,26 +172,33 @@ def add_or_check_unique_indexes_value(
         return
     assert where is not None
     row = cursor.execute(f"SELECT * FROM {table_name} {where.sql()}").fetchone()
-    for column_names, key_columns_to_index in unique_indexes:
-        curr_unique_index_columns_updated_and_non_null = False
+    conflicts = []
+    for index_name, column_names, key_columns_to_index in unique_indexes:
+        curr_unique_index_columns_updated = False
+        has_null_value = False
         unique_index_columns_values = []
         for column_name in column_names:
-            curr_unique_index_columns_updated_and_non_null |= column_name in unique_index_columns_updated
+            curr_unique_index_columns_updated |= column_name in unique_index_columns_updated
             if row[column_name] is None:
-                curr_unique_index_columns_updated_and_non_null = False
+                has_null_value = True
                 break
             unique_index_columns_values.append(row[column_name])
-        if curr_unique_index_columns_updated_and_non_null or type(expr) is expressions.Insert:
+        if has_null_value:
+            continue
+        if curr_unique_index_columns_updated or type(expr) is expressions.Insert:
             tupled_unique_index_columns_values = tuple(unique_index_columns_values)
             if not isAdd and tupled_unique_index_columns_values in key_columns_to_index:
-                return (key_columns_to_index[tupled_unique_index_columns_values], column_names)
+                conflicts.append((key_columns_to_index[tupled_unique_index_columns_values], index_name, column_names))
             key_columns_to_index[tupled_unique_index_columns_values] = i
+    if conflicts:
+        return conflicts
+        
 
 def add_to_res_match(res_match, build_with_base_to_ours, lookup_list_i, table_list_i):
     res_match.append(table_list_i if build_with_base_to_ours else lookup_list_i)
 
-def add_to_conflict_stmts(confict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
-    confict_stmts.append((table_list_i, lookup_list_i) if build_with_base_to_ours else (lookup_list_i, table_list_i))
+def get_ours_and_theirs_index_ordered(confict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
+    return (table_list_i, lookup_list_i) if build_with_base_to_ours else (lookup_list_i, table_list_i)
 
 def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
@@ -312,7 +317,9 @@ def check_conflict_and_return_final_diff(
                 if t is expressions.Delete:
                     add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
-                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                    conflict_stmts_pair.append(conflict_pairs.PrimaryKeyConflict(
+                        *get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                        ))
                 key_values_to_data.pop(key_values)
 
         elif isinstance(expr, expressions.Insert):
@@ -325,7 +332,13 @@ def check_conflict_and_return_final_diff(
                 lookup_cursor,
                 False)
             if check_entry is not None:
-                add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, check_entry[0])
+                for entry in check_entry:
+                    ours_i, theirs_i = get_ours_and_theirs_index_ordered(
+                        conflict_stmts_pair, build_with_base_to_ours, i, entry[0]
+                        )
+                    conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
+                        ours_i, theirs_i, entry[1], entry[2]
+                    ))
             for row in expr.expression.expressions:
                 primary_values_tuple, curr_column_to_literal = \
                     get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
@@ -339,7 +352,7 @@ def check_conflict_and_return_final_diff(
                         if check_entry is None:
                             add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                        get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                     key_values_to_data.pop(primary_values_tuple)
         elif isinstance(expr, expressions.Update):
             assert key_values is not None
@@ -362,20 +375,26 @@ def check_conflict_and_return_final_diff(
                     False,
                     unique_index_columns_updated)
                 if check_entry is not None:
-                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, check_entry[0])
+                    for entry in check_entry:
+                        ours_i, theirs_i = get_ours_and_theirs_index_ordered(
+                        conflict_stmts_pair, build_with_base_to_ours, i, entry[0]
+                        )
+                        conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
+                            ours_i, theirs_i, entry[1], entry[2]
+                        ))
             if key_values not in key_values_to_data:
                 if check_entry is None:
                     list_to_add_for_failed_lookup.append(i)
             else:
                 i2, t, column_to_literal = key_values_to_data[key_values]
                 if t is expressions.Delete:
-                    add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                    get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
                     if curr_column_to_literal == column_to_literal:
                         if check_entry is None:
                             add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        add_to_conflict_stmts(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                        get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
             
     base_con.close()
@@ -420,9 +439,7 @@ def main():
         text=True, 
         capture_output=True)
     if len(diffs.conflict_pairs) > 0:
-        out = {
-            "conflict pairs": [[base_to_ours[i], base_to_theirs[j]] for i, j in diffs.conflict_pairs]
-        }
+        out = [conflict_pair.to_dict(base_to_ours, base_to_theirs) for conflict_pair in diffs.conflict_pairs]
         conflict_file = f"{args.pathname}-.merge_file.json"
         with open(conflict_file, "w") as f:
             json.dump(out, f, indent=2)
