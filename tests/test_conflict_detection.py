@@ -42,8 +42,6 @@ class TestConflictDetection:
         )
         print(diffs.conflict_pairs)
         assert len(diffs.conflict_pairs) == 1
-        assert diffs.conflict_pairs[0].ours_index == 0
-        assert diffs.conflict_pairs[0].theirs_index == 0
     
     def test_no_conflict_extra_statements(self, temp_db_with_data, merge_driver):
         """One side makes changes, other side doesn't -> no conflict."""

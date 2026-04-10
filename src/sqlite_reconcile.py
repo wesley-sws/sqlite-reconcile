@@ -13,13 +13,14 @@ from dataclasses import dataclass
 import json
 from itertools import groupby
 import conflict_pairs
+from collections import defaultdict
 
 @dataclass
 class DiffBuckets:
     matched_ours_indices: list[int]
     extra_ours_indices: list[int]
     extra_theirs_indices: list[int]
-    conflict_pairs: list[conflict_pairs.ConflictPairs]
+    conflict_pairs: dict[tuple[int, int], list[conflict_pairs.ConflictPairs]]
 
 empty_set = set()
 empty_list = []
@@ -199,9 +200,9 @@ def get_ours_and_theirs_index_ordered(build_with_base_to_ours, lookup_list_i, ta
     return (table_list_i, lookup_list_i) if build_with_base_to_ours else (lookup_list_i, table_list_i)
 
 def add_pk_conflict(conflict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
-    conflict_stmts.append(conflict_pairs.PrimaryKeyConflict(
-        *get_ours_and_theirs_index_ordered(build_with_base_to_ours, lookup_list_i, table_list_i)
-        ))
+    conflict_stmts[get_ours_and_theirs_index_ordered(
+        build_with_base_to_ours, lookup_list_i, table_list_i
+    )].append(conflict_pairs.PrimaryKeyConflict())
 
 def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
@@ -295,7 +296,7 @@ def check_conflict_and_return_final_diff(
     res_match = [] # using index from base_to_ours
     extra_stmts_base_to_ours = []
     extra_stmts_base_to_theirs = []
-    conflict_stmts_pair = [] # (base_to_ours index, base_to_theirs index)
+    conflict_stmts_pair = defaultdict(list) # (base_to_ours index, base_to_theirs index)
     list_to_add_for_failed_lookup = extra_stmts_base_to_theirs \
         if build_with_base_to_ours \
         else extra_stmts_base_to_ours
@@ -334,12 +335,10 @@ def check_conflict_and_return_final_diff(
                 False)
             if check_entry is not None:
                 for entry in check_entry:
-                    ours_i, theirs_i = get_ours_and_theirs_index_ordered(
+                    conflict_stmts_pair[get_ours_and_theirs_index_ordered(
                         build_with_base_to_ours, i, entry[0]
-                    )
-                    conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
-                        ours_i, theirs_i, entry[1], entry[2]
-                    ))
+                    )].append(conflict_pairs.UniqueIndexesConflict(
+                        entry[1], entry[2]))
             for row in expr.expression.expressions:
                 primary_values_tuple, curr_column_to_literal = \
                     get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
@@ -377,12 +376,10 @@ def check_conflict_and_return_final_diff(
                     unique_index_columns_updated)
                 if check_entry is not None:
                     for entry in check_entry:
-                        ours_i, theirs_i = get_ours_and_theirs_index_ordered(
+                        conflict_stmts_pair[get_ours_and_theirs_index_ordered(
                             build_with_base_to_ours, i, entry[0]
-                        )
-                        conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
-                            ours_i, theirs_i, entry[1], entry[2]
-                        ))
+                        )].append(conflict_pairs.UniqueIndexesConflict(
+                            entry[1], entry[2]))
             if key_values not in key_values_to_data:
                 if check_entry is None:
                     list_to_add_for_failed_lookup.append(i)
@@ -440,7 +437,11 @@ def main():
         text=True, 
         capture_output=True)
     if len(diffs.conflict_pairs) > 0:
-        out = [conflict_pair.to_dict(base_to_ours, base_to_theirs) for conflict_pair in diffs.conflict_pairs]
+        out = [{
+            "conflict_stmts": (base_to_ours[i1], base_to_theirs[i2]),
+            "conflicts": [conflict_pair.to_dict() for conflict_pair in conflict_pairs]
+            } 
+            for (i1, i2), conflict_pairs in diffs.conflict_pairs.items()]
         conflict_file = f"{args.pathname}-.merge_file.json"
         with open(conflict_file, "w") as f:
             json.dump(out, f, indent=2)

@@ -75,10 +75,11 @@ class TestUniqueIndexConflicts:
         )
 
         assert len(diffs.conflict_pairs) == 1
-        conflict = diffs.conflict_pairs[0]
+        pair, conflict_list = next(iter(diffs.conflict_pairs.items()))
+        assert pair == (0, 0)
+        assert len(conflict_list) == 1
+        conflict = conflict_list[0]
         assert isinstance(conflict, merge_driver.conflict_pairs.UniqueIndexesConflict)
-        assert conflict.ours_index == 0
-        assert conflict.theirs_index == 0
 
     def test_composite_unique_index_insert_insert_conflict(self, tmp_path, merge_driver):
         schema_sql = """
@@ -117,10 +118,11 @@ class TestUniqueIndexConflicts:
         )
 
         assert len(diffs.conflict_pairs) == 1
-        conflict = diffs.conflict_pairs[0]
+        pair, conflict_list = next(iter(diffs.conflict_pairs.items()))
+        assert pair == (0, 0)
+        assert len(conflict_list) == 1
+        conflict = conflict_list[0]
         assert isinstance(conflict, merge_driver.conflict_pairs.UniqueIndexesConflict)
-        assert conflict.ours_index == 0
-        assert conflict.theirs_index == 0
 
     def test_unique_index_null_values_do_not_conflict(self, tmp_path, merge_driver):
         schema_sql = """
