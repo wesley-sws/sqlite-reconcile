@@ -40,9 +40,10 @@ class TestConflictDetection:
         diffs = merge_driver.check_conflict_and_return_final_diff(
             base_to_ours_parsed, base_to_theirs_parsed, temp_db_with_data, "", ""
         )
-        
+        print(diffs.conflict_pairs)
         assert len(diffs.conflict_pairs) == 1
-        assert diffs.conflict_pairs[0] == (0, 0)
+        assert diffs.conflict_pairs[0].ours_index == 0
+        assert diffs.conflict_pairs[0].theirs_index == 0
     
     def test_no_conflict_extra_statements(self, temp_db_with_data, merge_driver):
         """One side makes changes, other side doesn't -> no conflict."""

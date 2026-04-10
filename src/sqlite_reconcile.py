@@ -183,9 +183,7 @@ def add_or_check_unique_indexes_value(
                 has_null_value = True
                 break
             unique_index_columns_values.append(row[column_name])
-        if has_null_value:
-            continue
-        if curr_unique_index_columns_updated or type(expr) is expressions.Insert:
+        if not has_null_value and (curr_unique_index_columns_updated or type(expr) is expressions.Insert):
             tupled_unique_index_columns_values = tuple(unique_index_columns_values)
             if not isAdd and tupled_unique_index_columns_values in key_columns_to_index:
                 conflicts.append((key_columns_to_index[tupled_unique_index_columns_values], index_name, column_names))
@@ -197,8 +195,13 @@ def add_or_check_unique_indexes_value(
 def add_to_res_match(res_match, build_with_base_to_ours, lookup_list_i, table_list_i):
     res_match.append(table_list_i if build_with_base_to_ours else lookup_list_i)
 
-def get_ours_and_theirs_index_ordered(confict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
+def get_ours_and_theirs_index_ordered(build_with_base_to_ours, lookup_list_i, table_list_i):
     return (table_list_i, lookup_list_i) if build_with_base_to_ours else (lookup_list_i, table_list_i)
+
+def add_pk_conflict(conflict_stmts, build_with_base_to_ours, lookup_list_i, table_list_i):
+    conflict_stmts.append(conflict_pairs.PrimaryKeyConflict(
+        *get_ours_and_theirs_index_ordered(build_with_base_to_ours, lookup_list_i, table_list_i)
+        ))
 
 def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
@@ -317,9 +320,7 @@ def check_conflict_and_return_final_diff(
                 if t is expressions.Delete:
                     add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
-                    conflict_stmts_pair.append(conflict_pairs.PrimaryKeyConflict(
-                        *get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
-                        ))
+                    add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
 
         elif isinstance(expr, expressions.Insert):
@@ -334,8 +335,8 @@ def check_conflict_and_return_final_diff(
             if check_entry is not None:
                 for entry in check_entry:
                     ours_i, theirs_i = get_ours_and_theirs_index_ordered(
-                        conflict_stmts_pair, build_with_base_to_ours, i, entry[0]
-                        )
+                        build_with_base_to_ours, i, entry[0]
+                    )
                     conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
                         ours_i, theirs_i, entry[1], entry[2]
                     ))
@@ -352,7 +353,7 @@ def check_conflict_and_return_final_diff(
                         if check_entry is None:
                             add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                        add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                     key_values_to_data.pop(primary_values_tuple)
         elif isinstance(expr, expressions.Update):
             assert key_values is not None
@@ -377,7 +378,7 @@ def check_conflict_and_return_final_diff(
                 if check_entry is not None:
                     for entry in check_entry:
                         ours_i, theirs_i = get_ours_and_theirs_index_ordered(
-                        conflict_stmts_pair, build_with_base_to_ours, i, entry[0]
+                            build_with_base_to_ours, i, entry[0]
                         )
                         conflict_stmts_pair.append(conflict_pairs.UniqueIndexesConflict(
                             ours_i, theirs_i, entry[1], entry[2]
@@ -388,13 +389,13 @@ def check_conflict_and_return_final_diff(
             else:
                 i2, t, column_to_literal = key_values_to_data[key_values]
                 if t is expressions.Delete:
-                    get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                    add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 elif t is expressions.Update:
                     if curr_column_to_literal == column_to_literal:
                         if check_entry is None:
                             add_to_res_match(res_match, build_with_base_to_ours, i, i2)
                     else:
-                        get_ours_and_theirs_index_ordered(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                        add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
             
     base_con.close()
