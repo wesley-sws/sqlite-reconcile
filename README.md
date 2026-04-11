@@ -47,7 +47,7 @@ The merge driver starts from two diffs against a common base:
 - `base -> ours`
 - `base -> theirs`
 
-It then compares those diffs using the relevant key for the table. For primary-key tables (and we don't consider tables without primary key in sqlite-reconcile), the primary key identifies the row. For unique-index handling, the unique columns identify the value set that must remain unique. For foreign-key checks, the parent-child relationship is the thing that must remain consistent.
+It then compares those diffs using the relevant key for the table. For primary-key tables (and we don't consider tables without primary key in sqlite-reconcile), the primary key identifies the row. For unique-index handling, the unique columns identify the value set that must remain unique. For foreign-key checks, direct parent-child references and end-state FK validity are the things that must remain consistent.
 
 ### Primary Key
 
@@ -82,8 +82,29 @@ Foreign-key conflicts are about parent-child consistency across branches.
 
 - Insert-Delete: one branch inserts a child row while the other deletes the parent row it depends on.
 - Update-Delete: one branch updates a child row or foreign-key column while the other deletes the referenced parent row.
+- Parent-key-Update vs Child-Reference: one branch changes a parent key while the other branch creates or updates child references to the old key.
 
 The practical rule is simple: if the merged result would leave a child row pointing at a missing parent, that is a foreign-key conflict. Those cases are handled conservatively and then validated with foreign-key checks.
+
+### Foreign-Key Policy (Conservative, Action-Agnostic)
+
+`sqlite-reconcile` currently focuses foreign-key conflict detection on direct parent-child references plus final integrity validation.
+
+- Pairwise parent-child FK checks are used for semantic conflict detection.
+- `PRAGMA foreign_key_check` is used as the final guardrail on merged output.
+- Multi-hop ancestor-descendant intent inference is not required for this FK-integrity objective.
+
+Rationale:
+- For FK-focused correctness, direct edge checks plus final FK validation are sufficient.
+- This keeps behavior deterministic and easier to reason about.
+- It avoids over-flagging FK-valid merges based on higher-level intent interpretation.
+
+Why multi-hop is not needed for this objective:
+- SQLite foreign-key constraints are defined and enforced on direct parent-child edges.
+- Any true FK-integrity failure in deeper table chains still manifests as at least one broken direct edge, which `PRAGMA foreign_key_check` reports.
+- Therefore, adding ancestor-descendant intent inference does not improve FK-integrity guarantees; it mostly adds policy-level opinion and extra false positives.
+
+This policy is intentional: if the merged database is FK-valid, we treat it as acceptable from the FK perspective without extra multi-hop intent analysis.
 
 ### Design Choice 
 - Avoid fuzzy semantic-update inference from similar row content
@@ -107,9 +128,9 @@ The practical rule is simple: if the merged result would leave a child row point
 
 ### In Progress (Current Focus)
 - **Foreign-key-aware conflict handling**
-	- Goal: detect and handle parent-child cross-branch conflicts (for example child insert/update vs parent delete)
-	- Direction: salvage-oriented strategy with deterministic policy and explicit rejected/accepted statement reporting
-	- Scope now: focus on practical FK conflict cases first, advanced FK semantics later
+  - Goal: detect and handle parent-child cross-branch conflicts (for example child insert/update vs parent delete)
+  - Direction: conservative, action-agnostic direct parent-child checking plus final `foreign_key_check`
+  - Scope now: practical pairwise FK conflict cases and predictable diagnostics
 
 ## Roadmap
 
@@ -123,8 +144,6 @@ The practical rule is simple: if the merged result would leave a child row point
 - Schema guardrails (detect PK/schema drift early and fail clearly)
 
 ### Later
-
-- FK action semantics (`CASCADE`, `SET NULL`, deferred constraints)
 - Trigger/view/schema-object change detection with explicit manual-resolution flow
 - Performance tuning and larger-scale test coverage
 
@@ -142,7 +161,8 @@ The practical rule is simple: if the merged result would leave a child row point
 - Unique-constraint conflicts are handled conservatively and may surface as unresolved conflicts even when a manual rename would be safe
 - Current unique-index checks assume each input snapshot already satisfies its own unique constraints; pre-existing unique violations are out of scope and can lead to undefined conflict classification
 - Composite primary-key `NULL` edge cases are intentionally not special-cased yet
-- Foreign-key validation is a post-merge guardrail, not a full semantic dependency solver
+- Foreign-key conflict reporting is conservative and action-agnostic; FK actions are not currently used to suppress conflicts
+- Foreign-key checking is pairwise plus final `foreign_key_check`; multi-hop intent inference is not required for this FK-integrity objective
 - Tested on <100MB files
 
 ## License

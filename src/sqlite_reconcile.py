@@ -9,7 +9,7 @@ import tempfile
 import os
 import sqlglot
 from sqlglot import (Expression, expressions)
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 import json
 from itertools import groupby
 import conflict_pairs
@@ -28,11 +28,23 @@ KeyValueData = tuple[int, type, dict[str, Expression] | None]
 KeyTuple = tuple[Expression, ...]
 
 @dataclass
+class InvalidTableState:
+    invalid_reasons: list[dict[str, object]]
+    base_to_ours: list[int] = field(default_factory=list)
+    base_to_theirs: list[int] = field(default_factory=list)
+
+@dataclass
+class UniqueIndexState:
+    index_name: str
+    column_names: tuple[str, ...]
+    values_to_stmt_index: dict[tuple[object, ...], int] = field(default_factory=dict)
+
+@dataclass
 class TableConflictState:
     primary_key_columns_to_index: dict[str, int]
     primary_key_value_to_data: dict[KeyTuple, KeyValueData]
     unique_key_column_names: set[str]
-    unique_indexes: list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]]
+    unique_indexes: list[UniqueIndexState]
 
 transaction_begin = "BEGIN TRANSACTION;"
 transaction_end = "COMMIT;"
@@ -78,13 +90,64 @@ def get_target_table(expr: Expression) -> expressions.Table:
         )
     return table_expr
 
+def pragma_check_table_failed_and_recorded(
+        invalid_tables: dict[str, InvalidTableState], 
+        table_name: str, 
+        base_cursor: sqlite3.Cursor, 
+        ours_cursor: sqlite3.Cursor, 
+        theirs_cursor: sqlite3.Cursor):
+    # note its possible the table have yet to exist in which case sqlite3 would give operational error
+    # though in that case it would be a schema diff problem which we aim to flag error for now
+    for cursor_name, cursor in zip(("base", "ours", "theirs"), (base_cursor, ours_cursor, theirs_cursor)):
+        integrity_check = cursor.execute(f"PRAGMA integrity_check({table_name});").fetchone()["integrity_check"]
+        if integrity_check != "ok":
+            invalid_tables[table_name].invalid_reasons.append({
+                "failed_branch": cursor_name,
+                "failure_type": "pragma_integrity_check_failed",
+                "failure_rows_or_details": integrity_check
+                })
+        rows = cursor.execute(f"PRAGMA foreign_key_check({table_name});").fetchall()
+        if len(rows) > 0:
+            invalid_tables[table_name].invalid_reasons.append({
+                "failed_branch": cursor_name,
+                "failure_type": "pragma_foreign_check_failed",
+                "failure_rows_or_details": rows
+                })
+
+def check_valid_tables(
+        base_to_ours_parsed: list[Expression], 
+        base_to_theirs_parsed: list[Expression], 
+        base_cursor: sqlite3.Cursor, 
+        ours_cursor: sqlite3.Cursor, 
+        theirs_cursor: sqlite3.Cursor) -> dict[str, InvalidTableState]:
+    tables_set = set()
+    invalid_tables = defaultdict(lambda: InvalidTableState([]))
+    for expr in (base_to_ours_parsed + base_to_theirs_parsed):
+        table = get_target_table(expr)
+        assert table is not None
+        if table.name not in tables_set:
+            tables_set.add(table.name)
+            pragma_check_table_failed_and_recorded(invalid_tables, table.name, base_cursor, ours_cursor, theirs_cursor)
+
+    return invalid_tables
+
+def check_and_record_for_invalid_tables(invalid_tables, table_name, index, build_with_base_to_ours, is_building):
+    '''returns true if table is invalid'''
+    if table_name in invalid_tables:
+        if build_with_base_to_ours and is_building or not build_with_base_to_ours and not is_building:
+            invalid_tables[table_name].base_to_ours.append(index)
+        else:
+            invalid_tables[table_name].base_to_theirs.append(index)
+        return True
+    return False
+
 def table_primary_keys(table_name: str, cursor: sqlite3.Cursor) -> dict[str, int]:
     rows = cursor.execute(f"SELECT pk, name FROM pragma_table_info('{table_name}') WHERE pk <> 0").fetchall()
-    key_column_to_index: dict[str, int] = {name: index-1 for (index, name) in rows}
+    key_column_to_index: dict[str, int] = {row["name"]: row["pk"]-1 for row in rows}
     return key_column_to_index
 
 def get_unique_indexes_column_names_and_data(table_name: str, cursor: sqlite3.Cursor
-    )-> tuple[set[str], list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]]]:
+    )-> tuple[set[str], list[UniqueIndexState]]:
     rows = cursor.execute("SELECT il.name AS index_name, ii.name as column_name " 
                          f"FROM pragma_index_list('{table_name}') as il "
                          "JOIN pragma_index_info(il.name) AS ii "
@@ -92,11 +155,14 @@ def get_unique_indexes_column_names_and_data(table_name: str, cursor: sqlite3.Cu
                          "ORDER BY il.name").fetchall()
     if len(rows) == 0:
         return empty_set, empty_list
-    columns_set: set[str] = {column_name for _, column_name in rows}
-    unique_indexes = []
-    for index_name, g in groupby(rows, key=lambda x: x[0]):
-        cols = tuple(r[1] for r in g)
-        unique_indexes.append((index_name, cols, {}))
+    columns_set: set[str] = {row["column_name"] for row in rows}
+    index_to_cols = defaultdict(list)
+    for row in rows:
+        index_to_cols[row["index_name"]].append(row["column_name"])
+    unique_indexes = [
+        UniqueIndexState(index_name, tuple(cols))
+        for index_name, cols in index_to_cols.items()
+    ]
     return columns_set, unique_indexes
 
 def get_primary_key_values_from_where(key_column_to_index: dict[str, int], expr: Expression) -> None | KeyTuple:
@@ -129,7 +195,7 @@ def get_key_values_and_column_to_literal_insert(
     return tuple(primary_values), column_to_literal # type: ignore
 
 def add_or_check_unique_indexes_value(
-    unique_indexes: list[tuple[str, tuple[str], dict[tuple[Expression, ...], int]]],
+    unique_indexes: list[UniqueIndexState],
     primary_key_columns_to_index: dict[str, int],
     i: int,
     table_name: str, 
@@ -174,11 +240,11 @@ def add_or_check_unique_indexes_value(
     assert where is not None
     row = cursor.execute(f"SELECT * FROM {table_name} {where.sql()}").fetchone()
     conflicts = []
-    for index_name, column_names, key_columns_to_index in unique_indexes:
+    for unique_index in unique_indexes:
         curr_unique_index_columns_updated = False
         has_null_value = False
         unique_index_columns_values = []
-        for column_name in column_names:
+        for column_name in unique_index.column_names:
             curr_unique_index_columns_updated |= column_name in unique_index_columns_updated
             if row[column_name] is None:
                 has_null_value = True
@@ -186,9 +252,13 @@ def add_or_check_unique_indexes_value(
             unique_index_columns_values.append(row[column_name])
         if not has_null_value and (curr_unique_index_columns_updated or type(expr) is expressions.Insert):
             tupled_unique_index_columns_values = tuple(unique_index_columns_values)
-            if not isAdd and tupled_unique_index_columns_values in key_columns_to_index:
-                conflicts.append((key_columns_to_index[tupled_unique_index_columns_values], index_name, column_names))
-            key_columns_to_index[tupled_unique_index_columns_values] = i
+            if not isAdd and tupled_unique_index_columns_values in unique_index.values_to_stmt_index:
+                conflicts.append(
+                    (unique_index.values_to_stmt_index[tupled_unique_index_columns_values], 
+                     unique_index.index_name, 
+                     unique_index.column_names)
+                    )
+            unique_index.values_to_stmt_index[tupled_unique_index_columns_values] = i
     if conflicts:
         return conflicts
         
@@ -207,9 +277,10 @@ def add_pk_conflict(conflict_stmts, build_with_base_to_ours, lookup_list_i, tabl
 def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
         base_to_theirs_parsed: list[Expression],
-        base_dir: str,
-        ours_dir: str,
-        theirs_dir: str) -> DiffBuckets:
+        invalid_tables: dict[str, InvalidTableState],
+        base_cursor: sqlite3.Cursor,
+        ours_cursor: sqlite3.Cursor,
+        theirs_cursor: sqlite3.Cursor) -> DiffBuckets:
     '''approach:
     - build hash table keyed by primary key from base_to_ours_parsed
     - iterate through base_to_theirs_parsed for conflict / safe operations, raise
@@ -226,13 +297,7 @@ def check_conflict_and_return_final_diff(
     with sqldiff, the update and delete will always have its primary key value
     in the where clause
     '''
-    base_con = sqlite3.connect(base_dir)
-    ours_con, theirs_con = sqlite3.connect(ours_dir), sqlite3.connect(theirs_dir)
-    ours_con.row_factory = sqlite3.Row
-    theirs_con.row_factory = sqlite3.Row
-    base_cursor = base_con.cursor()
-    build_cursor = ours_cursor = ours_con.cursor()
-    lookup_cursor = theirs_cursor = theirs_con.cursor()
+    build_cursor, lookup_cursor = ours_cursor, theirs_cursor
     table_name_to_table_conflict_state: dict[str, TableConflictState] = {}
     # build hashed table
     to_build, to_lookup = base_to_ours_parsed, base_to_theirs_parsed
@@ -244,6 +309,8 @@ def check_conflict_and_return_final_diff(
     for i, expr in enumerate(to_build):
         table = get_target_table(expr)
         assert table is not None
+        if check_and_record_for_invalid_tables(invalid_tables, table.name, i, build_with_base_to_ours, is_building=True):
+            continue
         if table.name not in table_name_to_table_conflict_state:
             table_name_to_table_conflict_state[table.name] = TableConflictState(
                 # assume no change in primary key / unique indexes between base ours and theirs
@@ -296,13 +363,15 @@ def check_conflict_and_return_final_diff(
     res_match = [] # using index from base_to_ours
     extra_stmts_base_to_ours = []
     extra_stmts_base_to_theirs = []
-    conflict_stmts_pair = defaultdict(list) # (base_to_ours index, base_to_theirs index)
+    conflict_stmts_pair = defaultdict(list) # key:(base_to_ours index, base_to_theirs index)
     list_to_add_for_failed_lookup = extra_stmts_base_to_theirs \
         if build_with_base_to_ours \
         else extra_stmts_base_to_ours
     for i, expr in enumerate(to_lookup):
         table = get_target_table(expr)
         assert table is not None
+        if check_and_record_for_invalid_tables(invalid_tables, table.name, i, build_with_base_to_ours, is_building=False):
+            continue
         if table.name not in table_name_to_table_conflict_state:
             list_to_add_for_failed_lookup.append(i)
             continue
@@ -394,10 +463,7 @@ def check_conflict_and_return_final_diff(
                     else:
                         add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
                 key_values_to_data.pop(key_values)
-            
-    base_con.close()
-    ours_con.close()
-    theirs_con.close()
+
     list_to_add_for_remaining_table_entries = extra_stmts_base_to_ours \
         if build_with_base_to_ours \
         else extra_stmts_base_to_theirs
@@ -425,7 +491,22 @@ def main():
         ).stdout.strip().split('\n')
     base_to_ours_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_ours]
     base_to_theirs_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_theirs]
-    diffs = check_conflict_and_return_final_diff(base_to_ours_parsed, base_to_theirs_parsed, args.base, args.ours, args.theirs)
+
+    base_con = sqlite3.connect(args.base)
+    ours_con, theirs_con = sqlite3.connect(args.ours), sqlite3.connect(args.theirs)
+    base_con.row_factory = sqlite3.Row
+    ours_con.row_factory = sqlite3.Row
+    theirs_con.row_factory = sqlite3.Row
+    base_cursor = base_con.cursor()
+    ours_cursor = ours_con.cursor()
+    theirs_cursor = theirs_con.cursor()
+
+    invalid_tables = check_valid_tables(base_to_ours_parsed, base_to_theirs_parsed, base_cursor, ours_cursor, theirs_cursor)
+    diffs = check_conflict_and_return_final_diff(base_to_ours_parsed, base_to_theirs_parsed, invalid_tables, base_cursor, ours_cursor, theirs_cursor)
+    
+    base_con.close()
+    ours_con.close()
+    theirs_con.close()
     stmts_to_apply = \
         [base_to_ours[i] for i in diffs.matched_ours_indices] + \
         [base_to_ours[i] for i in diffs.extra_ours_indices] + \
@@ -437,11 +518,14 @@ def main():
         text=True, 
         capture_output=True)
     if len(diffs.conflict_pairs) > 0:
-        out = [{
-            "conflict_stmts": (base_to_ours[i1], base_to_theirs[i2]),
-            "conflicts": [conflict_pair.to_dict() for conflict_pair in conflict_pairs]
-            } 
-            for (i1, i2), conflict_pairs in diffs.conflict_pairs.items()]
+        out = {
+            "conflicts": [{
+                "conflict_stmts": (base_to_ours[i1], base_to_theirs[i2]),
+                "conflict_details": [conflict_pair.to_dict() for conflict_pair in conflict_pairs]
+                } 
+                for (i1, i2), conflict_pairs in diffs.conflict_pairs.items()],
+            "invalid_tables": {table_name: asdict(state) for table_name, state in invalid_tables.items()}
+        }
         conflict_file = f"{args.pathname}-.merge_file.json"
         with open(conflict_file, "w") as f:
             json.dump(out, f, indent=2)

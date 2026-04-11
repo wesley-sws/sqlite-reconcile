@@ -30,13 +30,37 @@ def _run_conflict_detection(
 ):
     base_to_ours_parsed = [sqlglot.parse_one(sql) for sql in base_to_ours_sql]
     base_to_theirs_parsed = [sqlglot.parse_one(sql) for sql in base_to_theirs_sql]
-    return merge_driver.check_conflict_and_return_final_diff(
+
+    base_con = sqlite3.connect(base_path)
+    ours_con = sqlite3.connect(ours_path)
+    theirs_con = sqlite3.connect(theirs_path)
+    base_con.row_factory = sqlite3.Row
+    ours_con.row_factory = sqlite3.Row
+    theirs_con.row_factory = sqlite3.Row
+    base_cursor = base_con.cursor()
+    ours_cursor = ours_con.cursor()
+    theirs_cursor = theirs_con.cursor()
+
+    invalid_tables = merge_driver.check_valid_tables(
         base_to_ours_parsed,
         base_to_theirs_parsed,
-        base_path,
-        ours_path,
-        theirs_path,
+        base_cursor,
+        ours_cursor,
+        theirs_cursor,
     )
+    diffs = merge_driver.check_conflict_and_return_final_diff(
+        base_to_ours_parsed,
+        base_to_theirs_parsed,
+        invalid_tables,
+        base_cursor,
+        ours_cursor,
+        theirs_cursor,
+    )
+
+    base_con.close()
+    ours_con.close()
+    theirs_con.close()
+    return diffs
 
 
 class TestUniqueIndexConflicts:

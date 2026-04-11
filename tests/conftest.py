@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import os
 import sys
+import shutil
 from pathlib import Path
 
 # Add src directory to path so we can import the merge driver
@@ -47,6 +48,26 @@ def temp_db_with_data(temp_db):
         con.commit()
     
     return temp_db
+
+
+@pytest.fixture
+def temp_db_three_way(temp_db_with_data):
+    """Create base/ours/theirs paths initialized from the same base data."""
+    base_path = temp_db_with_data
+
+    ours_fd, ours_path = tempfile.mkstemp(suffix=".db")
+    theirs_fd, theirs_path = tempfile.mkstemp(suffix=".db")
+    os.close(ours_fd)
+    os.close(theirs_fd)
+
+    shutil.copy2(base_path, ours_path)
+    shutil.copy2(base_path, theirs_path)
+
+    yield base_path, ours_path, theirs_path
+
+    for path in (ours_path, theirs_path):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 @pytest.fixture
