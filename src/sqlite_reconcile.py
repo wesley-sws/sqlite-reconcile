@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import sys
 import sqlite3
 import argparse
@@ -11,9 +10,9 @@ import sqlglot
 from sqlglot import (Expression, expressions)
 from dataclasses import dataclass, field, asdict
 import json
-from itertools import groupby
 import conflict_pairs
 from collections import defaultdict
+from typing import Literal, Iterable
 
 @dataclass
 class DiffBuckets:
@@ -93,25 +92,19 @@ def get_target_table(expr: Expression) -> expressions.Table:
 def pragma_check_table_failed_and_recorded(
         invalid_tables: dict[str, InvalidTableState], 
         table_name: str, 
+        branch_and_cursor: Iterable[tuple[Literal['base', 'ours', 'theirs'], sqlite3.Cursor]],
         base_cursor: sqlite3.Cursor, 
         ours_cursor: sqlite3.Cursor, 
         theirs_cursor: sqlite3.Cursor):
     # note its possible the table have yet to exist in which case sqlite3 would give operational error
     # though in that case it would be a schema diff problem which we aim to flag error for now
-    for cursor_name, cursor in zip(("base", "ours", "theirs"), (base_cursor, ours_cursor, theirs_cursor)):
+    for branch, cursor in branch_and_cursor:
         integrity_check = cursor.execute(f"PRAGMA integrity_check({table_name});").fetchone()["integrity_check"]
         if integrity_check != "ok":
             invalid_tables[table_name].invalid_reasons.append({
-                "failed_branch": cursor_name,
+                "failed_branch": branch,
                 "failure_type": "pragma_integrity_check_failed",
                 "failure_rows_or_details": integrity_check
-                })
-        rows = cursor.execute(f"PRAGMA foreign_key_check({table_name});").fetchall()
-        if len(rows) > 0:
-            invalid_tables[table_name].invalid_reasons.append({
-                "failed_branch": cursor_name,
-                "failure_type": "pragma_foreign_check_failed",
-                "failure_rows_or_details": rows
                 })
 
 def check_valid_tables(
@@ -122,13 +115,36 @@ def check_valid_tables(
         theirs_cursor: sqlite3.Cursor) -> dict[str, InvalidTableState]:
     tables_set = set()
     invalid_tables = defaultdict(lambda: InvalidTableState([]))
+    branch_and_cursor = tuple(zip(("base", "ours", "theirs"), (base_cursor, ours_cursor, theirs_cursor)))
+    # temporary table keyed by tuple[table name, branch, and a boolean s.t. True if child table else True ([parent table)]
+    invalid_foreign_key_tables: defaultdict[
+        str, defaultdict[tuple[Literal["base", "ours", "theirs"], bool], list[sqlite3.Row]]
+    ] = defaultdict(lambda: defaultdict(list)) 
+    for branch, cursor in branch_and_cursor:
+        # each row returns dictionary with keys "table", "rowid" (if exists), "parent" and "fkid"
+        rows = cursor.execute(f"PRAGMA foreign_key_check;").fetchall()
+        for row in rows:
+            invalid_foreign_key_tables[row["table"]][(branch, True)].append(row)
+            invalid_foreign_key_tables[row["parent"]][(branch, False)].append(row)
     for expr in (base_to_ours_parsed + base_to_theirs_parsed):
         table = get_target_table(expr)
         assert table is not None
         if table.name not in tables_set:
             tables_set.add(table.name)
-            pragma_check_table_failed_and_recorded(invalid_tables, table.name, base_cursor, ours_cursor, theirs_cursor)
-
+            pragma_check_table_failed_and_recorded(
+                invalid_tables, 
+                table.name, 
+                branch_and_cursor, 
+                base_cursor, 
+                ours_cursor, 
+                theirs_cursor)
+    for table_name in tables_set & invalid_foreign_key_tables.keys():
+        for (branch, is_child_table), invalid_rows in invalid_foreign_key_tables[table_name].items():
+            invalid_tables[table_name].invalid_reasons.append({
+                "failed_branch": branch,
+                "failure_type": f"pragma_foreign_check_failed - {'child table' if is_child_table else 'parent table'}",
+                "failure_rows_or_details": invalid_rows
+            })
     return invalid_tables
 
 def check_and_record_for_invalid_tables(invalid_tables, table_name, index, build_with_base_to_ours, is_building):
@@ -517,7 +533,7 @@ def main():
         input='\n'.join(stmts_to_apply), 
         text=True, 
         capture_output=True)
-    if len(diffs.conflict_pairs) > 0:
+    if len(diffs.conflict_pairs) > 0 or len(invalid_tables) > 0:
         out = {
             "conflicts": [{
                 "conflict_stmts": (base_to_ours[i1], base_to_theirs[i2]),
