@@ -55,7 +55,7 @@ class TestPragmaChecks:
 
         base_con, ours_con, theirs_con = _open_three_way(str(base_path), str(ours_path), str(theirs_path))
         try:
-            invalid_tables = merge_driver.check_valid_tables(
+            _, invalid_tables = merge_driver.check_valid_tables(
                 base_to_ours_parsed,
                 base_to_theirs_parsed,
                 base_con.cursor(),
@@ -105,7 +105,7 @@ class TestPragmaChecks:
 
         base_con, ours_con, theirs_con = _open_three_way(str(base_path), str(ours_path), str(theirs_path))
         try:
-            invalid_tables = merge_driver.check_valid_tables(
+            _, invalid_tables = merge_driver.check_valid_tables(
                 base_to_ours_parsed,
                 base_to_theirs_parsed,
                 base_con.cursor(),

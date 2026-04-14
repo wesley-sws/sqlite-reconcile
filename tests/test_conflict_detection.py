@@ -20,7 +20,7 @@ class TestConflictDetection:
         ours_cursor = ours_con.cursor()
         theirs_cursor = theirs_con.cursor()
 
-        invalid_tables = merge_driver.check_valid_tables(
+        _, invalid_tables = merge_driver.check_valid_tables(
             base_to_ours_parsed,
             base_to_theirs_parsed,
             base_cursor,
@@ -31,6 +31,7 @@ class TestConflictDetection:
             base_to_ours_parsed,
             base_to_theirs_parsed,
             invalid_tables,
+            {},
             base_cursor,
             ours_cursor,
             theirs_cursor,

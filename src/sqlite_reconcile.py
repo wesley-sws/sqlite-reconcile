@@ -13,6 +13,7 @@ import json
 import conflict_pairs
 from collections import defaultdict
 from typing import Literal, Iterable
+from contextlib import closing
 
 @dataclass
 class DiffBuckets:
@@ -38,12 +39,29 @@ class UniqueIndexState:
     column_names: tuple[str, ...]
     values_to_stmt_index: dict[tuple[object, ...], int] = field(default_factory=dict)
 
+# per table
 @dataclass
 class TableConflictState:
     primary_key_columns_to_index: dict[str, int]
     primary_key_value_to_data: dict[KeyTuple, KeyValueData]
     unique_key_column_names: set[str]
     unique_indexes: list[UniqueIndexState]
+    # look at child_references columns from parent_references from TableForeignLink
+    unique_indexes_outdated_values_as_parent: dict[tuple[object, ...], int] = field(default_factory=dict)
+    # look at parent_reference columns from child_references from TableForeignLink
+    column_values_as_child: dict[tuple[object, ...], int] = field(default_factory=dict)
+
+@dataclass
+class ForeignLinkMetadata:
+    linked_table: str
+    linked_table_columns: tuple[str, ...]
+
+@dataclass
+class TableForeignLink:
+    # OUR TABLE"S parent references: keyed by columns of our table
+    parent_references: dict[tuple[str, ...], ForeignLinkMetadata] = field(default_factory=dict)
+    # OUR TABLE"S children references: keyed by columns of our table
+    child_references: dict[tuple[str, ...], ForeignLinkMetadata] = field(default_factory=dict)
 
 transaction_begin = "BEGIN TRANSACTION;"
 transaction_end = "COMMIT;"
@@ -63,7 +81,7 @@ def apply_sql_to_temp_db(source_db_path, sql_script):
             raise RuntimeError(f"sqlite3 failed: {proc.stderr.strip()}")
 
         return temp_db_path  # caller can keep using this merged temp DB
-    except:
+    except Exception:
         if os.path.exists(temp_db_path):
             os.remove(temp_db_path)
         raise
@@ -89,13 +107,10 @@ def get_target_table(expr: Expression) -> expressions.Table:
         )
     return table_expr
 
-def pragma_check_table_failed_and_recorded(
+def pragma_integrity_check_table_failed_and_recorded(
         invalid_tables: dict[str, InvalidTableState], 
         table_name: str, 
-        branch_and_cursor: Iterable[tuple[Literal['base', 'ours', 'theirs'], sqlite3.Cursor]],
-        base_cursor: sqlite3.Cursor, 
-        ours_cursor: sqlite3.Cursor, 
-        theirs_cursor: sqlite3.Cursor):
+        branch_and_cursor: Iterable[tuple[Literal['base', 'ours', 'theirs'], sqlite3.Cursor]]):
     # note its possible the table have yet to exist in which case sqlite3 would give operational error
     # though in that case it would be a schema diff problem which we aim to flag error for now
     for branch, cursor in branch_and_cursor:
@@ -112,7 +127,8 @@ def check_valid_tables(
         base_to_theirs_parsed: list[Expression], 
         base_cursor: sqlite3.Cursor, 
         ours_cursor: sqlite3.Cursor, 
-        theirs_cursor: sqlite3.Cursor) -> dict[str, InvalidTableState]:
+        theirs_cursor: sqlite3.Cursor) -> tuple[set[str], dict[str, InvalidTableState]]:
+    '''run pragma foreign key and integrity check and returns invalid tables and tables set'''
     tables_set = set()
     invalid_tables = defaultdict(lambda: InvalidTableState([]))
     branch_and_cursor = tuple(zip(("base", "ours", "theirs"), (base_cursor, ours_cursor, theirs_cursor)))
@@ -131,13 +147,10 @@ def check_valid_tables(
         assert table is not None
         if table.name not in tables_set:
             tables_set.add(table.name)
-            pragma_check_table_failed_and_recorded(
+            pragma_integrity_check_table_failed_and_recorded(
                 invalid_tables, 
                 table.name, 
-                branch_and_cursor, 
-                base_cursor, 
-                ours_cursor, 
-                theirs_cursor)
+                branch_and_cursor)
     for table_name in tables_set & invalid_foreign_key_tables.keys():
         for (branch, is_child_table), invalid_rows in invalid_foreign_key_tables[table_name].items():
             invalid_tables[table_name].invalid_reasons.append({
@@ -145,7 +158,62 @@ def check_valid_tables(
                 "failure_type": f"pragma_foreign_check_failed - {'child table' if is_child_table else 'parent table'}",
                 "failure_rows_or_details": invalid_rows
             })
-    return invalid_tables
+    return tables_set, invalid_tables
+
+def check_and_add_table_foreign_link_entry(
+        table_to_table_foreign_link: dict[str, TableForeignLink], 
+        child_table: str, 
+        parent_table: str, 
+        child_columns: tuple[str], 
+        parent_columns: tuple[str]):
+    if len(child_columns) == 0 or len(parent_columns) == 0:
+        return
+    table_to_table_foreign_link[child_table].parent_references[child_columns] = \
+        ForeignLinkMetadata(parent_table, parent_columns)
+    table_to_table_foreign_link[parent_table].child_references[parent_columns] = \
+        ForeignLinkMetadata(child_table, child_columns)
+
+def create_table_to_foreign_link_information(
+        tables_set: set[str], 
+        invalid_tables: dict[str, InvalidTableState],
+        base_cursor: sqlite3.Cursor,
+        ) -> dict[str, TableForeignLink]:
+    table_to_table_foreign_link = defaultdict(lambda: TableForeignLink())
+    for table in tables_set:
+        if table in invalid_tables:
+            continue
+        rows = base_cursor.execute(f"SELECT * FROM pragma_foreign_key_list('{table}');").fetchall()
+        if len(rows) == 0:
+            continue
+        curr_id = rows[0]["id"]
+        curr_parent_table = rows[0]["table"]
+        curr_child_columns = []
+        curr_parent_columns = []
+        for row in rows:
+            if row["id"] != curr_id:
+                check_and_add_table_foreign_link_entry(
+                    table_to_table_foreign_link,
+                    table, 
+                    curr_parent_table, 
+                    tuple(curr_child_columns), 
+                    tuple(curr_parent_columns)
+                    )
+                curr_id = row["id"]
+                curr_parent_table = row["table"]
+                curr_child_columns = []
+                curr_parent_columns = []
+            if curr_parent_table not in tables_set or curr_parent_table in invalid_tables:
+                continue
+            curr_child_columns.append(row["from"])
+            curr_parent_columns.append(row["to"])
+        check_and_add_table_foreign_link_entry(
+            table_to_table_foreign_link,
+            table, 
+            curr_parent_table, 
+            tuple(curr_child_columns), 
+            tuple(curr_parent_columns)
+            )
+    return table_to_table_foreign_link
 
 def check_and_record_for_invalid_tables(invalid_tables, table_name, index, build_with_base_to_ours, is_building):
     '''returns true if table is invalid'''
@@ -294,6 +362,7 @@ def check_conflict_and_return_final_diff(
         base_to_ours_parsed: list[Expression], 
         base_to_theirs_parsed: list[Expression],
         invalid_tables: dict[str, InvalidTableState],
+        table_to_table_foreign_link: dict[str, TableForeignLink],
         base_cursor: sqlite3.Cursor,
         ours_cursor: sqlite3.Cursor,
         theirs_cursor: sqlite3.Cursor) -> DiffBuckets:
@@ -307,7 +376,7 @@ def check_conflict_and_return_final_diff(
     by primary key) in both base_to_ours and base_to_theirs 
     - insert-insert: check values the same
     - insert-update or insert-delete don't make sense so no need to consider
-    - delete-delete: cross appliaction and diffing would handle this (no conflict)
+    - delete-delete: cross appliaction and diffing would handle this (no conflict)p
     - update-update: check values updated the same
     - update-delete: check primary key the same, and if YES raise conflict
     with sqldiff, the update and delete will always have its primary key value
@@ -508,21 +577,20 @@ def main():
     base_to_ours_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_ours]
     base_to_theirs_parsed: list[Expression] = [sqlglot.parse_one(statement) for statement in base_to_theirs]
 
-    base_con = sqlite3.connect(args.base)
-    ours_con, theirs_con = sqlite3.connect(args.ours), sqlite3.connect(args.theirs)
-    base_con.row_factory = sqlite3.Row
-    ours_con.row_factory = sqlite3.Row
-    theirs_con.row_factory = sqlite3.Row
-    base_cursor = base_con.cursor()
-    ours_cursor = ours_con.cursor()
-    theirs_cursor = theirs_con.cursor()
+    with closing(sqlite3.connect(args.base)) as base_con, \
+     closing(sqlite3.connect(args.ours)) as ours_con, \
+     closing(sqlite3.connect(args.theirs)) as theirs_con:
+        base_con.row_factory = sqlite3.Row
+        ours_con.row_factory = sqlite3.Row
+        theirs_con.row_factory = sqlite3.Row
+        base_cursor = base_con.cursor()
+        ours_cursor = ours_con.cursor()
+        theirs_cursor = theirs_con.cursor()
 
-    invalid_tables = check_valid_tables(base_to_ours_parsed, base_to_theirs_parsed, base_cursor, ours_cursor, theirs_cursor)
-    diffs = check_conflict_and_return_final_diff(base_to_ours_parsed, base_to_theirs_parsed, invalid_tables, base_cursor, ours_cursor, theirs_cursor)
-    
-    base_con.close()
-    ours_con.close()
-    theirs_con.close()
+        tables_set, invalid_tables = check_valid_tables(base_to_ours_parsed, base_to_theirs_parsed, base_cursor, ours_cursor, theirs_cursor)
+        table_to_table_foreign_link = create_table_to_foreign_link_information(tables_set, invalid_tables, base_cursor)
+        diffs = check_conflict_and_return_final_diff(base_to_ours_parsed, base_to_theirs_parsed, invalid_tables, table_to_table_foreign_link, base_cursor, ours_cursor, theirs_cursor)
+
     stmts_to_apply = \
         [base_to_ours[i] for i in diffs.matched_ours_indices] + \
         [base_to_ours[i] for i in diffs.extra_ours_indices] + \
