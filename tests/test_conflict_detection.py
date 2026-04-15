@@ -1,6 +1,7 @@
 import pytest
 import sqlite3
 import sqlglot
+from collections import defaultdict
 
 
 class TestConflictDetection:
@@ -35,6 +36,7 @@ class TestConflictDetection:
             base_cursor,
             ours_cursor,
             theirs_cursor,
+            defaultdict(lambda: merge_driver.TableForeignKeyConflictState()),
         )
 
         base_con.close()
