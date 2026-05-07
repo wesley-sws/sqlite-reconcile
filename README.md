@@ -158,12 +158,10 @@ This policy is intentional: if the merged database is FK-valid, we treat it as a
 - Unkeyed tables are skipped
 - Cascading deletes treated as independent operations
 - Semantic rename/move inference is intentionally conservative; ambiguous delete+insert similarity is not auto-merged into an inferred update
-- Unique-constraint conflicts are handled conservatively and may surface as unresolved conflicts even when a manual rename would be safe
 - Current unique-index checks assume each input snapshot already satisfies its own unique constraints; pre-existing unique violations are out of scope and can lead to undefined conflict classification
 - Composite primary-key `NULL` edge cases are intentionally not special-cased yet
 - Foreign-key conflict reporting is conservative and action-agnostic; FK actions are not currently used to suppress conflicts
 - Foreign-key checking is pairwise plus final `foreign_key_check`; multi-hop intent inference is not required for this FK-integrity objective
-- Tested on <100MB files
 
 ## License
 

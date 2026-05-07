@@ -45,3 +45,20 @@ class UniqueIndexesConflict(ConflictPairs):
             "index_name": self.index_name,
             "index_columns": list(self.index_columns),
         }
+
+@dataclass(frozen=True)
+class ForeignIndexesConflict(ConflictPairs):
+    index_columns_parent: tuple[str, ...]
+    index_columns_child: tuple[str, ...]
+
+    @property
+    def conflict_type(self) -> str:
+        return "foreign_index"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "conflict_type": self.conflict_type,
+            "index_columns_parent": list(self.index_columns_parent),
+            "index_columns_child": list(self.index_columns_child),
+        }
+    

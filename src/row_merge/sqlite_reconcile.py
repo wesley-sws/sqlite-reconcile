@@ -2,7 +2,6 @@ import sys
 import sqlite3
 import argparse
 import subprocess
-import utils
 import shutil
 import tempfile
 import os
@@ -10,10 +9,12 @@ import sqlglot
 from sqlglot import (Expression, expressions)
 from dataclasses import dataclass, field, asdict
 import json
-import conflict_pairs
 from collections import defaultdict
 from typing import Literal, Iterable
 from contextlib import closing
+
+from . import utils
+from . import conflict_pairs
 
 @dataclass
 class DiffBuckets:
@@ -143,7 +144,7 @@ def check_valid_tables(
         rows = cursor.execute(f"PRAGMA foreign_key_check;").fetchall()
         for row in rows:
             invalid_foreign_key_tables[row["table"]][(branch, True)].append(row)
-            invalid_foreign_key_tables[row["parent"]][(branch, False)].append(row)
+            #invalid_foreign_key_tables[row["parent"]][(branch, False)].append(row)
     for expr in (base_to_ours_parsed + base_to_theirs_parsed):
         table = get_target_table(expr)
         assert table is not None
@@ -163,23 +164,23 @@ def check_valid_tables(
     return tables_set, invalid_tables
 
 def check_and_add_table_foreign_link_entry(
-        table_to_table_foreign_link: dict[str, TableForeignLink], 
+        table_name_to_table_foreign_link: dict[str, TableForeignLink], 
         child_table: str, 
         parent_table: str, 
         child_columns: tuple[str], 
         parent_columns: tuple[str]):
     if len(child_columns) == 0 or len(parent_columns) == 0:
         return
-    table_to_table_foreign_link[child_table].parent_references[child_columns] = \
+    table_name_to_table_foreign_link[child_table].parent_references[child_columns] = \
         ForeignLinkMetadata(parent_table, parent_columns)
-    table_to_table_foreign_link[parent_table].child_references.add(parent_columns)
+    table_name_to_table_foreign_link[parent_table].child_references.add(parent_columns)
 
 def create_table_to_foreign_link_information(
         tables_set: set[str], 
         invalid_tables: dict[str, InvalidTableState],
         base_cursor: sqlite3.Cursor,
         ) -> dict[str, TableForeignLink]:
-    table_to_table_foreign_link = defaultdict(lambda: TableForeignLink())
+    table_name_to_table_foreign_link = defaultdict(lambda: TableForeignLink())
     for table in tables_set:
         if table in invalid_tables:
             continue
@@ -193,7 +194,7 @@ def create_table_to_foreign_link_information(
         for row in rows:
             if row["id"] != curr_id:
                 check_and_add_table_foreign_link_entry(
-                    table_to_table_foreign_link,
+                    table_name_to_table_foreign_link,
                     table, 
                     curr_parent_table, 
                     tuple(curr_child_columns), 
@@ -208,13 +209,13 @@ def create_table_to_foreign_link_information(
             curr_child_columns.append(row["from"])
             curr_parent_columns.append(row["to"])
         check_and_add_table_foreign_link_entry(
-            table_to_table_foreign_link,
+            table_name_to_table_foreign_link,
             table, 
             curr_parent_table, 
             tuple(curr_child_columns), 
             tuple(curr_parent_columns)
             )
-    return table_to_table_foreign_link
+    return table_name_to_table_foreign_link
 
 def check_and_record_for_invalid_tables(invalid_tables, table_name, index, build_with_base_to_ours, is_building):
     '''returns true if table is invalid'''
@@ -396,13 +397,14 @@ def add_pk_conflict(conflict_stmts, build_with_base_to_ours, lookup_list_i, tabl
         build_with_base_to_ours, lookup_list_i, table_list_i
     )].append(conflict_pairs.PrimaryKeyConflict())
 
-def check_conflict_and_return_final_diff(
-        base_to_ours_parsed: list[Expression], 
-        base_to_theirs_parsed: list[Expression],
-        invalid_tables: dict[str, InvalidTableState],
-        table_to_table_foreign_link: dict[str, TableForeignLink],
-        base_cursor: sqlite3.Cursor,
-        ours_cursor: sqlite3.Cursor,
+def check_conflict_and_return_diffs(
+    base_to_ours_parsed: list[Expression], 
+    base_to_theirs_parsed: list[Expression],
+    table_name_to_table_conflict_state: dict[str, TableConflictState],
+    invalid_tables: dict[str, InvalidTableState],
+    table_name_to_table_foreign_link: dict[str, TableForeignLink],
+    base_cursor: sqlite3.Cursor,
+    ours_cursor: sqlite3.Cursor,
     theirs_cursor: sqlite3.Cursor,
     table_name_to_table_foreign_key_conflict_state: dict[str, TableForeignKeyConflictState]) -> DiffBuckets:
     '''approach:
@@ -411,18 +413,11 @@ def check_conflict_and_return_final_diff(
     exception and/or update the parsed list where applicable
     - return updated parsed list to apply / conflict if any
     Changes to data can be classified into insert, update and delete statements
-    Let's consider the combinations of the statements with the same row (identified
-    by primary key) in both base_to_ours and base_to_theirs 
-    - insert-insert: check values the same
-    - insert-update or insert-delete don't make sense so no need to consider
-    - delete-delete: cross appliaction and diffing would handle this (no conflict)p
-    - update-update: check values updated the same
-    - update-delete: check primary key the same, and if YES raise conflict
+    side effects on invalid_tables, table_name_to_table_foreign_key_conflict_state and table_name_to_table_conflict_state
     with sqldiff, the update and delete will always have its primary key value
     in the where clause
     '''
     build_cursor, lookup_cursor = ours_cursor, theirs_cursor
-    table_name_to_table_conflict_state: dict[str, TableConflictState] = {}
     # build hashed table
     to_build, to_lookup = base_to_ours_parsed, base_to_theirs_parsed
     build_with_base_to_ours = True
@@ -449,7 +444,7 @@ def check_conflict_and_return_final_diff(
             table_conflict_state.primary_key_columns_to_index,
             expr
         )
-        table_is_parent = table.name in table_to_table_foreign_link and len(table_to_table_foreign_link[table.name].child_references) > 0
+        table_is_parent = table.name in table_name_to_table_foreign_link and len(table_name_to_table_foreign_link[table.name].child_references) > 0
         if isinstance(expr, expressions.Delete):
             assert key_values is not None
             key_values_to_data[key_values] = (i, expressions.Delete, None)
@@ -459,15 +454,17 @@ def check_conflict_and_return_final_diff(
                 process_delete_for_foreign_link_as_parent(
                     row, 
                     i, 
-                    table_to_table_foreign_link[table.name].child_references,
+                    table_name_to_table_foreign_link[table.name].child_references,
                     get_foreign_dict_to_add(table_name_to_table_foreign_key_conflict_state[table.name], build_with_base_to_ours)
                     )
         elif isinstance(expr, expressions.Insert):
-            for row in expr.expression.expressions:
-                primary_values_tuple, column_to_literal = \
-                    get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
-                key_values_to_data[tuple(primary_values_tuple)] = (i, expressions.Insert, column_to_literal) # type: ignore
-            
+            values_rows = expr.expression.expressions
+            assert len(values_rows) == 1
+            insert_row = values_rows[0]
+            primary_values_tuple, column_to_literal = \
+                get_key_values_and_column_to_literal_insert(insert_row, expr.this, table_conflict_state.primary_key_columns_to_index)
+            key_values_to_data[tuple(primary_values_tuple)] = (i, expressions.Insert, column_to_literal) # type: ignore
+        
             row = get_full_row_from_expr(expr, table.name, build_cursor, table_conflict_state.primary_key_columns_to_index)
             add_or_check_unique_indexes_value(row, table_conflict_state.unique_indexes, i, True)
         elif isinstance(expr, expressions.Update):
@@ -489,7 +486,7 @@ def check_conflict_and_return_final_diff(
                         row, 
                         i, 
                         relevant_unique_indexes,
-                        table_to_table_foreign_link[table.name].child_references,
+                        table_name_to_table_foreign_link[table.name].child_references,
                         get_foreign_dict_to_add(table_name_to_table_foreign_key_conflict_state[table.name], build_with_base_to_ours)
                         )
     res_match = [] # using index from base_to_ours
@@ -503,7 +500,7 @@ def check_conflict_and_return_final_diff(
     for i, expr in enumerate(to_lookup):
         table = get_target_table(expr)
         assert table is not None
-        table_is_parent = table.name in table_to_table_foreign_link and len(table_to_table_foreign_link[table.name].child_references) > 0
+        table_is_parent = table.name in table_name_to_table_foreign_link and len(table_name_to_table_foreign_link[table.name].child_references) > 0
         if check_and_record_for_invalid_tables(invalid_tables, table.name, i, build_with_base_to_ours, is_building=False):
             continue
         if table.name not in table_name_to_table_conflict_state:
@@ -522,7 +519,7 @@ def check_conflict_and_return_final_diff(
                 process_delete_for_foreign_link_as_parent(
                     row,
                     i,
-                    table_to_table_foreign_link[table.name].child_references,
+                    table_name_to_table_foreign_link[table.name].child_references,
                     get_foreign_dict_to_add(table_name_to_table_foreign_key_conflict_state[table.name], not build_with_base_to_ours)
                     )
             if key_values not in key_values_to_data:
@@ -536,6 +533,25 @@ def check_conflict_and_return_final_diff(
                 key_values_to_data.pop(key_values)
 
         elif isinstance(expr, expressions.Insert):
+            to_add_to_extra = False
+            values_rows = expr.expression.expressions
+            assert len(values_rows) == 1
+            insert_row = values_rows[0]
+            primary_values_tuple, curr_column_to_literal = \
+                get_key_values_and_column_to_literal_insert(insert_row, expr.this, table_conflict_state.primary_key_columns_to_index)
+            if primary_values_tuple not in key_values_to_data:
+                to_add_to_extra = True
+            else:
+                i2, t, column_to_literal = key_values_to_data[primary_values_tuple]
+                assert t is expressions.Insert
+                if column_to_literal == curr_column_to_literal:
+                    add_to_res_match(res_match, build_with_base_to_ours, i, i2)
+                    key_values_to_data.pop(primary_values_tuple)
+                    # impossible for any matching statements to have conflict so simply continue
+                    continue
+                else:
+                    add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                key_values_to_data.pop(primary_values_tuple)
             row = get_full_row_from_expr(expr, table.name, lookup_cursor, table_conflict_state.primary_key_columns_to_index)
             check_entry = add_or_check_unique_indexes_value(row, table_conflict_state.unique_indexes, i, False)
             if check_entry is not None:
@@ -544,32 +560,41 @@ def check_conflict_and_return_final_diff(
                         build_with_base_to_ours, i, entry[0]
                     )].append(conflict_pairs.UniqueIndexesConflict(
                         entry[1], entry[2]))
-            for row in expr.expression.expressions:
-                primary_values_tuple, curr_column_to_literal = \
-                    get_key_values_and_column_to_literal_insert(row, expr.this, table_conflict_state.primary_key_columns_to_index)
-                if primary_values_tuple not in key_values_to_data:
-                    if check_entry is None:
-                        list_to_add_for_failed_lookup.append(i)
-                else:
-                    i2, t, column_to_literal = key_values_to_data[primary_values_tuple]
-                    assert t is expressions.Insert
-                    if column_to_literal == curr_column_to_literal:
-                        if check_entry is None:
-                            add_to_res_match(res_match, build_with_base_to_ours, i, i2)
-                    else:
-                        add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
-                    key_values_to_data.pop(primary_values_tuple)
+            elif to_add_to_extra:
+                list_to_add_for_failed_lookup.append(i)
+                
+        # TODO - BUG!! unique index collision false positive if both unique indexes are updated to the same thing
         elif isinstance(expr, expressions.Update):
+
             assert key_values is not None
             curr_column_to_literal = {}
             are_unique_index_column_updated = False
             check_entry = None
             columns_updated = set()
+
             for e in expr.args["expressions"]:
                 curr_column_to_literal[e.this.name] = e.expression
                 are_unique_index_column_updated |= e.this.name in table_conflict_state.unique_key_column_names
                 columns_updated.add(e.this.name)
+            to_add_to_extra = False
+            if key_values not in key_values_to_data:
+                to_add_to_extra = True
+            else:
+                # pk check
+                i2, t, column_to_literal = key_values_to_data[key_values]
+                if t is expressions.Delete:
+                    add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                elif t is expressions.Update:
+                    if curr_column_to_literal == column_to_literal:
+                        add_to_res_match(res_match, build_with_base_to_ours, i, i2)
+                        key_values_to_data.pop(key_values)
+                        # impossible for any matching statements to have conflict so simply continue
+                        continue
+                    else:
+                        add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
+                key_values_to_data.pop(key_values)
             if are_unique_index_column_updated:
+                # unique index check and build foreign
                 row = get_full_row_from_expr(expr, table.name, lookup_cursor)
                 relevant_unique_indexes = get_relevant_unique_indexes_from_update(table_conflict_state.unique_indexes, row, columns_updated)
                 check_entry = add_or_check_unique_indexes_value(row, relevant_unique_indexes, i, False)
@@ -584,23 +609,11 @@ def check_conflict_and_return_final_diff(
                         row, 
                         i, 
                         relevant_unique_indexes,
-                        table_to_table_foreign_link[table.name].child_references,
+                        table_name_to_table_foreign_link[table.name].child_references,
                         get_foreign_dict_to_add(table_name_to_table_foreign_key_conflict_state[table.name], build_with_base_to_ours)
                         )
-            if key_values not in key_values_to_data:
-                if check_entry is None:
-                    list_to_add_for_failed_lookup.append(i)
-            else:
-                i2, t, column_to_literal = key_values_to_data[key_values]
-                if t is expressions.Delete:
-                    add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
-                elif t is expressions.Update:
-                    if curr_column_to_literal == column_to_literal:
-                        if check_entry is None:
-                            add_to_res_match(res_match, build_with_base_to_ours, i, i2)
-                    else:
-                        add_pk_conflict(conflict_stmts_pair, build_with_base_to_ours, i, i2)
-                key_values_to_data.pop(key_values)
+            if check_entry is None and to_add_to_extra:
+                list_to_add_for_failed_lookup.append(i)
 
     list_to_add_for_remaining_table_entries = extra_stmts_base_to_ours \
         if build_with_base_to_ours \
@@ -609,6 +622,82 @@ def check_conflict_and_return_final_diff(
         list_to_add_for_remaining_table_entries.extend(
             data[0] for data in table_conflict_state.primary_key_value_to_data.values())
     return DiffBuckets(res_match, extra_stmts_base_to_ours, extra_stmts_base_to_theirs, conflict_stmts_pair)
+
+def get_relevant_fk_from_update(
+    unique_indexes: list[UniqueIndexState],
+    row: sqlite3.Row,
+    columns_updated: set[str]
+    ) -> list[UniqueIndexState]:
+    unique_indexes_updated = []
+    for unique_index in unique_indexes:
+        curr_unique_index_columns_updated = False
+        has_null_value = False
+        for column_name in unique_index.column_names:
+            curr_unique_index_columns_updated |= column_name in columns_updated
+            if row[column_name] is None:
+                has_null_value = True
+                break
+        if curr_unique_index_columns_updated and not has_null_value:
+            unique_indexes_updated.append(unique_index)
+    return unique_indexes_updated
+
+def check_fk_violation(
+    expr: Expression,
+    cursor: sqlite3.Cursor,
+    table_name_to_table_foreign_link: dict[str, TableForeignLink],
+    table_name_to_table_foreign_key_conflict_state: dict[str, TableForeignKeyConflictState],
+    table_name_to_table_conflict_state: dict[str, TableConflictState]
+) -> conflict_pairs.ForeignIndexesConflict | None:
+    table = get_target_table(expr)
+    assert table is not None
+    if table.name not in table_name_to_table_foreign_link or \
+        len(table_name_to_table_foreign_link[table.name].parent_references) == 0 \
+        or type(expr) not in (expressions.Insert, expressions.Update):
+        return
+    row = get_full_row_from_expr(
+        expr, 
+        table.name, 
+        cursor, 
+        table_name_to_table_conflict_state[table.name].primary_key_columns_to_index)
+    
+    for cols, link_data in table_name_to_table_foreign_link[table.name].parent_references:
+        ...
+
+    ...
+
+def foreign_key_check(
+    base_to_ours_parsed: list[Expression], 
+    base_to_theirs_parsed: list[Expression], 
+    ours_cursor: sqlite3.Cursor, 
+    theirs_cursor: sqlite3.Cursor, 
+    table_name_to_table_conflict_state: dict[str, TableConflictState],
+    diffs: DiffBuckets, 
+    table_name_to_table_foreign_link: dict[str, TableForeignLink],
+    table_name_to_table_foreign_key_conflict_state: dict[str, TableForeignKeyConflictState],
+) -> DiffBuckets:
+    '''
+    NOTE (will prob delete later): rmb to check that the outdated unique index entry in parent
+    table does not have a corresponding insert with the same outdated values (that is very much possible)
+    '''
+    new_extra_ours, new_extra_theirs = [], []
+    conflict_pair_ours, conflict_pair_theirs = zip(*diffs.conflict_pairs.keys())
+    for index in diffs.extra_ours_indices:
+        check_fk_violation(
+            base_to_ours_parsed[index], 
+            ours_cursor, 
+            table_name_to_table_foreign_link, 
+            table_name_to_table_foreign_key_conflict_state,
+            table_name_to_table_conflict_state)
+    for index in diffs.extra_theirs_indices:
+        ...
+    if len(diffs.conflict_pairs) > 0:
+        conflict_pair_ours, conflict_pair_theirs = zip(*diffs.conflict_pairs.keys())
+        for index in set(conflict_pair_ours):
+            ...
+        for index in set(conflict_pair_theirs):
+            ...
+    return diffs
+
 
 def main():
     parser = argparse.ArgumentParser(description='SQLite merge driver')
@@ -641,20 +730,32 @@ def main():
         theirs_cursor = theirs_con.cursor()
 
         tables_set, invalid_tables = check_valid_tables(base_to_ours_parsed, base_to_theirs_parsed, base_cursor, ours_cursor, theirs_cursor)
-        table_to_table_foreign_link = create_table_to_foreign_link_information(tables_set, invalid_tables, base_cursor)
+        table_name_to_table_foreign_link = create_table_to_foreign_link_information(tables_set, invalid_tables, base_cursor)
+        
         table_name_to_table_foreign_key_conflict_state: dict[str, TableForeignKeyConflictState] = defaultdict(
             lambda: TableForeignKeyConflictState())
-        diffs = check_conflict_and_return_final_diff(
+        table_name_to_table_conflict_state: dict[str, TableConflictState] = {}
+        diffs = check_conflict_and_return_diffs(
             base_to_ours_parsed, 
             base_to_theirs_parsed, 
+            table_name_to_table_conflict_state,
             invalid_tables, 
-            table_to_table_foreign_link, 
+            table_name_to_table_foreign_link, 
             base_cursor, 
             ours_cursor, 
             theirs_cursor,
             # passed by reference
             table_name_to_table_foreign_key_conflict_state)
-        
+        # TODO - implement an extra pass for foreign table
+        final_diffs = foreign_key_check(
+            base_to_ours_parsed, 
+            base_to_theirs_parsed, 
+            ours_cursor, 
+            theirs_cursor, 
+            table_name_to_table_conflict_state,
+            diffs, 
+            table_name_to_table_foreign_link,
+            table_name_to_table_foreign_key_conflict_state)
 
     stmts_to_apply = \
         [base_to_ours[i] for i in diffs.matched_ours_indices] + \

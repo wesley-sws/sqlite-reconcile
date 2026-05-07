@@ -7,8 +7,8 @@ import shutil
 from pathlib import Path
 
 # Add src directory to path so we can import the merge driver
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-import sqlite_reconcile
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+import row_merge.sqlite_reconcile as sqlite_reconcile
 
 
 @pytest.fixture(scope="session")

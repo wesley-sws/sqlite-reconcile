@@ -28,9 +28,10 @@ class TestConflictDetection:
             ours_cursor,
             theirs_cursor,
         )
-        diffs = merge_driver.check_conflict_and_return_final_diff(
+        diffs = merge_driver.check_conflict_and_return_diffs(
             base_to_ours_parsed,
             base_to_theirs_parsed,
+            {},
             invalid_tables,
             {},
             base_cursor,
