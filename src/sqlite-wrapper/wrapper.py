@@ -15,10 +15,43 @@ Limitations:
     writes against the internal merge tables.
 - Depends on SQLite trace output, so the recorded SQL text is the executed
     statement text rather than a semantic parse tree.
+- The wrapper assumes all executed statements within a committed transaction 
+    succeed without errors. Statements that fail mid-transaction and cause a 
+    partial rollback may result in an incomplete log entry. Users are expected 
+    to handle errors and roll back transactions explicitly
 """
 
 import sqlite3
 from datetime import datetime
+import sqlglot
+from sqlglot import exp
+
+NONDETERMINISTIC = {
+    'random', 'randomblob', 'changes', 'last_insert_rowid', 
+    'sqlite3_version', 'current_timestamp', 'current_date', 'current_time'
+}
+
+DATE_TIME_FUNCTIONS = {'datetime', 'date', 'time', 'julianday', 'strftime', 'unixepoch'}
+
+def rewrite_nondeterministic(sql, conn):
+    tree = sqlglot.parse_one(sql, dialect="sqlite")
+    
+    for func in tree.find_all(exp.Anonymous, exp.CurrentTimestamp, exp.CurrentDate):
+        name = func.name.lower() if hasattr(func, 'name') else ''
+        
+        if name in NONDETERMINISTIC:
+            # evaluate and replace with literal
+            value = conn.execute(f"SELECT {func.sql()}").fetchone()[0]
+            func.replace(exp.Literal.string(str(value)))
+        
+        elif name in DATE_TIME_FUNCTIONS:
+            # check if 'now' is an argument
+            args = func.sql()
+            if 'now' in args.lower():
+                value = conn.execute(f"SELECT {args}").fetchone()[0]
+                func.replace(exp.Literal.string(str(value)))
+    
+    return tree.sql(dialect="sqlite")
 
 # Table names - prefixed to avoid collision with user tables
 LOG_TABLE = "_sqlite_merge_log"
@@ -54,6 +87,13 @@ def _should_log(sql_upper: str) -> bool:
     if LOG_TABLE.upper() in sql_upper or TX_TABLE.upper() in sql_upper:
         return False
     return sql_upper.startswith(INCLUDED)
+
+
+def _rewrite_if_logged(sql: str, conn: sqlite3.Connection) -> str:
+    stripped = sql.strip()
+    if not _should_log(stripped.upper()):
+        return sql
+    return rewrite_nondeterministic(sql, conn)
 
 
 class SQLiteWrapper:
@@ -189,13 +229,20 @@ class SQLiteWrapper:
     # Public API - mirrors sqlite3.Connection
 
     def execute(self, sql, parameters=()):
-        return self._conn.execute(sql, parameters)
+        rewritten = _rewrite_if_logged(sql, self._conn)
+        return self._conn.execute(rewritten, parameters)
 
     def executemany(self, sql, seq_of_parameters):
-        return self._conn.executemany(sql, seq_of_parameters)
+        rewritten = _rewrite_if_logged(sql, self._conn)
+        return self._conn.executemany(rewritten, seq_of_parameters)
 
     def executescript(self, sql_script):
-        return self._conn.executescript(sql_script)
+        statements = sqlglot.parse(sql_script, dialect="sqlite")
+        rewritten = '; '.join(
+            _rewrite_if_logged(s.sql(dialect="sqlite"), self._conn)
+            for s in statements
+        )
+        return self._conn.executescript(rewritten)
 
     def cursor(self):
         return self._conn.cursor()
