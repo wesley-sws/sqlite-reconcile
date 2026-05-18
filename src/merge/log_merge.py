@@ -17,8 +17,12 @@ from .statement_metadata import (
     StatementMetadata,
     TableColumns,
     UNQUALIFIED_TABLE,
-    is_sql_expression,
     parse_statement_metadata,
+)
+from .utils import (
+    is_sql_expression,
+    quote_identifier,
+    row_value,
     sql_expression_to_sql,
 )
 
@@ -27,7 +31,15 @@ LOG_TABLE = "_sqlite_merge_log"
 TX_TABLE = "_sqlite_merge_transactions"
 
 BranchName = Literal["ours", "theirs"]
-ConflictDetector = Callable[["LoggedStatement", "LoggedStatement"], bool]
+ConflictKind = Literal[
+    "write_write",
+    "write_read",
+    "implicit_insert_key",
+    "implicit_insert_default",
+    "integrity",
+    "non_commutative",
+    "replay_error",
+]
 
 
 @dataclass(frozen=True)
@@ -47,6 +59,35 @@ class ConflictPair:
     theirs_index: int
     ours_sql: str
     theirs_sql: str
+    conflicts: tuple["StatementConflict", ...] = ()
+
+
+@dataclass(frozen=True)
+class ConflictCheckContext:
+    base_cursor: sqlite3.Cursor
+    base_db_path: str | Path
+    table_columns: TableColumns
+
+
+@dataclass(frozen=True)
+class StatementConflict:
+    kind: ConflictKind
+    message: str
+
+
+@dataclass(frozen=True)
+class ConflictCheckResult:
+    conflicts: tuple[StatementConflict, ...] = ()
+
+    @property
+    def has_conflict(self) -> bool:
+        return bool(self.conflicts)
+
+
+ConflictDetector = Callable[
+    [ConflictCheckContext, "LoggedStatement", "LoggedStatement"],
+    ConflictCheckResult,
+]
 
 
 @dataclass(frozen=True)
@@ -109,9 +150,16 @@ class MergeNotApplicableError(Exception):
         )
 
 
-def statements_conflict(ours_statement: LoggedStatement, theirs_statement: LoggedStatement) -> bool:
-    """Placeholder for the real per-statement conflict detector."""
-    return False
+def statements_conflict(
+    context: ConflictCheckContext,
+    ours_statement: LoggedStatement,
+    theirs_statement: LoggedStatement,
+) -> ConflictCheckResult:
+    """Default per-statement conflict detector."""
+
+    from .static_analysis import conflict_detection
+
+    return conflict_detection(context, ours_statement, theirs_statement)
 
 
 def make_logged_statement(
@@ -134,16 +182,6 @@ def make_logged_statement(
     )
 
 
-def _row_value(row: sqlite3.Row | tuple, key: str, index: int):
-    if isinstance(row, sqlite3.Row):
-        return row[key]
-    return row[index]
-
-
-def _quote_identifier(identifier: str) -> str:
-    return f'"{identifier.replace("\"", "\"\"")}"'
-
-
 def load_table_columns(cursor: sqlite3.Cursor) -> TableColumns:
     table_columns: TableColumns = {}
     table_rows = cursor.execute(
@@ -155,14 +193,14 @@ def load_table_columns(cursor: sqlite3.Cursor) -> TableColumns:
         """
     ).fetchall()
     for table_row in table_rows:
-        table_name = str(_row_value(table_row, "name", 0))
+        table_name = str(row_value(table_row, "name", 0))
         if table_name in (LOG_TABLE, TX_TABLE):
             continue
         pragma_rows = cursor.execute(
-            f"PRAGMA table_info({_quote_identifier(table_name)})"
+            f"PRAGMA table_info({quote_identifier(table_name)})"
         ).fetchall()
         table_columns[table_name] = {
-            str(_row_value(pragma_row, "name", 1))
+            str(row_value(pragma_row, "name", 1))
             for pragma_row in pragma_rows
         }
     return table_columns
@@ -235,24 +273,28 @@ def _conflict_pair(
     theirs: Sequence[LoggedStatement],
     ours_index: int,
     theirs_index: int,
+    result: ConflictCheckResult | None = None,
 ) -> ConflictPair:
     return ConflictPair(
         ours_index=ours_index,
         theirs_index=theirs_index,
         ours_sql=ours[ours_index].sql_text,
         theirs_sql=theirs[theirs_index].sql_text,
+        conflicts=() if result is None else result.conflicts,
     )
 
 
 def find_first_pairwise_conflict(
     ours: Sequence[LoggedStatement],
     theirs: Sequence[LoggedStatement],
+    context: ConflictCheckContext,
     conflict_detector: ConflictDetector = statements_conflict,
 ) -> ConflictPair | None:
     """Compare X1/Y1, X2/Y2, ... and return the first conflict."""
     for index, (ours_statement, theirs_statement) in enumerate(zip(ours, theirs)):
-        if conflict_detector(ours_statement, theirs_statement):
-            return _conflict_pair(ours, theirs, index, index)
+        result = conflict_detector(context, ours_statement, theirs_statement)
+        if result.has_conflict:
+            return _conflict_pair(ours, theirs, index, index, result)
     return None
 
 
@@ -260,6 +302,7 @@ def search_by_backtracking_ours(
     ours: Sequence[LoggedStatement],
     theirs: Sequence[LoggedStatement],
     conflict_index: int,
+    context: ConflictCheckContext,
     conflict_detector: ConflictDetector = statements_conflict,
 ) -> FrontierCandidate:
     """
@@ -271,23 +314,31 @@ def search_by_backtracking_ours(
     remote side is exhausted.
     """
     if conflict_index == 0:
+        result = conflict_detector(context, ours[0], theirs[conflict_index])
         return FrontierCandidate(
             name="backtrack_ours",
             ours_count=0,
             theirs_count=conflict_index,
-            next_conflict=_conflict_pair(ours, theirs, 0, conflict_index),
+            next_conflict=_conflict_pair(ours, theirs, 0, conflict_index, result),
         )
     ours_index = conflict_index - 1
     theirs_index = conflict_index
 
     while theirs_index < len(theirs):
-        if conflict_detector(ours[ours_index], theirs[theirs_index]):
+        result = conflict_detector(context, ours[ours_index], theirs[theirs_index])
+        if result.has_conflict:
             if ours_index == 0:
                 return FrontierCandidate(
                     name="backtrack_ours",
                     ours_count=0,
                     theirs_count=theirs_index,
-                    next_conflict=_conflict_pair(ours, theirs, ours_index, theirs_index),
+                    next_conflict=_conflict_pair(
+                        ours,
+                        theirs,
+                        ours_index,
+                        theirs_index,
+                        result,
+                    ),
                 )
             ours_index -= 1
             continue
@@ -305,6 +356,7 @@ def search_by_backtracking_theirs(
     ours: Sequence[LoggedStatement],
     theirs: Sequence[LoggedStatement],
     conflict_index: int,
+    context: ConflictCheckContext,
     conflict_detector: ConflictDetector = statements_conflict,
 ) -> FrontierCandidate:
     """Mirror of search_by_backtracking_ours, keeping more local statements."""
@@ -312,21 +364,29 @@ def search_by_backtracking_theirs(
     ours_index = conflict_index
 
     if theirs_index < 0:
+        result = conflict_detector(context, ours[conflict_index], theirs[0])
         return FrontierCandidate(
             name="backtrack_theirs",
             ours_count=conflict_index,
             theirs_count=0,
-            next_conflict=_conflict_pair(ours, theirs, conflict_index, 0),
+            next_conflict=_conflict_pair(ours, theirs, conflict_index, 0, result),
         )
 
     while ours_index < len(ours):
-        if conflict_detector(ours[ours_index], theirs[theirs_index]):
+        result = conflict_detector(context, ours[ours_index], theirs[theirs_index])
+        if result.has_conflict:
             if theirs_index == 0:
                 return FrontierCandidate(
                     name="backtrack_theirs",
                     ours_count=ours_index,
                     theirs_count=0,
-                    next_conflict=_conflict_pair(ours, theirs, ours_index, theirs_index),
+                    next_conflict=_conflict_pair(
+                        ours,
+                        theirs,
+                        ours_index,
+                        theirs_index,
+                        result,
+                    ),
                 )
             theirs_index -= 1
             continue
@@ -396,68 +456,60 @@ def build_merge_plan(
             table_columns=table_columns,
         )
 
-    first_conflict = find_first_pairwise_conflict(ours, theirs, conflict_detector)
-    if first_conflict is None:
-        selected = FrontierCandidate(
-            name="clean",
-            ours_count=len(ours),
-            theirs_count=len(theirs),
-            next_conflict=None,
+        context = ConflictCheckContext(
+            base_cursor=base_cursor,
+            base_db_path=base_db_path,
+            table_columns=table_columns,
         )
+        first_conflict = find_first_pairwise_conflict(
+            ours,
+            theirs,
+            context,
+            conflict_detector,
+        )
+        if first_conflict is None:
+            selected = FrontierCandidate(
+                name="clean",
+                ours_count=len(ours),
+                theirs_count=len(theirs),
+                next_conflict=None,
+            )
+            return MergePlan(
+                status="clean",
+                base_transaction_id=base_transaction_id,
+                ours=ours,
+                theirs=theirs,
+                selected=selected,
+                statement_plan=ordered_statement_plan(ours, theirs, selected),
+            )
+
+        candidates = [
+            search_by_backtracking_ours(
+                ours,
+                theirs,
+                first_conflict.ours_index,
+                context,
+                conflict_detector,
+            ),
+            search_by_backtracking_theirs(
+                ours,
+                theirs,
+                first_conflict.ours_index,
+                context,
+                conflict_detector,
+            ),
+        ]
+        selected = choose_frontier(candidates)
         return MergePlan(
-            status="clean",
+            status="conflict",
             base_transaction_id=base_transaction_id,
             ours=ours,
             theirs=theirs,
             selected=selected,
             statement_plan=ordered_statement_plan(ours, theirs, selected),
+            first_conflict=first_conflict,
+            candidates=candidates,
         )
-
-    candidates = [
-        search_by_backtracking_ours(
-            ours,
-            theirs,
-            first_conflict.ours_index,
-            conflict_detector,
-        ),
-        search_by_backtracking_theirs(
-            ours,
-            theirs,
-            first_conflict.ours_index,
-            conflict_detector,
-        ),
-    ]
-    selected = choose_frontier(candidates)
-    return MergePlan(
-        status="conflict",
-        base_transaction_id=base_transaction_id,
-        ours=ours,
-        theirs=theirs,
-        selected=selected,
-        statement_plan=ordered_statement_plan(ours, theirs, selected),
-        first_conflict=first_conflict,
-        candidates=candidates,
-    )
-
-
-def _ensure_log_tables(con: sqlite3.Connection) -> None:
-    con.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {TX_TABLE} (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            committed_at TEXT NOT NULL
-        )
-        """
-    )
-    con.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_id INTEGER NOT NULL REFERENCES {TX_TABLE}(id),
-            sql_text       TEXT NOT NULL
-        )
-        """
-    )
 
 
 def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) -> None:
@@ -494,14 +546,31 @@ def replay_statement_plan(
 
     with sqlite3.connect(output_path) as con:
         con.execute("PRAGMA foreign_keys = ON")
-        _ensure_log_tables(con)
 
         for applied_count, statement in enumerate(statement_plan):
+            savepoint_name = f"replay_statement_{applied_count}"
+            con.execute(f"SAVEPOINT {savepoint_name}")
             try:
                 con.execute(statement.sql_text)
+                integrity_errors = validate_database(con)
+                if integrity_errors:
+                    con.execute(f"ROLLBACK TO {savepoint_name}")
+                    con.execute(f"RELEASE {savepoint_name}")
+                    return ReplayResult(
+                        ok=False,
+                        output_path=str(output_path),
+                        applied_count=applied_count,
+                        failure=ReplayFailure(
+                            statement=asdict(statement),
+                            error="database validation failed after statement",
+                        ),
+                        integrity_errors=integrity_errors,
+                    )
                 _append_replayed_log(con, statement)
+                con.execute(f"RELEASE {savepoint_name}")
             except sqlite3.Error as exc:
-                con.rollback()
+                con.execute(f"ROLLBACK TO {savepoint_name}")
+                con.execute(f"RELEASE {savepoint_name}")
                 return ReplayResult(
                     ok=False,
                     output_path=str(output_path),
@@ -512,16 +581,6 @@ def replay_statement_plan(
                     ),
                 )
 
-        integrity_errors = validate_database(con)
-        if integrity_errors:
-            con.rollback()
-            return ReplayResult(
-                ok=False,
-                output_path=str(output_path),
-                applied_count=len(statement_plan),
-                failure=ReplayFailure(statement=None, error="database validation failed"),
-                integrity_errors=integrity_errors,
-            )
         con.commit()
 
     return ReplayResult(

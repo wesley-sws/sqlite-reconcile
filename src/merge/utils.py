@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import re
+import sqlite3
+
+from sqlglot import expressions as exp
+
+from .statement_metadata import StatementMetadata
+
+CURRENT_TIME_DEFAULTS = {
+    "current_date",
+    "current_time",
+    "current_timestamp",
+}
+NONDETERMINISTIC_DEFAULT_FUNCTIONS = {
+    "date",
+    "datetime",
+    "julianday",
+    "random",
+    "randomblob",
+    "strftime",
+    "time",
+    "unixepoch",
+}
+
+
+def is_sql_expression(value: object) -> bool:
+    """Return whether value is a sqlglot expression."""
+
+    return isinstance(value, exp.Expression)
+
+
+def sql_expression_to_sql(value: exp.Expression) -> str:
+    """Render a sqlglot expression back to SQLite-flavoured SQL."""
+
+    return value.sql(dialect="sqlite")
+
+
+def is_delete_statement(metadata: StatementMetadata) -> bool:
+    """Return whether statement metadata belongs to a DELETE statement."""
+
+    return isinstance(metadata.parsed_sql_text, exp.Delete)
+
+
+def is_insert_statement(metadata: StatementMetadata) -> bool:
+    """Return whether statement metadata belongs to an INSERT statement."""
+
+    return isinstance(metadata.parsed_sql_text, exp.Insert)
+
+
+def is_update_statement(metadata: StatementMetadata) -> bool:
+    """Return whether statement metadata belongs to an UPDATE statement."""
+
+    return isinstance(metadata.parsed_sql_text, exp.Update)
+
+
+def row_value(row: sqlite3.Row | tuple, key: str, index: int):
+    """Read a sqlite row by key when available, otherwise by tuple index."""
+
+    if isinstance(row, sqlite3.Row):
+        return row[key]
+    return row[index]
+
+
+def quote_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier for PRAGMA and schema introspection SQL."""
+
+    escaped = identifier.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def key_columns(cursor: sqlite3.Cursor, table: str | None) -> set[str]:
+    """Return the union of primary-key and unique-key columns for a table."""
+
+    if table is None:
+        return set()
+
+    return set().union(*key_column_sets(cursor, table))
+
+
+def key_column_sets(cursor: sqlite3.Cursor, table: str) -> tuple[set[str], ...]:
+    """Return primary-key and unique-index column sets for a table."""
+
+    key_sets: list[set[str]] = []
+    pk_columns = {
+        str(row_value(row, "name", 1))
+        for row in cursor.execute(
+            f"PRAGMA table_info({quote_identifier(table)})"
+        ).fetchall()
+        if int(row_value(row, "pk", 5) or 0) > 0
+    }
+    if pk_columns:
+        key_sets.append(pk_columns)
+
+    index_rows = cursor.execute(
+        f"PRAGMA index_list({quote_identifier(table)})"
+    ).fetchall()
+    for index_row in index_rows:
+        if int(row_value(index_row, "unique", 2) or 0) != 1:
+            continue
+
+        index_name = str(row_value(index_row, "name", 1))
+        index_columns = {
+            str(row_value(info_row, "name", 2))
+            for info_row in cursor.execute(
+                f"PRAGMA index_info({quote_identifier(index_name)})"
+            ).fetchall()
+            if row_value(info_row, "name", 2) is not None
+        }
+        if index_columns:
+            key_sets.append(index_columns)
+
+    return tuple(key_sets)
+
+
+def nondeterministic_default_columns(
+    cursor: sqlite3.Cursor,
+    table: str | None,
+) -> set[str]:
+    """Return columns whose DEFAULT value is replay-time dependent."""
+
+    if table is None:
+        return set()
+
+    return {
+        str(row_value(row, "name", 1))
+        for row in cursor.execute(
+            f"PRAGMA table_info({quote_identifier(table)})"
+        ).fetchall()
+        if _is_nondeterministic_default(row_value(row, "dflt_value", 4))
+    }
+
+
+def _is_nondeterministic_default(default_sql: object) -> bool:
+    """Return whether a SQLite DEFAULT expression should block replay."""
+
+    if default_sql is None:
+        return False
+
+    sql = str(default_sql).strip().lower()
+    if sql in CURRENT_TIME_DEFAULTS:
+        return True
+
+    return any(
+        re.search(rf"\b{function_name}\s*\(", sql)
+        for function_name in NONDETERMINISTIC_DEFAULT_FUNCTIONS
+    )

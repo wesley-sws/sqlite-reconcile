@@ -7,6 +7,7 @@ The metadata records:
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -19,6 +20,11 @@ UNQUALIFIED_TABLE = "__unqualified__"
 
 TableColumns = dict[str, set[str]]
 IgnoredRelations = dict[str, set[str]]
+
+DEFAULT_VALUES_INSERT_PATTERN = re.compile(
+    r"\bDEFAULT\s+VALUES\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +61,7 @@ def parse_statement_metadata(
 ) -> StatementMetadata:
     """Parse one SQL statement and extract metadata used by conflict checks."""
 
-    parsed_sql_text = sqlglot.parse_one(sql_text, dialect="sqlite")
+    parsed_sql_text = _parse_one(sql_text)
     return StatementMetadata(
         parsed_sql_text=parsed_sql_text,
         table_updated=_target_table_name(parsed_sql_text),
@@ -67,16 +73,32 @@ def parse_statement_metadata(
     )
 
 
-def is_sql_expression(value: object) -> bool:
-    """Return whether a value is a sqlglot expression."""
+def _parse_one(sql_text: str) -> exp.Expression:
+    """Parse one SQLite statement, including INSERT ... DEFAULT VALUES."""
 
-    return isinstance(value, exp.Expression)
+    try:
+        return sqlglot.parse_one(sql_text, dialect="sqlite")
+    except sqlglot.errors.ParseError:
+        normalized = _normalize_default_values_insert(sql_text)
+        if normalized == sql_text:
+            raise
+        return sqlglot.parse_one(normalized, dialect="sqlite")
 
 
-def sql_expression_to_sql(value: exp.Expression) -> str:
-    """Render a sqlglot expression back to SQLite-flavoured SQL."""
+def _normalize_default_values_insert(sql_text: str) -> str:
+    """
+    Rewrite DEFAULT VALUES into an equivalent metadata-only empty insert.
+    This is necessary because sqlglot does not parse INSERT INTO ... DEFAULT VALUES
+    """
 
-    return value.sql(dialect="sqlite")
+    stripped = sql_text.lstrip().lower()
+    if not (
+        stripped.startswith("insert")
+        or stripped.startswith("with")
+    ):
+        return sql_text
+
+    return DEFAULT_VALUES_INSERT_PATTERN.sub("() VALUES ()", sql_text, count=1)
 
 
 def _target_table_name(parsed_sql_text: exp.Expression) -> str | None:
@@ -88,10 +110,10 @@ def _target_table_name(parsed_sql_text: exp.Expression) -> str | None:
 
 
 def _updated_columns(parsed_sql_text: exp.Expression) -> set[str]:
-    """Return UPDATE assignment column names; INSERT/DELETE return an empty set."""
+    """Return UPDATE assignment names; other write statements return '*'."""
 
     if not isinstance(parsed_sql_text, exp.Update):
-        return set()
+        return {ALL_COLUMNS}
 
     return {
         column.name

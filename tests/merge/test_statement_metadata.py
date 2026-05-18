@@ -45,7 +45,7 @@ def test_logged_statement_metadata_for_insert_select_reads_source_columns():
     )
 
     assert statement.metadata.table_updated == "users"
-    assert statement.metadata.columns_updated == set()
+    assert statement.metadata.columns_updated == {log_merge.ALL_COLUMNS}
     assert statement.metadata.tables_referenced_to_columns_referenced == {
         "staging_users": {"id", "name", "active"},
     }
@@ -116,7 +116,7 @@ def test_logged_statement_metadata_for_delete_reads_predicate_columns():
     )
 
     assert statement.metadata.table_updated == "users"
-    assert statement.metadata.columns_updated == set()
+    assert statement.metadata.columns_updated == {log_merge.ALL_COLUMNS}
     assert statement.metadata.tables_referenced_to_columns_referenced == {
         "users": {"id"},
         "orders": {"user_id", "total"},
