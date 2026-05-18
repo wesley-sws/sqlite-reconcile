@@ -12,6 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .statement_metadata import (
+    ALL_COLUMNS,
+    StatementMetadata,
+    TableColumns,
+    UNQUALIFIED_TABLE,
+    is_sql_expression,
+    parse_statement_metadata,
+    sql_expression_to_sql,
+)
+
 
 LOG_TABLE = "_sqlite_merge_log"
 TX_TABLE = "_sqlite_merge_transactions"
@@ -28,6 +38,7 @@ class LoggedStatement:
     transaction_id: int
     committed_at: str
     sql_text: str
+    metadata: StatementMetadata
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,60 @@ def statements_conflict(ours_statement: LoggedStatement, theirs_statement: Logge
     return False
 
 
+def make_logged_statement(
+    branch: BranchName,
+    branch_index: int,
+    log_id: int,
+    transaction_id: int,
+    committed_at: str,
+    sql_text: str,
+    table_columns: TableColumns | None = None,
+) -> LoggedStatement:
+    return LoggedStatement(
+        branch=branch,
+        branch_index=branch_index,
+        log_id=log_id,
+        transaction_id=transaction_id,
+        committed_at=committed_at,
+        sql_text=sql_text,
+        metadata=parse_statement_metadata(sql_text, table_columns=table_columns),
+    )
+
+
+def _row_value(row: sqlite3.Row | tuple, key: str, index: int):
+    if isinstance(row, sqlite3.Row):
+        return row[key]
+    return row[index]
+
+
+def _quote_identifier(identifier: str) -> str:
+    return f'"{identifier.replace("\"", "\"\"")}"'
+
+
+def load_table_columns(cursor: sqlite3.Cursor) -> TableColumns:
+    table_columns: TableColumns = {}
+    table_rows = cursor.execute(
+        """
+        SELECT name
+        FROM sqlite_schema
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchall()
+    for table_row in table_rows:
+        table_name = str(_row_value(table_row, "name", 0))
+        if table_name in (LOG_TABLE, TX_TABLE):
+            continue
+        pragma_rows = cursor.execute(
+            f"PRAGMA table_info({_quote_identifier(table_name)})"
+        ).fetchall()
+        table_columns[table_name] = {
+            str(_row_value(pragma_row, "name", 1))
+            for pragma_row in pragma_rows
+        }
+    return table_columns
+
+
 def _table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
     row = cursor.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -133,6 +198,7 @@ def load_logged_statements(
     branch: BranchName,
     since_transaction_id: int,
     db_path: str | Path,
+    table_columns: TableColumns | None = None,
 ) -> list[LoggedStatement]:
     """Load branch log entries after the merge-base transaction watermark."""
     _require_log_tables(cursor, db_path, branch)
@@ -151,13 +217,14 @@ def load_logged_statements(
     ).fetchall()
 
     return [
-        LoggedStatement(
+        make_logged_statement(
             branch=branch,
             branch_index=index,
             log_id=int(row["log_id"]),
             transaction_id=int(row["transaction_id"]),
             committed_at=str(row["committed_at"]),
             sql_text=str(row["sql_text"]),
+            table_columns=table_columns,
         )
         for index, row in enumerate(rows)
     ]
@@ -312,9 +379,22 @@ def build_merge_plan(
         ours_cursor = ours_conn.cursor()
         theirs_cursor = theirs_conn.cursor()
 
+        table_columns = load_table_columns(base_cursor)
         base_transaction_id = get_base_watermark(base_cursor, base_db_path)
-        ours = load_logged_statements(ours_cursor, "ours", base_transaction_id, ours_db_path)
-        theirs = load_logged_statements(theirs_cursor, "theirs", base_transaction_id, theirs_db_path)
+        ours = load_logged_statements(
+            ours_cursor,
+            "ours",
+            base_transaction_id,
+            ours_db_path,
+            table_columns=table_columns,
+        )
+        theirs = load_logged_statements(
+            theirs_cursor,
+            "theirs",
+            base_transaction_id,
+            theirs_db_path,
+            table_columns=table_columns,
+        )
 
     first_conflict = find_first_pairwise_conflict(ours, theirs, conflict_detector)
     if first_conflict is None:
@@ -454,6 +534,10 @@ def replay_statement_plan(
 def _dataclass_to_dict(value: object) -> object:
     if hasattr(value, "__dataclass_fields__"):
         return asdict(value)
+    if is_sql_expression(value):
+        return sql_expression_to_sql(value)
+    if isinstance(value, set):
+        return sorted(value)
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")

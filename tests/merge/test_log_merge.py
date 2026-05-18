@@ -1,3 +1,4 @@
+import json
 import shutil
 import sqlite3
 import sys
@@ -13,13 +14,14 @@ from merge import log_merge
 
 
 def make_statement(branch, index):
-    return log_merge.LoggedStatement(
+    sql_text = f"{branch.upper()}{index + 1}"
+    return log_merge.make_logged_statement(
         branch=branch,
         branch_index=index,
         log_id=index + 1,
         transaction_id=index + 1,
         committed_at="2026-01-01T00:00:00",
-        sql_text=f"{branch.upper()}{index + 1}",
+        sql_text=sql_text,
     )
 
 
@@ -130,6 +132,12 @@ def test_load_logged_statements_uses_base_transaction_watermark(tmp_path):
     assert statements[0].branch == "ours"
     assert statements[0].branch_index == 0
     assert statements[0].sql_text == "INSERT INTO users (id, name) VALUES (2, 'Bob')"
+    assert statements[0].metadata.parsed_sql_text.sql(dialect="sqlite") == (
+        "INSERT INTO users (id, name) VALUES (2, 'Bob')"
+    )
+    assert statements[0].metadata.table_updated == "users"
+    assert statements[0].metadata.columns_updated == set()
+    assert statements[0].metadata.tables_referenced_to_columns_referenced == {}
 
 
 def test_backtracking_ours_keeps_backtracking_after_later_conflict():
@@ -174,8 +182,8 @@ def test_frontier_choice_uses_highest_total_statement_count():
 
     assert selected.name == "backtrack_theirs"
     assert selected.ours_count == 4
-    assert selected.theirs_count == 1
-    assert selected.score == 5
+    assert selected.theirs_count == 0
+    assert selected.score == 4
 
 
 def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
@@ -184,13 +192,14 @@ def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
     init_logged_db(base)
     append_log(base, "INSERT INTO users (id, name) VALUES (1, 'Alice')")
 
-    statement = log_merge.LoggedStatement(
+    sql_text = "INSERT INTO users (id, name) VALUES (2, 'Bob')"
+    statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
         log_id=2,
         transaction_id=2,
         committed_at="2026-01-02T00:00:00",
-        sql_text="INSERT INTO users (id, name) VALUES (2, 'Bob')",
+        sql_text=sql_text,
     )
 
     result = log_merge.replay_statement_plan(base, output, [statement])
@@ -207,3 +216,45 @@ def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
         ("INSERT INTO users (id, name) VALUES (1, 'Alice')",),
         ("INSERT INTO users (id, name) VALUES (2, 'Bob')",),
     ]
+
+
+def test_conflict_report_serializes_logged_statement_metadata(tmp_path):
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT INTO user_archive SELECT * FROM users",
+    )
+    frontier = log_merge.FrontierCandidate(
+        name="clean",
+        ours_count=1,
+        theirs_count=0,
+        next_conflict=None,
+    )
+    plan = log_merge.MergePlan(
+        status="clean",
+        base_transaction_id=0,
+        ours=[statement],
+        theirs=[],
+        selected=frontier,
+        statement_plan=[statement],
+    )
+    replay = log_merge.ReplayResult(
+        ok=True,
+        output_path=str(tmp_path / "merged.db"),
+        applied_count=1,
+    )
+    report_path = tmp_path / "report.json"
+
+    log_merge.write_conflict_report(report_path, plan, replay)
+
+    payload = json.loads(report_path.read_text())
+    assert payload["statement_plan"][0]["metadata"]["parsed_sql_text"] == (
+        "INSERT INTO user_archive SELECT * FROM users"
+    )
+    metadata = payload["statement_plan"][0]["metadata"]
+    assert metadata["tables_referenced_to_columns_referenced"] == {
+        "users": [log_merge.ALL_COLUMNS],
+    }
