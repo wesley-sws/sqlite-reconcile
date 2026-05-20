@@ -7,6 +7,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 from sqlglot import expressions as exp
@@ -29,6 +30,15 @@ from .utils import (
 )
 
 WriteReadProbeOutcome = Literal["changed", "unchanged", "unsupported"]
+ReadProbeStatus = Literal["ok", "no_read", "unsupported"]
+
+
+@dataclass(frozen=True)
+class ReadProbeResult:
+    """A read probe, or why no probe should be run."""
+
+    status: ReadProbeStatus
+    sql: str | None = None
 
 
 def commutativity_check(
@@ -77,6 +87,12 @@ def execution_based_matching(
 ) -> ConflictCheckResult:
     """Recheck static conflicts with targeted SQLite execution where possible."""
 
+    integrity_error = _pair_integrity_error(context, ours_statement, theirs_statement)
+    if integrity_error is not None:
+        return ConflictCheckResult((
+            StatementConflict(kind="integrity", message=integrity_error),
+        ))
+
     result = static_result
     result = _check_write_read(
         context,
@@ -90,12 +106,7 @@ def execution_based_matching(
         theirs_statement.metadata,
         result,
     )
-    return _with_integrity_conflict(
-        context,
-        ours_statement,
-        theirs_statement,
-        result,
-    )
+    return result
 
 
 def _check_write_write(
@@ -163,10 +174,13 @@ def write_read_dependency_outcome(
     if not _can_simulate_writer(writer_metadata):
         return "unsupported"
 
-    base_probe = _read_probe_select(context, reader_metadata)
-    if base_probe is None:
+    probe_result = _read_probe_result(context, reader_metadata)
+    if probe_result.status == "no_read":
+        return "unchanged"
+    if probe_result.status == "unsupported" or probe_result.sql is None:
         return "unsupported"
 
+    base_probe = probe_result.sql
     cursor = context.base_cursor
     before_table = _temp_probe_result_table_name()
     savepoint = quote_identifier(f"sqlite_merge_write_read_{uuid.uuid4().hex}")
@@ -330,20 +344,28 @@ def _target_row_select(
     )
 
 
-def _read_probe_select(
+def _read_probe_result(
     context: ConflictCheckContext,
     metadata: StatementMetadata,
-) -> str | None:
-    """Build a SELECT probe for reads performed by DML statements."""
+) -> ReadProbeResult:
+    """Build a read probe, or report that no probe is needed/supported."""
 
     expression = metadata.parsed_sql_text
     if isinstance(expression, exp.Update):
-        return _update_read_probe_select(context, metadata)
+        return _probe_result(_update_read_probe_select(context, metadata))
     if isinstance(expression, exp.Delete):
-        return _affected_primary_key_select(context, metadata)
+        return _probe_result(_affected_primary_key_select(context, metadata))
     if isinstance(expression, exp.Insert):
         return _insert_probe_select(context, expression)
-    return None
+    return ReadProbeResult("unsupported")
+
+
+def _probe_result(sql: str | None) -> ReadProbeResult:
+    """Return an ok/unsupported probe result for UPDATE and DELETE probes."""
+
+    if sql is None:
+        return ReadProbeResult("unsupported")
+    return ReadProbeResult("ok", sql)
 
 
 def _update_read_probe_select(
@@ -391,7 +413,7 @@ def _insert_values_probe_select(expression: exp.Insert) -> str | None:
     rows = [_value_row_expressions(row) for row in insert_expression.expressions]
     read_rows = [
         (row_index, row)
-        for row_index, row in enumerate(rows, start=1)
+        for row_index, row in enumerate(rows)
         if any(_expression_has_read(value) for value in row)
     ]
     if not read_rows:
@@ -412,7 +434,7 @@ def _insert_values_probe_select(expression: exp.Insert) -> str | None:
         ]
         selects.append(
             "SELECT "
-            f"{row_index} AS __row_index, "
+            f"{row_index + 1} AS __row_index, "
             + ", ".join(selected_values)
         )
 
@@ -428,15 +450,18 @@ def _insert_values_probe_select(expression: exp.Insert) -> str | None:
 def _insert_probe_select(
     context: ConflictCheckContext,
     expression: exp.Insert,
-) -> str | None:
+) -> ReadProbeResult:
     """Build a read probe for INSERT VALUES or INSERT SELECT."""
 
     insert_expression = expression.expression
     if isinstance(insert_expression, exp.Values):
-        return _insert_values_probe_select(expression)
+        probe = _insert_values_probe_select(expression)
+        if probe is None:
+            return ReadProbeResult("no_read")
+        return ReadProbeResult("ok", probe)
     if insert_expression is not None:
-        return _insert_select_probe_select(context, expression)
-    return None
+        return _probe_result(_insert_select_probe_select(context, expression))
+    return ReadProbeResult("no_read")
 
 
 def _insert_select_probe_select(
@@ -618,23 +643,6 @@ def _create_probe_result_table(
         "CREATE TEMP TABLE "
         f"{quote_identifier(result_table)} AS "
         f"SELECT * FROM ({probe})"
-    )
-
-
-def _with_integrity_conflict(
-    context: ConflictCheckContext,
-    first: LoggedStatement,
-    second: LoggedStatement,
-    result: ConflictCheckResult,
-) -> ConflictCheckResult:
-    """Append an integrity conflict if either pair replay order fails constraints."""
-
-    integrity_error = _pair_integrity_error(context, first, second)
-    if integrity_error is None:
-        return result
-
-    return result.add_conflicts(
-        StatementConflict(kind="integrity", message=integrity_error)
     )
 
 

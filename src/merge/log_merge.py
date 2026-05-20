@@ -12,7 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from .statement_metadata import StatementMetadata, parse_statement_metadata
+from sqlglot.errors import ParseError
+
+from .statement_metadata import (
+    StatementMetadata,
+    parse_statement_metadata,
+    unsupported_statement_metadata,
+)
 from .utils import (
     ALL_COLUMNS,
     TableColumns,
@@ -26,6 +32,7 @@ from .utils import (
 
 LOG_TABLE = "_sqlite_merge_log"
 TX_TABLE = "_sqlite_merge_transactions"
+METADATA_PARSE_ERROR_REASON = "statement could not be parsed for merge analysis"
 
 BranchName = Literal["ours", "theirs"]
 ConflictScope = Literal["pair", "ours", "theirs"]
@@ -268,6 +275,16 @@ def make_logged_statement(
     is_replay_safe: bool = True,
     replay_block_reason: str | None = None,
 ) -> LoggedStatement:
+    try:
+        metadata = parse_statement_metadata(sql_text, table_columns=table_columns)
+    except ParseError as exc:
+        metadata = unsupported_statement_metadata(sql_text)
+        is_replay_safe = False
+        replay_block_reason = (
+            replay_block_reason
+            or f"{METADATA_PARSE_ERROR_REASON}: {exc}"
+        )
+
     return LoggedStatement(
         branch=branch,
         branch_index=branch_index,
@@ -278,7 +295,7 @@ def make_logged_statement(
         to_replay_sql_text=sql_text,
         is_replay_safe=is_replay_safe,
         replay_block_reason=replay_block_reason,
-        metadata=parse_statement_metadata(sql_text, table_columns=table_columns),
+        metadata=metadata,
     )
 
 

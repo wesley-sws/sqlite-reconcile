@@ -219,6 +219,21 @@ def test_load_table_columns_skips_only_internal_log_tables():
     }
 
 
+def test_make_logged_statement_marks_unparseable_sql_unsafe():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="NOT VALID SQL @@@",
+    )
+
+    assert not statement.is_replay_safe
+    assert log_merge.METADATA_PARSE_ERROR_REASON in statement.replay_block_reason
+    assert statement.metadata.table_updated is None
+
+
 def test_load_logged_statements_uses_base_transaction_watermark(tmp_path):
     base = tmp_path / "base.db"
     ours = tmp_path / "ours.db"
@@ -255,6 +270,25 @@ def test_load_logged_statements_uses_base_transaction_watermark(tmp_path):
     assert statements[0].metadata.table_updated == "users"
     assert statements[0].metadata.columns_updated == {log_merge.ALL_COLUMNS}
     assert statements[0].metadata.tables_referenced_to_columns_referenced == {}
+
+
+def test_load_logged_statements_tolerates_unparseable_unsafe_sql(tmp_path):
+    db_path = tmp_path / "branch.db"
+    init_logged_db(db_path)
+    append_log(
+        db_path,
+        "NOT VALID SQL @@@",
+        is_replay_safe=False,
+        replay_block_reason="statement could not be parsed for replay preparation",
+    )
+
+    with closing(sqlite3.connect(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        statements = log_merge.load_logged_statements(con.cursor(), "ours", 0, db_path)
+
+    assert len(statements) == 1
+    assert not statements[0].is_replay_safe
+    assert statements[0].metadata.table_updated is None
 
 
 def test_load_logged_statements_uses_replay_sql_for_metadata(tmp_path):

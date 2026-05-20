@@ -589,6 +589,44 @@ def test_execution_write_read_clears_unchanged_insert_values_probe(tmp_path):
     assert not result.has_conflict
 
 
+def test_execution_write_read_clears_insert_values_with_no_read_probe(tmp_path):
+    table_columns = {
+        "products": {"id", "category"},
+        "logs": {"message"},
+    }
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT)",
+            "CREATE TABLE logs (message TEXT)",
+            "INSERT INTO products VALUES (1, 'sale')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "UPDATE products SET category = 'new' WHERE id = 1",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "WITH c AS (SELECT category FROM products WHERE id = 1) "
+            "INSERT INTO logs(message) VALUES ('literal')",
+            table_columns,
+            branch="theirs",
+        )
+        assert conflict_kinds(static_result(context, ours, theirs)) == ["write_read"]
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert not result.has_conflict
+
+
 def test_execution_write_read_clears_unchanged_insert_select_probe(tmp_path):
     table_columns = {
         "products": {"id", "category"},
@@ -729,9 +767,9 @@ def test_execution_reports_integrity_conflict_when_only_one_order_fails(tmp_path
             static_result(context, ours, theirs),
         )
 
-    assert "integrity" in conflict_kinds(result)
-    assert "theirs then ours" in result.conflicts[-1].message
-    assert "UNIQUE constraint failed" in result.conflicts[-1].message
+    assert conflict_kinds(result) == ["integrity"]
+    assert "theirs then ours" in result.conflicts[0].message
+    assert "UNIQUE constraint failed" in result.conflicts[0].message
 
 
 def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):

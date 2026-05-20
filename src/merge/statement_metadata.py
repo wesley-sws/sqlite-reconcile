@@ -71,6 +71,20 @@ def parse_statement_metadata(
     )
 
 
+def unsupported_statement_metadata(sql_text: str) -> StatementMetadata:
+    """Return empty metadata for SQL that cannot be statically analyzed."""
+
+    return StatementMetadata(
+        parsed_sql_text=exp.Command(
+            this="UNSUPPORTED_SQL",
+            expression=exp.Literal.string(sql_text),
+        ),
+        table_updated=None,
+        columns_updated=set(),
+        tables_referenced_to_columns_referenced={},
+    )
+
+
 def _parse_one(sql_text: str) -> exp.Expression:
     """Parse one SQLite statement, including INSERT ... DEFAULT VALUES."""
 
@@ -612,4 +626,3 @@ def _has_ancestor_before_root(
         parent = parent.parent
 
     return False
-
