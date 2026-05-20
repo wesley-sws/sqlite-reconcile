@@ -6,24 +6,21 @@ import shutil
 import sqlite3
 from contextlib import closing
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from .statement_metadata import (
-    ALL_COLUMNS,
-    StatementMetadata,
-    TableColumns,
-    UNQUALIFIED_TABLE,
-    parse_statement_metadata,
-)
+from .statement_metadata import StatementMetadata, parse_statement_metadata
 from .utils import (
+    ALL_COLUMNS,
+    TableColumns,
     is_sql_expression,
-    quote_identifier,
-    row_value,
+    load_table_columns as load_user_table_columns,
+    rollback_savepoint,
     sql_expression_to_sql,
+    table_exists,
 )
 
 
@@ -31,11 +28,11 @@ LOG_TABLE = "_sqlite_merge_log"
 TX_TABLE = "_sqlite_merge_transactions"
 
 BranchName = Literal["ours", "theirs"]
+ConflictScope = Literal["pair", "ours", "theirs"]
 ConflictKind = Literal[
     "write_write",
     "write_read",
     "implicit_insert_key",
-    "implicit_insert_default",
     "unsafe_replay",
     "integrity",
     "non_commutative",
@@ -83,15 +80,102 @@ class ConflictCheckContext:
 class StatementConflict:
     kind: ConflictKind
     message: str
+    scope: ConflictScope = "pair"
+    details: tuple[tuple[str, str], ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ConflictCheckResult:
-    conflicts: tuple[StatementConflict, ...] = ()
+    conflicts_by_kind: dict[ConflictKind, tuple[StatementConflict, ...]]
+
+    def __init__(
+        self,
+        conflicts: Sequence[StatementConflict] = (),
+        *,
+        conflicts_by_kind: Mapping[
+            ConflictKind,
+            Sequence[StatementConflict],
+        ] | None = None,
+    ):
+        grouped: dict[ConflictKind, list[StatementConflict]] = {}
+        if conflicts_by_kind is None:
+            for conflict in conflicts:
+                grouped.setdefault(conflict.kind, []).append(conflict)
+        else:
+            for kind, kind_conflicts in conflicts_by_kind.items():
+                if kind_conflicts:
+                    grouped[kind] = list(kind_conflicts)
+
+        object.__setattr__(
+            self,
+            "conflicts_by_kind",
+            {kind: tuple(values) for kind, values in grouped.items()},
+        )
+
+    @property
+    def conflicts(self) -> tuple[StatementConflict, ...]:
+        """Return conflicts flattened in insertion order."""
+
+        return tuple(
+            conflict
+            for kind_conflicts in self.conflicts_by_kind.values()
+            for conflict in kind_conflicts
+        )
 
     @property
     def has_conflict(self) -> bool:
-        return bool(self.conflicts)
+        return bool(self.conflicts_by_kind)
+
+    def of_kind(self, kind: ConflictKind) -> tuple[StatementConflict, ...]:
+        """Return conflicts of one kind."""
+
+        return self.conflicts_by_kind.get(kind, ())
+
+    def has_kind(self, kind: ConflictKind) -> bool:
+        """Return whether any conflicts of kind are present."""
+
+        return kind in self.conflicts_by_kind
+
+    def without_kind(self, kind: ConflictKind) -> ConflictCheckResult:
+        """Return a copy without conflicts of kind."""
+
+        return ConflictCheckResult(
+            conflicts_by_kind={
+                existing_kind: conflicts
+                for existing_kind, conflicts in self.conflicts_by_kind.items()
+                if existing_kind != kind
+            }
+        )
+
+    def replace_kind(
+        self,
+        kind: ConflictKind,
+        conflicts: Sequence[StatementConflict],
+    ) -> ConflictCheckResult:
+        """Return a copy with conflicts of kind replaced."""
+
+        grouped = {
+            existing_kind: kind_conflicts
+            for existing_kind, kind_conflicts in self.conflicts_by_kind.items()
+            if existing_kind != kind
+        }
+        if conflicts:
+            grouped[kind] = tuple(conflicts)
+        return ConflictCheckResult(conflicts_by_kind=grouped)
+
+    def add_conflicts(
+        self,
+        *conflicts: StatementConflict,
+    ) -> ConflictCheckResult:
+        """Return a copy with conflicts appended to their kind groups."""
+
+        grouped = {
+            kind: list(kind_conflicts)
+            for kind, kind_conflicts in self.conflicts_by_kind.items()
+        }
+        for conflict in conflicts:
+            grouped.setdefault(conflict.kind, []).append(conflict)
+        return ConflictCheckResult(conflicts_by_kind=grouped)
 
 
 ConflictDetector = Callable[
@@ -167,7 +251,7 @@ def statements_conflict(
 ) -> ConflictCheckResult:
     """Default per-statement conflict detector."""
 
-    from .static_analysis import conflict_detection
+    from .conflict_detection import conflict_detection
 
     return conflict_detection(context, ours_statement, theirs_statement)
 
@@ -199,42 +283,16 @@ def make_logged_statement(
 
 
 def load_table_columns(cursor: sqlite3.Cursor) -> TableColumns:
-    table_columns: TableColumns = {}
-    table_rows = cursor.execute(
-        """
-        SELECT name
-        FROM sqlite_schema
-        WHERE type = 'table'
-          AND name NOT LIKE 'sqlite_%'
-        """
-    ).fetchall()
-    for table_row in table_rows:
-        table_name = str(row_value(table_row, "name", 0))
-        if table_name in (LOG_TABLE, TX_TABLE):
-            continue
-        pragma_rows = cursor.execute(
-            f"PRAGMA table_info({quote_identifier(table_name)})"
-        ).fetchall()
-        table_columns[table_name] = {
-            str(row_value(pragma_row, "name", 1))
-            for pragma_row in pragma_rows
-        }
-    return table_columns
+    """Return non-internal table columns, excluding merge log tables."""
 
-
-def _table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
-    row = cursor.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
+    return load_user_table_columns(cursor, ignored_tables={LOG_TABLE, TX_TABLE})
 
 
 def _require_log_tables(cursor: sqlite3.Cursor, db_path: str | Path, role: str) -> None:
     missing_tables = [
         table_name
         for table_name in (TX_TABLE, LOG_TABLE)
-        if not _table_exists(cursor, table_name)
+        if not table_exists(cursor, table_name)
     ]
     if missing_tables:
         raise MergeNotApplicableError(db_path, role, missing_tables)
@@ -434,6 +492,53 @@ def choose_frontier(candidates: Sequence[FrontierCandidate]) -> FrontierCandidat
     )
 
 
+def frontier_candidates_for_conflict(
+    ours: Sequence[LoggedStatement],
+    theirs: Sequence[LoggedStatement],
+    first_conflict: ConflictPair,
+    context: ConflictCheckContext,
+    conflict_detector: ConflictDetector = statements_conflict,
+) -> list[FrontierCandidate]:
+    """Return backtracking candidates, narrowing unsafe replay to its branch."""
+
+    unsafe_branches = _unsafe_replay_branches(first_conflict)
+    candidates: list[FrontierCandidate] = []
+    if not unsafe_branches or "ours" in unsafe_branches:
+        candidates.append(
+            search_by_backtracking_ours(
+                ours,
+                theirs,
+                first_conflict.ours_index,
+                context,
+                conflict_detector,
+            )
+        )
+    if not unsafe_branches or "theirs" in unsafe_branches:
+        candidates.append(
+            search_by_backtracking_theirs(
+                ours,
+                theirs,
+                first_conflict.ours_index,
+                context,
+                conflict_detector,
+            )
+        )
+    return candidates
+
+
+def _unsafe_replay_branches(conflict: ConflictPair) -> set[BranchName]:
+    """Return branches that are blocked by standalone unsafe replay conflicts."""
+
+    branches: set[BranchName] = set()
+    for statement_conflict in conflict.conflicts:
+        if statement_conflict.kind != "unsafe_replay":
+            continue
+
+        if statement_conflict.scope in {"ours", "theirs"}:
+            branches.add(statement_conflict.scope)
+    return branches
+
+
 def ordered_statement_plan(
     ours: Sequence[LoggedStatement],
     theirs: Sequence[LoggedStatement],
@@ -505,22 +610,13 @@ def build_merge_plan(
                 statement_plan=ordered_statement_plan(ours, theirs, selected),
             )
 
-        candidates = [
-            search_by_backtracking_ours(
-                ours,
-                theirs,
-                first_conflict.ours_index,
-                context,
-                conflict_detector,
-            ),
-            search_by_backtracking_theirs(
-                ours,
-                theirs,
-                first_conflict.ours_index,
-                context,
-                conflict_detector,
-            ),
-        ]
+        candidates = frontier_candidates_for_conflict(
+            ours,
+            theirs,
+            first_conflict,
+            context,
+            conflict_detector,
+        )
         selected = choose_frontier(candidates)
         return MergePlan(
             status="conflict",
@@ -605,8 +701,7 @@ def replay_statement_plan(
                 con.execute(statement.sql_text)
                 integrity_errors = validate_database(con)
                 if integrity_errors:
-                    con.execute(f"ROLLBACK TO {savepoint_name}")
-                    con.execute(f"RELEASE {savepoint_name}")
+                    rollback_savepoint(con, savepoint_name)
                     return ReplayResult(
                         ok=False,
                         output_path=str(output_path),
@@ -620,8 +715,7 @@ def replay_statement_plan(
                 _append_replayed_log(con, statement)
                 con.execute(f"RELEASE {savepoint_name}")
             except sqlite3.Error as exc:
-                con.execute(f"ROLLBACK TO {savepoint_name}")
-                con.execute(f"RELEASE {savepoint_name}")
+                rollback_savepoint(con, savepoint_name)
                 return ReplayResult(
                     ok=False,
                     output_path=str(output_path),

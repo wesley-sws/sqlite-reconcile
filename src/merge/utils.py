@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 import sqlite3
+from collections.abc import Container
 from typing import TYPE_CHECKING
 
 from sqlglot import expressions as exp
@@ -9,21 +9,8 @@ from sqlglot import expressions as exp
 if TYPE_CHECKING:
     from .statement_metadata import StatementMetadata
 
-CURRENT_TIME_DEFAULTS = {
-    "current_date",
-    "current_time",
-    "current_timestamp",
-}
-NONDETERMINISTIC_DEFAULT_FUNCTIONS = {
-    "date",
-    "datetime",
-    "julianday",
-    "random",
-    "randomblob",
-    "strftime",
-    "time",
-    "unixepoch",
-}
+ALL_COLUMNS = "*"
+TableColumns = dict[str, set[str]]
 
 
 def is_sql_expression(value: object) -> bool:
@@ -47,6 +34,15 @@ def table_expression(expression: exp.Expression | None) -> exp.Table | None:
     if isinstance(expression, exp.Schema) and isinstance(expression.this, exp.Table):
         return expression.this
 
+    return None
+
+
+def table_name(expression: exp.Expression | None) -> str | None:
+    """Return a table expression's concrete table name."""
+
+    table = table_expression(expression)
+    if table is not None:
+        return table.name
     return None
 
 
@@ -81,6 +77,59 @@ def quote_identifier(identifier: str) -> str:
 
     escaped = identifier.replace('"', '""')
     return f'"{escaped}"'
+
+
+def table_exists(cursor: sqlite3.Cursor, table: str) -> bool:
+    """Return whether a real table exists in the database schema."""
+
+    row = cursor.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def load_table_columns(
+    cursor: sqlite3.Cursor,
+    *,
+    ignored_tables: Container[str] = (),
+) -> TableColumns:
+    """Return user table names mapped to column names."""
+
+    table_columns: TableColumns = {}
+    table_rows = cursor.execute(
+        """
+        SELECT name
+        FROM sqlite_schema
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchall()
+    for table_row in table_rows:
+        table = str(row_value(table_row, "name", 0))
+        if table in ignored_tables:
+            continue
+
+        pragma_rows = cursor.execute(
+            f"PRAGMA table_info({quote_identifier(table)})"
+        ).fetchall()
+        table_columns[table] = {
+            str(row_value(pragma_row, "name", 1))
+            for pragma_row in pragma_rows
+        }
+    return table_columns
+
+
+def rollback_savepoint(
+    cursor: sqlite3.Connection | sqlite3.Cursor,
+    savepoint: str,
+) -> None:
+    """Roll back and release an already-created SQLite savepoint."""
+
+    try:
+        cursor.execute(f"ROLLBACK TO {savepoint}")
+    finally:
+        cursor.execute(f"RELEASE {savepoint}")
 
 
 def key_columns(cursor: sqlite3.Cursor, table: str | None) -> set[str]:
@@ -144,37 +193,3 @@ def key_column_sets(cursor: sqlite3.Cursor, table: str) -> tuple[set[str], ...]:
             key_sets.append(index_columns)
 
     return tuple(key_sets)
-
-
-def nondeterministic_default_columns(
-    cursor: sqlite3.Cursor,
-    table: str | None,
-) -> set[str]:
-    """Return columns whose DEFAULT value is replay-time dependent."""
-
-    if table is None:
-        return set()
-
-    return {
-        str(row_value(row, "name", 1))
-        for row in cursor.execute(
-            f"PRAGMA table_info({quote_identifier(table)})"
-        ).fetchall()
-        if _is_nondeterministic_default(row_value(row, "dflt_value", 4))
-    }
-
-
-def _is_nondeterministic_default(default_sql: object) -> bool:
-    """Return whether a SQLite DEFAULT expression should block replay."""
-
-    if default_sql is None:
-        return False
-
-    sql = str(default_sql).strip().lower()
-    if sql in CURRENT_TIME_DEFAULTS:
-        return True
-
-    return any(
-        re.search(rf"\b{function_name}\s*\(", sql)
-        for function_name in NONDETERMINISTIC_DEFAULT_FUNCTIONS
-    )

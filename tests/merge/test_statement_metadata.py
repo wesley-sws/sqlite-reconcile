@@ -337,7 +337,7 @@ def test_logged_statement_metadata_resolves_unqualified_columns_with_schema_map(
     }
 
 
-def test_logged_statement_metadata_keeps_truly_ambiguous_unqualified_columns_separate():
+def test_logged_statement_metadata_ignores_ambiguous_unqualified_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
@@ -357,7 +357,6 @@ def test_logged_statement_metadata_keeps_truly_ambiguous_unqualified_columns_sep
     )
 
     assert statement.metadata.tables_referenced_to_columns_referenced == {
-        log_merge.UNQUALIFIED_TABLE: {"user_id"},
         "staging": {"name", "user_id"},
     }
 

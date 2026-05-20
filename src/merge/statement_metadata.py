@@ -15,12 +15,8 @@ import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from .utils import table_expression
+from .utils import ALL_COLUMNS, TableColumns, table_expression, table_name
 
-ALL_COLUMNS = "*"
-UNQUALIFIED_TABLE = "__unqualified__"
-
-TableColumns = dict[str, set[str]]
 IgnoredRelations = dict[str, set[str]]
 
 DEFAULT_VALUES_INSERT_PATTERN = re.compile(
@@ -107,7 +103,7 @@ def _target_table_name(parsed_sql_text: exp.Expression) -> str | None:
     """Return the table directly written by INSERT, UPDATE, or DELETE."""
 
     if isinstance(parsed_sql_text, (exp.Insert, exp.Update, exp.Delete)):
-        return _table_name(parsed_sql_text.this)
+        return table_name(parsed_sql_text.this)
     return None
 
 
@@ -341,9 +337,6 @@ def _resolve_unqualified_table(
         candidates = _real_table_candidates(frame.sources, column_name, table_columns)
         if len(candidates) == 1:
             return next(iter(candidates))
-
-        if len(candidates) > 1:
-            return UNQUALIFIED_TABLE
 
         if column_name in frame.sources.output_aliases:
             return None
@@ -620,11 +613,3 @@ def _has_ancestor_before_root(
 
     return False
 
-
-def _table_name(expression: exp.Expression | None) -> str | None:
-    """Return a table expression's concrete table name."""
-
-    table = table_expression(expression)
-    if table is not None:
-        return table.name
-    return None

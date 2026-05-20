@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import shutil
 import sqlite3
 import subprocess
@@ -8,6 +7,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from collections.abc import Sequence
+from typing import Literal
 
 from sqlglot import expressions as exp
 
@@ -17,14 +17,18 @@ from .log_merge import (
     LoggedStatement,
     StatementConflict,
 )
-from .statement_metadata import ALL_COLUMNS, UNQUALIFIED_TABLE, StatementMetadata
+from .statement_metadata import StatementMetadata
 from .utils import (
     is_delete_statement,
+    is_insert_statement,
     is_update_statement,
     primary_key_columns,
     quote_identifier,
+    rollback_savepoint,
     table_expression,
 )
+
+WriteReadProbeOutcome = Literal["changed", "unchanged", "unsupported"]
 
 
 def commutativity_check(
@@ -76,8 +80,8 @@ def execution_based_matching(
     result = static_result
     result = _check_write_read(
         context,
-        ours_statement.metadata,
-        theirs_statement.metadata,
+        ours_statement,
+        theirs_statement,
         result,
     )
     result = _check_write_write(
@@ -102,7 +106,7 @@ def _check_write_write(
 ) -> ConflictCheckResult:
     """Use affected primary-key rows to clear supported write/write conflicts."""
 
-    if not _has_conflict_kind(result, "write_write"):
+    if not result.has_kind("write_write"):
         return result
 
     row_overlap = update_delete_write_write_row_overlap(
@@ -113,16 +117,17 @@ def _check_write_write(
     if row_overlap is None:
         return result
     if not row_overlap:
-        return _without_conflict_kind(result, "write_write")
+        return result.without_kind("write_write")
 
-    preserved = _without_conflict_kind(result, "write_write").conflicts
-    return ConflictCheckResult((
-        *preserved,
-        StatementConflict(
-            kind="write_write",
-            message="write-write row overlap",
+    return result.replace_kind(
+        "write_write",
+        (
+            StatementConflict(
+                kind="write_write",
+                message="write-write row overlap",
+            ),
         ),
-    ))
+    )
 
 
 def update_delete_write_write_row_overlap(
@@ -136,11 +141,6 @@ def update_delete_write_write_row_overlap(
     theirs_select = _affected_primary_key_select(context, theirs_metadata)
     if ours_select is None or theirs_select is None:
         return None
-    if (
-        _update_from_has_duplicate_target_rows(context, ours_metadata, ours_select)
-        or _update_from_has_duplicate_target_rows(context, theirs_metadata, theirs_select)
-    ):
-        return None
 
     query = (
         "SELECT 1 FROM ("
@@ -152,95 +152,121 @@ def update_delete_write_write_row_overlap(
     return context.base_cursor.execute(query).fetchone() is not None
 
 
-def write_read_dependency_changed(
+def write_read_dependency_outcome(
     context: ConflictCheckContext,
-    writer_metadata: StatementMetadata,
+    writer_statement: LoggedStatement,
     reader_metadata: StatementMetadata,
-) -> bool | None:
-    """Return whether reader output changes after simulating writer on temp table."""
+) -> WriteReadProbeOutcome:
+    """Return whether reader output changes after writer runs in a savepoint."""
 
-    if not _metadata_has_write_read_overlap(writer_metadata, reader_metadata):
-        return False
+    writer_metadata = writer_statement.metadata
     if not _can_simulate_writer(writer_metadata):
-        return None
-
-    table = writer_metadata.table_updated
-    if table is None:
-        return None
+        return "unsupported"
 
     base_probe = _read_probe_select(context, reader_metadata)
     if base_probe is None:
-        return None
+        return "unsupported"
 
-    temp_table = _temp_table_name(table)
     cursor = context.base_cursor
+    before_table = _temp_probe_result_table_name()
+    savepoint = quote_identifier(f"sqlite_merge_write_read_{uuid.uuid4().hex}")
+    savepoint_started = False
     try:
-        _create_temp_table_copy(cursor, table, temp_table)
-        writer_sql = _replace_table_references_sql(
-            writer_metadata.parsed_sql_text,
-            table,
-            temp_table,
+        _create_probe_result_table(cursor, before_table, base_probe)
+        cursor.execute(f"SAVEPOINT {savepoint}")
+        savepoint_started = True
+
+        cursor.execute(writer_statement.sql_text)
+
+        if _is_update_from_statement(
+            reader_metadata,
+        ) and _probe_has_duplicate_target_rows(context, reader_metadata, base_probe):
+            return "unsupported"
+
+        query = _stored_probe_difference_query(before_table, base_probe)
+        return (
+            "changed"
+            if cursor.execute(query).fetchone() is not None
+            else "unchanged"
         )
-        if writer_sql is None:
-            return None
-
-        cursor.execute(writer_sql)
-        temp_probe = _replace_table_references_sql(
-            base_probe,
-            table,
-            temp_table,
-        )
-        if temp_probe is None:
-            return None
-
-        if _update_from_has_duplicate_target_rows(context, reader_metadata, base_probe):
-            return None
-        if _update_from_has_duplicate_target_rows(context, reader_metadata, temp_probe):
-            return None
-
-        query = _probe_difference_query(base_probe, temp_probe)
-        return cursor.execute(query).fetchone() is not None
     except sqlite3.Error:
-        return None
+        return "unsupported"
     finally:
-        cursor.execute(f"DROP TABLE IF EXISTS {quote_identifier(temp_table)}")
+        if savepoint_started:
+            rollback_savepoint(cursor, savepoint)
+        cursor.execute(f"DROP TABLE IF EXISTS {quote_identifier(before_table)}")
 
 
 def _check_write_read(
     context: ConflictCheckContext,
-    ours_metadata: StatementMetadata,
-    theirs_metadata: StatementMetadata,
+    ours_statement: LoggedStatement,
+    theirs_statement: LoggedStatement,
     result: ConflictCheckResult,
 ) -> ConflictCheckResult:
     """Use read probes to clear supported write/read conflicts."""
 
-    if not _has_conflict_kind(result, "write_read"):
+    if not result.has_kind("write_read"):
         return result
 
-    checks: list[tuple[str, bool | None]] = []
-    if _metadata_has_write_read_overlap(ours_metadata, theirs_metadata):
-        checks.append((
-            "ours writes; theirs reads",
-            write_read_dependency_changed(context, ours_metadata, theirs_metadata),
-        ))
-    if _metadata_has_write_read_overlap(theirs_metadata, ours_metadata):
-        checks.append((
-            "theirs writes; ours reads",
-            write_read_dependency_changed(context, theirs_metadata, ours_metadata),
-        ))
-
-    if not checks or any(changed is None for _, changed in checks):
+    directions = _write_read_directions(result.of_kind("write_read"))
+    if not directions:
         return result
-    if not any(changed for _, changed in checks):
-        return _without_conflict_kind(result, "write_read")
 
-    preserved = _without_conflict_kind(result, "write_read").conflicts
+    metadata_by_label = {
+        "ours": ours_statement.metadata,
+        "theirs": theirs_statement.metadata,
+    }
+    statement_by_label = {
+        "ours": ours_statement,
+        "theirs": theirs_statement,
+    }
+    checks: list[tuple[str, WriteReadProbeOutcome]] = []
+    for writer_label, reader_label in directions:
+        checks.append((
+            f"{writer_label} writes; {reader_label} reads",
+            write_read_dependency_outcome(
+                context,
+                statement_by_label[writer_label],
+                metadata_by_label[reader_label],
+            ),
+        ))
+
+    if not checks or any(outcome == "unsupported" for _, outcome in checks):
+        return result
+
+    changed_labels = [
+        label
+        for label, outcome in checks
+        if outcome == "changed"
+    ]
+    if not changed_labels:
+        return result.without_kind("write_read")
+
     conflicts = [
         StatementConflict(kind="write_read", message=f"write-read dependency: {label}")
-        for label, changed in checks
-        if changed
+        for label in changed_labels
     ]
-    return ConflictCheckResult((*preserved, *conflicts))
+    return result.replace_kind("write_read", conflicts)
+
+
+def _write_read_directions(
+    conflicts: Sequence[StatementConflict],
+) -> tuple[tuple[str, str], ...] | None:
+    """Return writer/reader directions already reported by static analysis."""
+
+    directions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for conflict in conflicts:
+        details = dict(conflict.details)
+        pair = (details.get("writer"), details.get("reader"))
+        if pair not in {("ours", "theirs"), ("theirs", "ours")}:
+            return None
+
+        if pair not in seen:
+            seen.add(pair)
+            directions.append(pair)
+
+    return tuple(directions)
 
 
 def _affected_primary_key_select(
@@ -248,6 +274,16 @@ def _affected_primary_key_select(
     metadata: StatementMetadata,
 ) -> str | None:
     """Build a SELECT returning primary keys affected by UPDATE/DELETE."""
+
+    return _target_row_select(context, metadata)
+
+
+def _target_row_select(
+    context: ConflictCheckContext,
+    metadata: StatementMetadata,
+    extra_select_expressions: Sequence[str] = (),
+) -> str | None:
+    """Build a SELECT over rows targeted by an UPDATE/DELETE statement."""
 
     expression = metadata.parsed_sql_text
     if not isinstance(expression, (exp.Update, exp.Delete)):
@@ -260,13 +296,16 @@ def _affected_primary_key_select(
         return None
 
     with_expression = expression.args.get("with")
-    if with_expression is not None and with_expression.args.get("recursive"):
-        return None
 
     qualifier = target_table.alias_or_name
     select_columns = ", ".join(
-        f"{quote_identifier(qualifier)}.{quote_identifier(column)}"
-        for column in pk_columns
+        [
+            *(
+                f"{quote_identifier(qualifier)}.{quote_identifier(column)}"
+                for column in pk_columns
+            ),
+            *extra_select_expressions,
+        ]
     )
     from_sources = [target_table.sql(dialect="sqlite")]
     from_expression = expression.args.get("from")
@@ -317,43 +356,10 @@ def _update_read_probe_select(
     if not isinstance(expression, exp.Update):
         return None
 
-    if _affected_primary_key_select(context, metadata) is None:
-        return None
-
-    pk_columns = primary_key_columns(context.base_cursor, metadata.table_updated)
-    target_table = table_expression(expression.this)
-    if target_table is None:
-        return None
-
-    qualifier = target_table.alias_or_name
-    select_expressions = [
-        f"{quote_identifier(qualifier)}.{quote_identifier(column)}"
-        for column in pk_columns
-    ]
-    select_expressions.extend(_assignment_read_expressions(expression))
-
-    with_expression = expression.args.get("with")
-    with_sql = (
-        f"{with_expression.sql(dialect='sqlite')} "
-        if with_expression is not None
-        else ""
-    )
-    from_sources = [target_table.sql(dialect="sqlite")]
-    from_expression = expression.args.get("from")
-    if from_expression is not None:
-        from_sources.append(_from_expression_sql(from_expression))
-
-    where_expression = expression.args.get("where")
-    where_sql = (
-        f" WHERE {where_expression.this.sql(dialect='sqlite')}"
-        if where_expression is not None
-        else ""
-    )
-
-    return (
-        f"{with_sql}SELECT {', '.join(select_expressions)} "
-        f"FROM {', '.join(from_sources)}"
-        f"{where_sql}"
+    return _target_row_select(
+        context,
+        metadata,
+        extra_select_expressions=_assignment_read_expressions(expression),
     )
 
 
@@ -498,37 +504,61 @@ def _expression_has_read(expression: exp.Expression) -> bool:
     )
 
 
-def _probe_difference_query(base_probe: str, temp_probe: str) -> str:
-    """Return SQL that detects any set difference between two probes."""
+def _select_difference_query(first_select: str, second_select: str) -> str:
+    """Return SQL that detects any set difference between two SELECTs."""
 
     return (
         "SELECT 1 FROM ("
         "SELECT 1 FROM ("
-        f"SELECT * FROM ({temp_probe}) "
+        f"{second_select} "
         "EXCEPT "
-        f"SELECT * FROM ({base_probe})"
+        f"{first_select}"
         ") "
         "UNION ALL "
         "SELECT 1 FROM ("
-        f"SELECT * FROM ({base_probe}) "
+        f"{first_select} "
         "EXCEPT "
-        f"SELECT * FROM ({temp_probe})"
+        f"{second_select}"
         ")"
         ") LIMIT 1"
     )
 
 
-def _update_from_has_duplicate_target_rows(
+def _stored_probe_difference_query(before_table: str, after_probe: str) -> str:
+    """Return SQL comparing stored probe rows with current probe rows."""
+
+    return _select_difference_query(
+        f"SELECT * FROM {quote_identifier(before_table)}",
+        f"SELECT * FROM ({after_probe})",
+    )
+
+
+def update_from_has_duplicate_target_rows(
+    context: ConflictCheckContext,
+    metadata: StatementMetadata,
+    probe: str | None = None,
+) -> bool:
+    """Return whether an UPDATE FROM probe has multiple rows for a target PK."""
+
+    if not _is_update_from_statement(metadata):
+        return False
+
+    probe = probe or _affected_primary_key_select(context, metadata)
+    if probe is None:
+        return False
+
+    try:
+        return _probe_has_duplicate_target_rows(context, metadata, probe)
+    except sqlite3.Error:
+        return False
+
+
+def _probe_has_duplicate_target_rows(
     context: ConflictCheckContext,
     metadata: StatementMetadata,
     probe: str,
 ) -> bool:
-    """Return whether an UPDATE FROM probe has multiple rows for a target PK."""
-
-    if not is_update_statement(metadata):
-        return False
-    if metadata.parsed_sql_text.args.get("from") is None:
-        return False
+    """Return whether probe returns duplicate target PK rows."""
 
     pk_count = len(primary_key_columns(context.base_cursor, metadata.table_updated))
     if pk_count == 0:
@@ -544,117 +574,50 @@ def _update_from_has_duplicate_target_rows(
     return context.base_cursor.execute(query).fetchone() is not None
 
 
+def _is_update_from_statement(metadata: StatementMetadata) -> bool:
+    """Return whether metadata is for an UPDATE with a FROM clause."""
+
+    return (
+        is_update_statement(metadata)
+        and metadata.parsed_sql_text.args.get("from") is not None
+    )
+
+
 def _from_expression_sql(from_expression: exp.Expression) -> str:
     """Return FROM contents without the leading FROM keyword."""
-
-    if isinstance(from_expression, exp.From) and from_expression.this is not None:
-        return from_expression.this.sql(dialect="sqlite")
     return from_expression.sql(dialect="sqlite").removeprefix("FROM ").strip()
 
 
-def _metadata_has_write_read_overlap(
-    writer: StatementMetadata,
-    reader: StatementMetadata,
-) -> bool:
-    """Return whether metadata says reader may read columns written by writer."""
+def _can_simulate_writer(metadata: StatementMetadata) -> bool:
+    """
+    Return whether writer can be replayed inside a rollback-only savepoint.
+    Unsupported or unsafe statements are kept as static conflicts instead.
+    """
 
-    table = writer.table_updated
-    if table is None:
-        return False
-
-    written_columns = writer.columns_updated
-    if not written_columns:
-        return False
-
-    references = reader.tables_referenced_to_columns_referenced
-    return bool(
-        _column_overlap(references.get(table, set()), written_columns)
-        or _column_overlap(references.get(UNQUALIFIED_TABLE, set()), written_columns)
+    return (
+        is_insert_statement(metadata)
+        or is_update_statement(metadata)
+        or is_delete_statement(metadata)
     )
 
 
-def _column_overlap(left: set[str], right: set[str]) -> set[str]:
-    """Return overlapping columns, treating '*' as all columns."""
+def _temp_probe_result_table_name() -> str:
+    """Return a unique temporary table name for stored probe rows."""
 
-    if not left or not right:
-        return set()
-
-    if ALL_COLUMNS in left and ALL_COLUMNS in right:
-        return {ALL_COLUMNS}
-    if ALL_COLUMNS in left:
-        return set(right)
-    if ALL_COLUMNS in right:
-        return set(left)
-    return left & right
+    return f"__sqlite_merge_probe_{uuid.uuid4().hex}"
 
 
-def _can_simulate_writer(metadata: StatementMetadata) -> bool:
-    """Return whether writer can safely be replayed against one temp table."""
-
-    return is_update_statement(metadata) or is_delete_statement(metadata)
-
-
-def _temp_table_name(table: str) -> str:
-    """Return a unique temporary table name for one pair check."""
-
-    safe_table = "".join(character if character.isalnum() else "_" for character in table)
-    return f"__sqlite_merge_{safe_table}_{uuid.uuid4().hex}"
-
-
-def _create_temp_table_copy(
+def _create_probe_result_table(
     cursor: sqlite3.Cursor,
-    table: str,
-    temp_table: str,
+    result_table: str,
+    probe: str,
 ) -> None:
-    """Create a TEMP table initialized with the base rows from table."""
+    """Store the current output of a read probe in a temporary table."""
 
     cursor.execute(
         "CREATE TEMP TABLE "
-        f"{quote_identifier(temp_table)} AS "
-        f"SELECT * FROM {quote_identifier(table)}"
-    )
-
-
-def _replace_table_references_sql(
-    sql_or_expression: str | exp.Expression,
-    table: str,
-    replacement_table: str,
-) -> str | None:
-    """Render SQL with table references rewritten to a replacement table."""
-
-    if isinstance(sql_or_expression, str):
-        try:
-            expression = exp.maybe_parse(sql_or_expression, dialect="sqlite")
-        except Exception:
-            return None
-    else:
-        expression = copy.deepcopy(sql_or_expression)
-
-    if expression is None or _cte_shadows_table(expression, table):
-        return None
-
-    def replace(node: exp.Expression) -> exp.Expression:
-        if not isinstance(node, exp.Table) or node.name != table:
-            return node
-
-        replacement = node.copy()
-        replacement.set("this", exp.to_identifier(replacement_table))
-        if replacement.args.get("alias") is None:
-            replacement.set(
-                "alias",
-                exp.TableAlias(this=exp.to_identifier(table)),
-            )
-        return replacement
-
-    return expression.transform(replace).sql(dialect="sqlite")
-
-
-def _cte_shadows_table(expression: exp.Expression, table: str) -> bool:
-    """Return whether a CTE name could be confused with the rewritten table."""
-
-    return any(
-        cte.alias == table
-        for cte in expression.find_all(exp.CTE)
+        f"{quote_identifier(result_table)} AS "
+        f"SELECT * FROM ({probe})"
     )
 
 
@@ -670,10 +633,9 @@ def _with_integrity_conflict(
     if integrity_error is None:
         return result
 
-    return ConflictCheckResult((
-        *result.conflicts,
-        StatementConflict(kind="integrity", message=integrity_error),
-    ))
+    return result.add_conflicts(
+        StatementConflict(kind="integrity", message=integrity_error)
+    )
 
 
 def _pair_integrity_error(
@@ -683,35 +645,44 @@ def _pair_integrity_error(
 ) -> str | None:
     """Return the first integrity error found when replaying both pair orders."""
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        for label, statements in (
-            ("ours then theirs", (first, second)),
-            ("theirs then ours", (second, first)),
-        ):
-            db_path = Path(tmp_dir) / f"{label.replace(' ', '_')}.db"
-            shutil.copy2(context.base_db_path, db_path)
-            error = _replay_integrity_error(db_path, statements)
-            if error is not None:
-                return f"{label}: {error}"
+    cursor = context.base_cursor
+    cursor.execute("PRAGMA foreign_keys = ON")
+    for label, statements in (
+        ("ours then theirs", (first, second)),
+        ("theirs then ours", (second, first)),
+    ):
+        error = _savepoint_integrity_error(cursor, statements)
+        if error is not None:
+            return f"{label}: {error}"
 
     return None
 
 
-def _replay_integrity_error(
-    db_path: Path,
+def _savepoint_integrity_error(
+    cursor: sqlite3.Cursor,
     statements: Sequence[LoggedStatement],
 ) -> str | None:
-    """Apply statements and return an integrity error message on failure."""
+    """Try statements inside a savepoint, then discard all effects."""
 
+    savepoint = quote_identifier(f"sqlite_merge_integrity_{uuid.uuid4().hex}")
+    cursor.execute(f"SAVEPOINT {savepoint}")
     try:
-        with sqlite3.connect(db_path) as con:
-            con.execute("PRAGMA foreign_keys = ON")
-            for statement in statements:
-                con.execute(statement.sql_text)
-            con.commit()
+        for statement in statements:
+            cursor.execute(statement.sql_text)
+        return _foreign_key_check_error(cursor)
     except sqlite3.IntegrityError as exc:
         return str(exc)
-    return None
+    finally:
+        rollback_savepoint(cursor, savepoint)
+
+
+def _foreign_key_check_error(cursor: sqlite3.Cursor) -> str | None:
+    """Return a deferred foreign-key error detected after replaying statements."""
+
+    row = cursor.execute("PRAGMA foreign_key_check").fetchone()
+    if row is None:
+        return None
+    return f"foreign key check failed: {tuple(row)}"
 
 
 def _replay_statements(
@@ -758,22 +729,3 @@ def _sqldiff_path() -> Path | None:
     if local_path.exists():
         return local_path
     return None
-
-
-def _has_conflict_kind(result: ConflictCheckResult, kind: str) -> bool:
-    """Return whether result contains a conflict of kind."""
-
-    return any(conflict.kind == kind for conflict in result.conflicts)
-
-
-def _without_conflict_kind(
-    result: ConflictCheckResult,
-    kind: str,
-) -> ConflictCheckResult:
-    """Return result without conflicts of kind."""
-
-    return ConflictCheckResult(tuple(
-        conflict
-        for conflict in result.conflicts
-        if conflict.kind != kind
-    ))

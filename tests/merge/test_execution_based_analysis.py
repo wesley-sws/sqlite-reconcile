@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from merge import execution_based_analysis, log_merge, static_analysis
+from merge import conflict_detection, execution_based_analysis, log_merge, static_analysis
 
 
 def init_base_db(tmp_path, statements):
@@ -127,6 +127,91 @@ def test_execution_write_write_reports_overlapping_update_rows(tmp_path):
         )
         theirs = make_statement(
             "UPDATE products SET discount = 9 WHERE id IN (1, 2)",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == ["write_write"]
+    assert result.conflicts[0].message == "write-write row overlap"
+
+
+def test_execution_write_write_supports_recursive_cte_disjoint_rows(tmp_path):
+    table_columns = {"nodes": {"id", "parent_id", "flag"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER, flag INTEGER)",
+            "INSERT INTO nodes VALUES (1, NULL, 0)",
+            "INSERT INTO nodes VALUES (2, 1, 0)",
+            "INSERT INTO nodes VALUES (3, 2, 0)",
+            "INSERT INTO nodes VALUES (4, 1, 0)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "WITH RECURSIVE descendants(id) AS ("
+            "  SELECT 2 "
+            "  UNION ALL "
+            "  SELECT nodes.id "
+            "  FROM nodes JOIN descendants ON nodes.parent_id = descendants.id"
+            ") "
+            "UPDATE nodes SET flag = 1 "
+            "WHERE id IN (SELECT id FROM descendants)",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE nodes SET flag = 2 WHERE id = 4",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert not result.has_conflict
+
+
+def test_execution_write_write_reports_recursive_cte_overlap(tmp_path):
+    table_columns = {"nodes": {"id", "parent_id", "flag"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER, flag INTEGER)",
+            "INSERT INTO nodes VALUES (1, NULL, 0)",
+            "INSERT INTO nodes VALUES (2, 1, 0)",
+            "INSERT INTO nodes VALUES (3, 2, 0)",
+            "INSERT INTO nodes VALUES (4, 1, 0)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "WITH RECURSIVE descendants(id) AS ("
+            "  SELECT 2 "
+            "  UNION ALL "
+            "  SELECT nodes.id "
+            "  FROM nodes JOIN descendants ON nodes.parent_id = descendants.id"
+            ") "
+            "UPDATE nodes SET flag = 1 "
+            "WHERE id IN (SELECT id FROM descendants)",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE nodes SET flag = 2 WHERE id = 3",
             table_columns,
             branch="theirs",
         )
@@ -333,6 +418,53 @@ def test_execution_write_read_clears_when_update_probe_unchanged(tmp_path):
     assert not result.has_conflict
 
 
+def test_execution_write_read_clears_when_writer_has_shadowing_cte(tmp_path):
+    table_columns = {
+        "products": {"id", "discount"},
+        "stats": {"id", "value"},
+    }
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, discount INTEGER)",
+            "CREATE TABLE stats (id INTEGER PRIMARY KEY, value INTEGER)",
+            "INSERT INTO products VALUES (1, 5)",
+            "INSERT INTO products VALUES (2, 0)",
+            "INSERT INTO stats VALUES (1, 0)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "WITH products AS (SELECT 1 AS id) "
+            "UPDATE products SET discount = 10 WHERE id = 2",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE stats "
+            "SET value = (SELECT discount FROM products WHERE id = 1) "
+            "WHERE id = 1",
+            table_columns,
+            branch="theirs",
+        )
+        assert conflict_kinds(static_result(context, ours, theirs)) == ["write_read"]
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+        products = context.base_cursor.execute(
+            "SELECT id, discount FROM products ORDER BY id"
+        ).fetchall()
+
+    assert not result.has_conflict
+    assert products == [(1, 5), (2, 0)]
+
+
 def test_execution_write_read_reports_when_update_probe_changes(tmp_path):
     table_columns = {
         "products": {"id", "discount"},
@@ -371,6 +503,51 @@ def test_execution_write_read_reports_when_update_probe_changes(tmp_path):
 
     assert conflict_kinds(result) == ["write_read"]
     assert result.conflicts[0].message == "write-read dependency: ours writes; theirs reads"
+
+
+def test_execution_write_read_clears_unchanged_insert_writer(tmp_path):
+    table_columns = {
+        "products": {"id", "category"},
+        "stats": {"id", "value"},
+    }
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT)",
+            "CREATE TABLE stats (id INTEGER PRIMARY KEY, value TEXT)",
+            "INSERT INTO products VALUES (1, 'sale')",
+            "INSERT INTO stats VALUES (1, 'old')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT INTO products(id, category) VALUES (2, 'clearance')",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE stats "
+            "SET value = (SELECT category FROM products WHERE id = 1) "
+            "WHERE id = 1",
+            table_columns,
+            branch="theirs",
+        )
+        assert conflict_kinds(static_result(context, ours, theirs)) == ["write_read"]
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+        products = context.base_cursor.execute(
+            "SELECT id, category FROM products ORDER BY id"
+        ).fetchall()
+
+    assert not result.has_conflict
+    assert products == [(1, "sale")]
 
 
 def test_execution_write_read_clears_unchanged_insert_values_probe(tmp_path):
@@ -523,7 +700,41 @@ def test_execution_reports_integrity_conflict_for_duplicate_insert_key(tmp_path)
     assert "UNIQUE constraint failed" in result.conflicts[0].message
 
 
-def test_execution_update_from_duplicate_source_rows_keep_static(tmp_path):
+def test_execution_reports_integrity_conflict_when_only_one_order_fails(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO products VALUES (1, 'base')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "DELETE FROM products WHERE id = 1",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT INTO products(id, name) VALUES (1, 'new')",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert "integrity" in conflict_kinds(result)
+    assert "theirs then ours" in result.conflicts[-1].message
+    assert "UNIQUE constraint failed" in result.conflicts[-1].message
+
+
+def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
     table_columns = {
         "products": {"id", "category_id", "discount"},
         "categories": {"id", "rate"},
@@ -556,14 +767,11 @@ def test_execution_update_from_duplicate_source_rows_keep_static(tmp_path):
             table_columns,
             branch="theirs",
         )
-        static = static_result(context, ours, theirs)
-
-        result = execution_based_analysis.execution_based_matching(
+        result = conflict_detection.conflict_detection(
             context,
             ours,
             theirs,
-            static,
         )
 
-    assert result == static
-    assert conflict_kinds(result) == ["write_write"]
+    assert conflict_kinds(result) == ["write_write", "unsafe_replay"]
+    assert result.of_kind("unsafe_replay")[0].scope == "ours"

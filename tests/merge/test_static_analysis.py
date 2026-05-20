@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from merge import log_merge, static_analysis
+from merge import conflict_detection, log_merge, static_analysis
 
 
 def make_context(table_columns, schema=()):
@@ -86,9 +86,48 @@ def test_conflict_detection_blocks_unsafe_replay_statement():
         branch="theirs",
     )
 
-    result = static_analysis.conflict_detection(context, ours, theirs)
+    result = conflict_detection.conflict_detection(context, ours, theirs)
 
     assert "unsafe_replay" in conflict_kinds(result)
+
+
+def test_conflict_detection_blocks_update_from_duplicate_target_rows():
+    table_columns = {
+        "products": {"id", "category_id", "discount"},
+        "categories": {"id", "rate"},
+        "audit": {"id", "value"},
+    }
+    context = make_context(
+        table_columns,
+        schema=[
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)",
+            "CREATE TABLE categories (id INTEGER, rate INTEGER)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, value INTEGER)",
+            "INSERT INTO products VALUES (1, 1, 0)",
+            "INSERT INTO categories VALUES (1, 5)",
+            "INSERT INTO categories VALUES (1, 7)",
+            "INSERT INTO audit VALUES (1, 0)",
+        ],
+    )
+    ours = make_statement(
+        "UPDATE products "
+        "SET discount = categories.rate "
+        "FROM categories "
+        "WHERE products.category_id = categories.id",
+        table_columns,
+        branch="ours",
+    )
+    theirs = make_statement(
+        "UPDATE audit SET value = 1 WHERE id = 1",
+        table_columns,
+        branch="theirs",
+    )
+
+    result = conflict_detection.conflict_detection(context, ours, theirs)
+
+    assert conflict_kinds(result) == ["unsafe_replay"]
+    assert "multiple source rows" in result.conflicts[0].message
+    assert result.conflicts[0].scope == "ours"
 
 
 def test_static_analysis_allows_update_different_columns():
@@ -414,7 +453,7 @@ def test_static_analysis_implicit_key_dml_conflicts_on_omitted_key_column():
     assert "user_id" in result.conflicts[0].message
 
 
-def test_static_analysis_blocks_insert_omitting_current_timestamp_default():
+def test_static_analysis_ignores_insert_omitting_current_timestamp_default():
     table_columns = {
         "products": {"id", "name", "created_at"},
         "audit": {"id", "value"},
@@ -442,11 +481,10 @@ def test_static_analysis_blocks_insert_omitting_current_timestamp_default():
 
     result = static_analysis.static_analysis_matching(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_default"]
-    assert "created_at" in result.conflicts[0].message
+    assert not result.has_conflict
 
 
-def test_static_analysis_blocks_insert_default_values_with_nondeterministic_default():
+def test_static_analysis_ignores_insert_default_values_with_nondeterministic_default():
     table_columns = {
         "products": {"id", "created_at"},
         "audit": {"id", "value"},
@@ -473,11 +511,10 @@ def test_static_analysis_blocks_insert_default_values_with_nondeterministic_defa
 
     result = static_analysis.static_analysis_matching(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_default"]
-    assert "created_at" in result.conflicts[0].message
+    assert not result.has_conflict
 
 
-def test_static_analysis_blocks_insert_omitting_random_default():
+def test_static_analysis_ignores_insert_omitting_random_default():
     table_columns = {
         "products": {"id", "token"},
         "audit": {"id", "value"},
@@ -504,8 +541,7 @@ def test_static_analysis_blocks_insert_omitting_random_default():
 
     result = static_analysis.static_analysis_matching(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_default"]
-    assert "token" in result.conflicts[0].message
+    assert not result.has_conflict
 
 
 def test_static_analysis_allows_explicit_or_deterministic_insert_defaults():
@@ -541,7 +577,7 @@ def test_static_analysis_allows_explicit_or_deterministic_insert_defaults():
     assert not result.has_conflict
 
 
-def test_static_analysis_flags_unqualified_read_overlap_conservatively():
+def test_static_analysis_ignores_ambiguous_unqualified_read():
     table_columns = {
         "products": {"id", "discount"},
         "archived_products": {"id", "discount"},
@@ -565,5 +601,4 @@ def test_static_analysis_flags_unqualified_read_overlap_conservatively():
 
     result = static_analysis.static_analysis_matching(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["write_read"]
-    assert "unresolved reads" in result.conflicts[0].message
+    assert not result.has_conflict

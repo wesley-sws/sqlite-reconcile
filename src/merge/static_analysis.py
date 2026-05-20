@@ -8,13 +8,13 @@ from .log_merge import (
     LoggedStatement,
     StatementConflict,
 )
-from .statement_metadata import ALL_COLUMNS, UNQUALIFIED_TABLE, StatementMetadata
+from .statement_metadata import StatementMetadata
 from .utils import (
+    ALL_COLUMNS,
     is_delete_statement,
     is_insert_statement,
     key_columns as schema_key_columns,
     key_column_sets as schema_key_column_sets,
-    nondeterministic_default_columns,
 )
 
 
@@ -31,34 +31,6 @@ def static_analysis_matching(
         theirs_statement.metadata,
     )
 
-def _with_unsafe_replay_conflicts(
-    result: ConflictCheckResult,
-    ours_statement: LoggedStatement,
-    theirs_statement: LoggedStatement,
-) -> ConflictCheckResult:
-    """Append blocking conflicts for statements unsafe for automatic replay."""
-
-    conflicts = list(result.conflicts)
-    for label, statement in (
-        ("ours", ours_statement),
-        ("theirs", theirs_statement),
-    ):
-        if statement.is_replay_safe:
-            continue
-
-        conflicts.append(
-            StatementConflict(
-                kind="unsafe_replay",
-                message=f"{label} statement is unsafe for replay: "
-                f"{statement.replay_block_reason or 'reason not recorded'}",
-            )
-        )
-
-    if len(conflicts) == len(result.conflicts):
-        return result
-
-    return ConflictCheckResult(tuple(conflicts))
-
 
 def _match_metadata(
     context: ConflictCheckContext,
@@ -68,9 +40,6 @@ def _match_metadata(
     """Compare metadata in both write/write and write/read directions."""
 
     conflicts: list[StatementConflict] = []
-    conflicts.extend(
-        _implicit_insert_default_conflicts(context, ours_metadata, theirs_metadata)
-    )
     conflicts.extend(
         _implicit_insert_key_conflicts(context, ours_metadata, theirs_metadata)
     )
@@ -95,36 +64,7 @@ def _match_metadata(
             reader=ours_metadata,
         )
     )
-    return ConflictCheckResult(tuple(conflicts))
-
-
-def _implicit_insert_default_conflicts(
-    context: ConflictCheckContext,
-    ours_metadata: StatementMetadata,
-    theirs_metadata: StatementMetadata,
-) -> list[StatementConflict]:
-    """Return conflicts for INSERTs that rely on nondeterministic defaults."""
-
-    conflicts: list[StatementConflict] = []
-    for label, metadata in (
-        ("ours", ours_metadata),
-        ("theirs", theirs_metadata),
-    ):
-        columns = _omitted_nondeterministic_default_columns(context, metadata)
-        if not columns:
-            continue
-
-        conflicts.append(
-            StatementConflict(
-                kind="implicit_insert_default",
-                message=(
-                    f"{label} INSERT omits nondeterministic default columns on "
-                    f"{metadata.table_updated}: {_format_columns(columns)}"
-                ),
-            )
-        )
-
-    return conflicts
+    return ConflictCheckResult(conflicts)
 
 
 def _write_write_conflict(
@@ -176,37 +116,34 @@ def _write_read_conflicts(
     if not written_columns:
         return []
 
-    conflicts: list[StatementConflict] = []
-    qualified_overlap, unqualified_overlap = _metadata_read_overlaps(
+    overlap = _metadata_read_overlap(
         reader,
         table,
         written_columns,
     )
-    if qualified_overlap:
-        conflicts.append(
-            StatementConflict(
-                kind="write_read",
-                message=(
-                    f"{writer_label} writes "
-                    f"{table}.{_format_columns(qualified_overlap)}; "
-                    f"{reader_label} reads it"
-                ),
-            )
-        )
+    if not overlap:
+        return []
 
-    if unqualified_overlap:
-        conflicts.append(
-            StatementConflict(
-                kind="write_read",
-                message=(
-                    f"{writer_label} writes {_format_columns(unqualified_overlap)} "
-                    f"on {table}; {reader_label} has unresolved reads of the same "
-                    "columns"
-                ),
-            )
+    return [
+        StatementConflict(
+            kind="write_read",
+            message=(
+                f"{writer_label} writes "
+                f"{table}.{_format_columns(overlap)}; "
+                f"{reader_label} reads it"
+            ),
+            details=_write_read_details(writer_label, reader_label),
         )
+    ]
 
-    return conflicts
+
+def _write_read_details(
+    writer_label: str,
+    reader_label: str,
+) -> tuple[tuple[str, str], ...]:
+    """Return structured direction data for execution-based refinement."""
+
+    return (("writer", writer_label), ("reader", reader_label))
 
 
 def _implicit_insert_key_conflicts(
@@ -340,29 +277,6 @@ def _omitted_insert_key_columns(
     return omitted_columns
 
 
-def _omitted_nondeterministic_default_columns(
-    context: ConflictCheckContext,
-    metadata: StatementMetadata,
-) -> set[str]:
-    """Return nondeterministic default columns omitted by an INSERT."""
-
-    if not is_insert_statement(metadata) or metadata.table_updated is None:
-        return set()
-
-    default_columns = nondeterministic_default_columns(
-        context.base_cursor,
-        metadata.table_updated,
-    )
-    if not default_columns:
-        return set()
-
-    explicit_columns = _insert_explicit_columns(context, metadata)
-    if ALL_COLUMNS in explicit_columns:
-        return set()
-
-    return default_columns - explicit_columns
-
-
 def _insert_explicit_columns(
     context: ConflictCheckContext,
     metadata: StatementMetadata,
@@ -392,7 +306,7 @@ def _metadata_touch_overlap(
 
     return (
         _metadata_write_overlap(metadata, table, columns)
-        | set().union(*_metadata_read_overlaps(metadata, table, columns))
+        | _metadata_read_overlap(metadata, table, columns)
     )
 
 
@@ -409,18 +323,15 @@ def _metadata_write_overlap(
     return _column_overlap(metadata.columns_updated, columns)
 
 
-def _metadata_read_overlaps(
+def _metadata_read_overlap(
     metadata: StatementMetadata,
     table: str | None,
     columns: set[str],
-) -> tuple[set[str], set[str]]:
-    """Return qualified and unresolved read overlaps for columns."""
+) -> set[str]:
+    """Return columns metadata reads on table."""
 
     references = metadata.tables_referenced_to_columns_referenced
-    return (
-        _column_overlap(references.get(table, set()), columns),
-        _column_overlap(references.get(UNQUALIFIED_TABLE, set()), columns),
-    )
+    return _column_overlap(references.get(table, set()), columns)
 
 
 def _written_columns(

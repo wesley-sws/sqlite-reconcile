@@ -39,6 +39,19 @@ def make_detector(conflicting_pairs):
     return detector
 
 
+def make_unsafe_detector(branch):
+    def detector(context, ours_statement, theirs_statement):
+        return log_merge.ConflictCheckResult((
+            log_merge.StatementConflict(
+                kind="unsafe_replay",
+                message=f"{branch} statement is unsafe for replay",
+                scope=branch,
+            ),
+        ))
+
+    return detector
+
+
 @pytest.fixture
 def conflict_context():
     with closing(sqlite3.connect(":memory:")) as con:
@@ -342,6 +355,28 @@ def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
     assert selected.ours_count == 4
     assert selected.theirs_count == 0
     assert selected.score == 4
+
+
+def test_unsafe_replay_only_backtracks_unsafe_branch(conflict_context):
+    ours = [make_statement("ours", index) for index in range(3)]
+    theirs = [make_statement("theirs", index) for index in range(3)]
+    detector = make_unsafe_detector("ours")
+
+    first = log_merge.find_first_pairwise_conflict(
+        ours,
+        theirs,
+        conflict_context,
+        detector,
+    )
+    candidates = log_merge.frontier_candidates_for_conflict(
+        ours,
+        theirs,
+        first,
+        conflict_context,
+        detector,
+    )
+
+    assert [candidate.name for candidate in candidates] == ["backtrack_ours"]
 
 
 def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
