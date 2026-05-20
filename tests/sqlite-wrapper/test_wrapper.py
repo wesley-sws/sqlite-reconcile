@@ -26,6 +26,25 @@ def create_user_db(db_path: Path):
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                token INTEGER
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE random_events (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                token INTEGER DEFAULT (random())
+            )
+            """
+        )
         con.commit()
 
 
@@ -197,6 +216,46 @@ def test_executescript_logs_multiple_statements(tmp_path, wrapper_module):
         wrapper.close()
 
 
+def test_executescript_preserves_explicit_transaction(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.executescript(
+            """
+            BEGIN;
+            INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');
+            INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com');
+            COMMIT;
+            """
+        )
+
+        log_entries = wrapper.get_log()
+        assert len(log_entries) == 2
+        assert {entry["transaction_id"] for entry in log_entries} == {
+            log_entries[0]["transaction_id"]
+        }
+    finally:
+        wrapper.close()
+
+
+def test_executescript_split_preserves_semicolon_inside_string(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.executescript(
+            """
+            INSERT INTO users (id, name, email) VALUES (1, 'Alice; A', 'alice@example.com');
+            INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com');
+            """
+        )
+
+        log_entries = wrapper.get_log()
+        assert len(log_entries) == 2
+        assert log_entries[0]["sql_text"].rstrip(";") == (
+            "INSERT INTO users (id, name, email) VALUES (1, 'Alice; A', 'alice@example.com')"
+        )
+    finally:
+        wrapper.close()
+
+
 def test_cursor_proxies_execute_and_fetch(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
@@ -207,5 +266,195 @@ def test_cursor_proxies_execute_and_fetch(tmp_path, wrapper_module):
         assert row == ("Alice", "alice@example.com")
         assert len(wrapper.get_log()) == 1
         assert wrapper.get_log()[0]["sql_text"] == "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')"
+    finally:
+        wrapper.close()
+
+
+def test_cursor_execute_uses_replay_sql_preparation(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        cursor = wrapper.cursor()
+        cursor.execute("UPDATE events SET token = random()")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == "UPDATE events SET token = random()"
+        assert entry["is_replay_safe"] == 0
+    finally:
+        wrapper.close()
+
+
+def test_logs_original_and_replay_sql_for_current_time_expression(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "UPDATE events "
+            "SET name = 'expired' "
+            "WHERE created_at < datetime('now', '-7 days')"
+        )
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == (
+            "UPDATE events "
+            "SET name = 'expired' "
+            "WHERE created_at < datetime('now', '-7 days')"
+        )
+        assert "datetime('now', '-7 days')" not in entry["to_replay_sql_text"]
+        assert "created_at <" in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_parameterized_nondeterministic_expression_is_marked_unsafe(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO events (id, name, created_at) VALUES (1, 'Alice', '2026-01-01')")
+        wrapper.execute(
+            "UPDATE events SET created_at = datetime('now', ?) WHERE id = 1",
+            ("-7 days",),
+        )
+
+        entry = wrapper.get_log()[1]
+        assert entry["original_sql_text"] == (
+            "UPDATE events SET created_at = datetime('now', '-7 days') WHERE id = 1"
+        )
+        assert entry["to_replay_sql_text"] == entry["original_sql_text"]
+        assert entry["is_replay_safe"] == 0
+    finally:
+        wrapper.close()
+
+
+def test_parameterized_statement_that_needs_rewrite_logs_expanded_unsafe_sql(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO events (id, name, created_at) VALUES (1, 'Alice', '2026-01-01')")
+        wrapper.execute(
+            "UPDATE events SET name = ? WHERE created_at < datetime('now', '+1 day')",
+            ("expired",),
+        )
+
+        entry = wrapper.get_log()[1]
+        assert "?" not in entry["original_sql_text"]
+        assert "'expired'" in entry["original_sql_text"]
+        assert "datetime('now', '+1 day')" in entry["original_sql_text"]
+        assert entry["to_replay_sql_text"] == entry["original_sql_text"]
+        assert entry["is_replay_safe"] == 0
+    finally:
+        wrapper.close()
+
+
+def test_insert_omitted_current_timestamp_default_is_materialized(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO events (id, name) VALUES (1, 'Alice')")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == "INSERT INTO events (id, name) VALUES (1, 'Alice')"
+        assert "created_at" in entry["to_replay_sql_text"]
+        assert "CURRENT_TIMESTAMP" not in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_insert_omitted_parenthesized_random_default_is_materialized(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO random_events (id, name) VALUES (1, 'Alice')")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == "INSERT INTO random_events (id, name) VALUES (1, 'Alice')"
+        assert "token" in entry["to_replay_sql_text"]
+        assert "RANDOM()" not in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_single_values_random_is_materialized(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO events (id, name, token) VALUES (1, 'Alice', random())")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == (
+            "INSERT INTO events (id, name, token) VALUES (1, 'Alice', random())"
+        )
+        assert "RANDOM()" not in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_executemany_rewrite_candidate_is_marked_unsafe_per_execution(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.executemany(
+            "INSERT INTO events (id, name, token) VALUES (?, ?, random())",
+            [
+                (1, "Alice"),
+                (2, "Bob"),
+            ],
+        )
+
+        entries = wrapper.get_log()
+        assert len(entries) == 2
+        assert [entry["is_replay_safe"] for entry in entries] == [0, 0]
+        assert [entry["original_sql_text"] for entry in entries] == [
+            "INSERT INTO events (id, name, token) VALUES (1, 'Alice', random())",
+            "INSERT INTO events (id, name, token) VALUES (2, 'Bob', random())",
+        ]
+        assert [entry["to_replay_sql_text"] for entry in entries] == [
+            entry["original_sql_text"] for entry in entries
+        ]
+    finally:
+        wrapper.close()
+
+
+def test_row_level_random_update_is_marked_unsafe(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("UPDATE events SET token = random()")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == "UPDATE events SET token = random()"
+        assert entry["to_replay_sql_text"] == "UPDATE events SET token = random()"
+        assert entry["is_replay_safe"] == 0
+    finally:
+        wrapper.close()
+
+
+def test_failed_autocommit_statement_is_not_logged_without_trace(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        with pytest.raises(sqlite3.IntegrityError):
+            wrapper.execute("INSERT INTO users (id, name) VALUES (1, 'Duplicate')")
+
+        entries = wrapper.get_log()
+        assert len(entries) == 1
+        assert entries[0]["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_transaction_statement_error_marks_failed_statement_unsafe(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("BEGIN")
+        wrapper.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        with pytest.raises(sqlite3.IntegrityError):
+            wrapper.execute("INSERT INTO users (id, name) VALUES (1, 'Duplicate')")
+        wrapper.commit()
+
+        entries = wrapper.get_log()
+        assert len(entries) == 2
+        assert {entry["transaction_id"] for entry in entries} == {
+            entries[0]["transaction_id"]
+        }
+        assert entries[0]["is_replay_safe"] == 0
+        assert entries[1]["is_replay_safe"] == 0
+        assert "execution error" in entries[0]["replay_block_reason"]
+        assert "execution error" in entries[1]["replay_block_reason"]
     finally:
         wrapper.close()

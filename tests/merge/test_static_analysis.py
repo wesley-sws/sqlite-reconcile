@@ -31,6 +31,19 @@ def make_statement(sql_text, table_columns, branch="ours", index=0):
     )
 
 
+def make_unsafe_statement(sql_text, table_columns, branch="ours", index=0):
+    return log_merge.make_logged_statement(
+        branch=branch,
+        branch_index=index,
+        log_id=index + 1,
+        transaction_id=index + 1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=sql_text,
+        table_columns=table_columns,
+        is_replay_safe=False,
+    )
+
+
 def conflict_kinds(result):
     return [conflict.kind for conflict in result.conflicts]
 
@@ -55,6 +68,27 @@ def test_static_analysis_flags_update_same_column_write_write():
 
     assert conflict_kinds(result) == ["write_write"]
     assert "products.discount" in result.conflicts[0].message
+
+
+def test_conflict_detection_blocks_unsafe_replay_statement():
+    table_columns = {
+        "products": {"id", "discount"},
+    }
+    context = make_context(table_columns)
+    ours = make_unsafe_statement(
+        "UPDATE products SET discount = random()",
+        table_columns,
+        branch="ours",
+    )
+    theirs = make_statement(
+        "UPDATE products SET discount = 9 WHERE id = 1",
+        table_columns,
+        branch="theirs",
+    )
+
+    result = static_analysis.conflict_detection(context, ours, theirs)
+
+    assert "unsafe_replay" in conflict_kinds(result)
 
 
 def test_static_analysis_allows_update_different_columns():

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from typing import TYPE_CHECKING
 
 from sqlglot import expressions as exp
 
-from .statement_metadata import StatementMetadata
+if TYPE_CHECKING:
+    from .statement_metadata import StatementMetadata
 
 CURRENT_TIME_DEFAULTS = {
     "current_date",
@@ -34,6 +36,18 @@ def sql_expression_to_sql(value: exp.Expression) -> str:
     """Render a sqlglot expression back to SQLite-flavoured SQL."""
 
     return value.sql(dialect="sqlite")
+
+
+def table_expression(expression: exp.Expression | None) -> exp.Table | None:
+    """Return the table node from a table or INSERT schema target."""
+
+    if isinstance(expression, exp.Table):
+        return expression
+
+    if isinstance(expression, exp.Schema) and isinstance(expression.this, exp.Table):
+        return expression.this
+
+    return None
 
 
 def is_delete_statement(metadata: StatementMetadata) -> bool:
@@ -76,6 +90,25 @@ def key_columns(cursor: sqlite3.Cursor, table: str | None) -> set[str]:
         return set()
 
     return set().union(*key_column_sets(cursor, table))
+
+
+def primary_key_columns(cursor: sqlite3.Cursor, table: str | None) -> tuple[str, ...]:
+    """Return primary-key columns for table in key order."""
+
+    if table is None:
+        return ()
+
+    columns = [
+        (
+            int(row_value(row, "pk", 5) or 0),
+            str(row_value(row, "name", 1)),
+        )
+        for row in cursor.execute(
+            f"PRAGMA table_info({quote_identifier(table)})"
+        ).fetchall()
+        if int(row_value(row, "pk", 5) or 0) > 0
+    ]
+    return tuple(column for _, column in sorted(columns))
 
 
 def key_column_sets(cursor: sqlite3.Cursor, table: str) -> tuple[set[str], ...]:

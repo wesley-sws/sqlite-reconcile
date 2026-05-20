@@ -65,22 +65,47 @@ def init_logged_db(path):
             CREATE TABLE {log_merge.LOG_TABLE} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 transaction_id INTEGER NOT NULL REFERENCES {log_merge.TX_TABLE}(id),
-                sql_text TEXT NOT NULL
+                original_sql_text TEXT NOT NULL,
+                to_replay_sql_text TEXT NOT NULL,
+                is_replay_safe INTEGER NOT NULL DEFAULT 1,
+                replay_block_reason TEXT
             )
             """
         )
         con.commit()
 
 
-def append_log(path, sql_text, committed_at="2026-01-01T00:00:00"):
+def append_log(
+    path,
+    sql_text,
+    committed_at="2026-01-01T00:00:00",
+    original_sql_text=None,
+    is_replay_safe=True,
+    replay_block_reason=None,
+):
     with sqlite3.connect(path) as con:
         cursor = con.execute(
             f"INSERT INTO {log_merge.TX_TABLE} (committed_at) VALUES (?)",
             (committed_at,),
         )
         con.execute(
-            f"INSERT INTO {log_merge.LOG_TABLE} (transaction_id, sql_text) VALUES (?, ?)",
-            (cursor.lastrowid, sql_text),
+            f"""
+            INSERT INTO {log_merge.LOG_TABLE} (
+                transaction_id,
+                original_sql_text,
+                to_replay_sql_text,
+                is_replay_safe,
+                replay_block_reason
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                cursor.lastrowid,
+                original_sql_text or sql_text,
+                sql_text,
+                int(is_replay_safe),
+                replay_block_reason,
+            ),
         )
         con.commit()
 
@@ -105,7 +130,10 @@ def create_log_tables(con):
         CREATE TABLE {log_merge.LOG_TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transaction_id INTEGER NOT NULL REFERENCES {log_merge.TX_TABLE}(id),
-            sql_text TEXT NOT NULL
+            original_sql_text TEXT NOT NULL,
+            to_replay_sql_text TEXT NOT NULL,
+            is_replay_safe INTEGER NOT NULL DEFAULT 1,
+            replay_block_reason TEXT
         )
         """
     )
@@ -159,7 +187,10 @@ def test_load_table_columns_skips_only_internal_log_tables():
             CREATE TABLE {log_merge.LOG_TABLE} (
                 id INTEGER PRIMARY KEY,
                 transaction_id INTEGER NOT NULL,
-                sql_text TEXT NOT NULL
+                original_sql_text TEXT NOT NULL,
+                to_replay_sql_text TEXT NOT NULL,
+                is_replay_safe INTEGER NOT NULL DEFAULT 1,
+                replay_block_reason TEXT
             )
             """
         )
@@ -201,12 +232,41 @@ def test_load_logged_statements_uses_base_transaction_watermark(tmp_path):
     assert statements[0].branch == "ours"
     assert statements[0].branch_index == 0
     assert statements[0].sql_text == "INSERT INTO users (id, name) VALUES (2, 'Bob')"
+    assert statements[0].original_sql_text == (
+        "INSERT INTO users (id, name) VALUES (2, 'Bob')"
+    )
+    assert statements[0].is_replay_safe
     assert statements[0].metadata.parsed_sql_text.sql(dialect="sqlite") == (
         "INSERT INTO users (id, name) VALUES (2, 'Bob')"
     )
     assert statements[0].metadata.table_updated == "users"
     assert statements[0].metadata.columns_updated == {log_merge.ALL_COLUMNS}
     assert statements[0].metadata.tables_referenced_to_columns_referenced == {}
+
+
+def test_load_logged_statements_uses_replay_sql_for_metadata(tmp_path):
+    base = tmp_path / "base.db"
+    ours = tmp_path / "ours.db"
+    init_logged_db(base)
+    shutil.copy2(base, ours)
+
+    append_log(
+        ours,
+        "UPDATE users SET name = 'old-literal' WHERE id = 1",
+        original_sql_text="UPDATE users SET name = datetime('now') WHERE id = 1",
+    )
+
+    with closing(sqlite3.connect(ours)) as con:
+        con.row_factory = sqlite3.Row
+        statements = log_merge.load_logged_statements(con.cursor(), "ours", 0, ours)
+
+    assert statements[0].original_sql_text == (
+        "UPDATE users SET name = datetime('now') WHERE id = 1"
+    )
+    assert statements[0].sql_text == "UPDATE users SET name = 'old-literal' WHERE id = 1"
+    assert statements[0].metadata.parsed_sql_text.sql(dialect="sqlite") == (
+        "UPDATE users SET name = 'old-literal' WHERE id = 1"
+    )
 
 
 def test_backtracking_ours_keeps_backtracking_after_later_conflict(conflict_context):
@@ -306,7 +366,7 @@ def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
     with closing(sqlite3.connect(output)) as con:
         names = con.execute("SELECT name FROM users ORDER BY id").fetchall()
         log_rows = con.execute(
-            f"SELECT sql_text FROM {log_merge.LOG_TABLE} ORDER BY id"
+            f"SELECT to_replay_sql_text FROM {log_merge.LOG_TABLE} ORDER BY id"
         ).fetchall()
 
     assert names == [("Bob",)]
@@ -364,7 +424,7 @@ def test_replay_statement_plan_reports_deferred_foreign_key_failure_in_loop(tmp_
     assert result.applied_count == 1
     assert result.failure is not None
     assert result.failure.statement is not None
-    assert result.failure.statement["sql_text"] == invalid_sql_text
+    assert result.failure.statement["to_replay_sql_text"] == invalid_sql_text
     assert result.integrity_errors is not None
     assert any("foreign_key_check" in error for error in result.integrity_errors)
 
@@ -372,12 +432,35 @@ def test_replay_statement_plan_reports_deferred_foreign_key_failure_in_loop(tmp_
         parent_rows = con.execute("SELECT * FROM parents").fetchall()
         child_rows = con.execute("SELECT * FROM children").fetchall()
         log_rows = con.execute(
-            f"SELECT sql_text FROM {log_merge.LOG_TABLE} ORDER BY id"
+            f"SELECT to_replay_sql_text FROM {log_merge.LOG_TABLE} ORDER BY id"
         ).fetchall()
 
     assert parent_rows == [(1,)]
     assert child_rows == []
     assert log_rows == [(valid_sql_text,)]
+
+
+def test_replay_statement_plan_blocks_unsafe_replay_statement(tmp_path):
+    base = tmp_path / "base.db"
+    output = tmp_path / "merged.db"
+    init_logged_db(base)
+
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-02T00:00:00",
+        sql_text="UPDATE users SET name = random()",
+        is_replay_safe=False,
+    )
+
+    result = log_merge.replay_statement_plan(base, output, [statement])
+
+    assert not result.ok
+    assert result.applied_count == 0
+    assert result.failure is not None
+    assert "unsafe for automatic replay" in result.failure.error
 
 
 def test_conflict_report_serializes_logged_statement_metadata(tmp_path):

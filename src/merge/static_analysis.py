@@ -31,15 +31,33 @@ def static_analysis_matching(
         theirs_statement.metadata,
     )
 
-
-def conflict_detection(
-    context: ConflictCheckContext,
+def _with_unsafe_replay_conflicts(
+    result: ConflictCheckResult,
     ours_statement: LoggedStatement,
     theirs_statement: LoggedStatement,
 ) -> ConflictCheckResult:
-    """Entry point for statement-pair conflict detection."""
+    """Append blocking conflicts for statements unsafe for automatic replay."""
 
-    return static_analysis_matching(context, ours_statement, theirs_statement)
+    conflicts = list(result.conflicts)
+    for label, statement in (
+        ("ours", ours_statement),
+        ("theirs", theirs_statement),
+    ):
+        if statement.is_replay_safe:
+            continue
+
+        conflicts.append(
+            StatementConflict(
+                kind="unsafe_replay",
+                message=f"{label} statement is unsafe for replay: "
+                f"{statement.replay_block_reason or 'reason not recorded'}",
+            )
+        )
+
+    if len(conflicts) == len(result.conflicts):
+        return result
+
+    return ConflictCheckResult(tuple(conflicts))
 
 
 def _match_metadata(

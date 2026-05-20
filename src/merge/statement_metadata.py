@@ -15,6 +15,8 @@ import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
+from .utils import table_expression
+
 ALL_COLUMNS = "*"
 UNQUALIFIED_TABLE = "__unqualified__"
 
@@ -430,7 +432,7 @@ def _dml_outer_sources(
     sources = _new_source_map()
 
     if isinstance(parsed_sql_text, (exp.Update, exp.Delete)):
-        target_table = _table_expression(parsed_sql_text.this)
+        target_table = table_expression(parsed_sql_text.this)
         if target_table is not None:
             _add_table_source(sources, target_table, ignored_relations)
 
@@ -622,19 +624,7 @@ def _has_ancestor_before_root(
 def _table_name(expression: exp.Expression | None) -> str | None:
     """Return a table expression's concrete table name."""
 
-    table = _table_expression(expression)
+    table = table_expression(expression)
     if table is not None:
         return table.name
-    return None
-
-
-def _table_expression(expression: exp.Expression | None) -> exp.Table | None:
-    """Return the table node from a table or INSERT schema target."""
-
-    if isinstance(expression, exp.Table):
-        return expression
-
-    if isinstance(expression, exp.Schema) and isinstance(expression.this, exp.Table):
-        return expression.this
-
     return None

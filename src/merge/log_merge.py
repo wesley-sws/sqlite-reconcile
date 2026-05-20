@@ -36,6 +36,7 @@ ConflictKind = Literal[
     "write_read",
     "implicit_insert_key",
     "implicit_insert_default",
+    "unsafe_replay",
     "integrity",
     "non_commutative",
     "replay_error",
@@ -49,8 +50,17 @@ class LoggedStatement:
     log_id: int
     transaction_id: int
     committed_at: str
-    sql_text: str
+    original_sql_text: str
+    to_replay_sql_text: str
+    is_replay_safe: bool
+    replay_block_reason: str | None
     metadata: StatementMetadata
+
+    @property
+    def sql_text(self) -> str:
+        """Return the deterministic SQL used for analysis and replay."""
+
+        return self.to_replay_sql_text
 
 
 @dataclass(frozen=True)
@@ -170,6 +180,9 @@ def make_logged_statement(
     committed_at: str,
     sql_text: str,
     table_columns: TableColumns | None = None,
+    original_sql_text: str | None = None,
+    is_replay_safe: bool = True,
+    replay_block_reason: str | None = None,
 ) -> LoggedStatement:
     return LoggedStatement(
         branch=branch,
@@ -177,7 +190,10 @@ def make_logged_statement(
         log_id=log_id,
         transaction_id=transaction_id,
         committed_at=committed_at,
-        sql_text=sql_text,
+        original_sql_text=original_sql_text or sql_text,
+        to_replay_sql_text=sql_text,
+        is_replay_safe=is_replay_safe,
+        replay_block_reason=replay_block_reason,
         metadata=parse_statement_metadata(sql_text, table_columns=table_columns),
     )
 
@@ -245,7 +261,10 @@ def load_logged_statements(
         SELECT l.id AS log_id,
                l.transaction_id,
                t.committed_at,
-               l.sql_text
+               l.original_sql_text,
+               l.to_replay_sql_text,
+               l.is_replay_safe,
+               l.replay_block_reason
         FROM {LOG_TABLE} AS l
         JOIN {TX_TABLE} AS t ON t.id = l.transaction_id
         WHERE l.transaction_id > ?
@@ -261,7 +280,10 @@ def load_logged_statements(
             log_id=int(row["log_id"]),
             transaction_id=int(row["transaction_id"]),
             committed_at=str(row["committed_at"]),
-            sql_text=str(row["sql_text"]),
+            sql_text=str(row["to_replay_sql_text"]),
+            original_sql_text=str(row["original_sql_text"]),
+            is_replay_safe=bool(row["is_replay_safe"]),
+            replay_block_reason=row["replay_block_reason"],
             table_columns=table_columns,
         )
         for index, row in enumerate(rows)
@@ -278,8 +300,8 @@ def _conflict_pair(
     return ConflictPair(
         ours_index=ours_index,
         theirs_index=theirs_index,
-        ours_sql=ours[ours_index].sql_text,
-        theirs_sql=theirs[theirs_index].sql_text,
+        ours_sql=ours[ours_index].original_sql_text,
+        theirs_sql=theirs[theirs_index].original_sql_text,
         conflicts=() if result is None else result.conflicts,
     )
 
@@ -519,8 +541,23 @@ def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) ->
         (committed_at,),
     )
     con.execute(
-        f"INSERT INTO {LOG_TABLE} (transaction_id, sql_text) VALUES (?, ?)",
-        (cursor.lastrowid, statement.sql_text),
+        f"""
+        INSERT INTO {LOG_TABLE} (
+            transaction_id,
+            original_sql_text,
+            to_replay_sql_text,
+            is_replay_safe,
+            replay_block_reason
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            cursor.lastrowid,
+            statement.original_sql_text,
+            statement.to_replay_sql_text,
+            int(statement.is_replay_safe),
+            statement.replay_block_reason,
+        ),
     )
 
 
@@ -548,6 +585,20 @@ def replay_statement_plan(
         con.execute("PRAGMA foreign_keys = ON")
 
         for applied_count, statement in enumerate(statement_plan):
+            if not statement.is_replay_safe:
+                return ReplayResult(
+                    ok=False,
+                    output_path=str(output_path),
+                    applied_count=applied_count,
+                    failure=ReplayFailure(
+                        statement=asdict(statement),
+                        error=(
+                            statement.replay_block_reason
+                            or "statement is unsafe for automatic replay"
+                        ),
+                    ),
+                )
+
             savepoint_name = f"replay_statement_{applied_count}"
             con.execute(f"SAVEPOINT {savepoint_name}")
             try:
