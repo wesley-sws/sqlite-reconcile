@@ -23,7 +23,7 @@ from .utils import (
     is_delete_statement,
     is_insert_statement,
     is_update_statement,
-    primary_key_columns,
+    primary_key_columns as schema_primary_key_columns,
     quote_identifier,
     rollback_savepoint,
     table_expression,
@@ -336,7 +336,7 @@ def _target_row_select(
         return None
 
     table = metadata.table_updated
-    pk_columns = primary_key_columns(context.base_cursor, table)
+    pk_columns = _primary_key_columns(context, table)
     target_table = table_expression(expression.this)
     if table is None or not pk_columns or target_table is None:
         return None
@@ -374,6 +374,22 @@ def _target_row_select(
         f"FROM {', '.join(from_sources)}"
         f"{where_sql}"
     )
+
+
+def _primary_key_columns(
+    context: ConflictCheckContext,
+    table: str | None,
+) -> tuple[str, ...]:
+    """Return cached primary-key columns, falling back to schema lookup."""
+
+    if table is None:
+        return ()
+
+    columns = context.primary_key_columns.get(table)
+    if columns is not None:
+        return columns
+
+    return schema_primary_key_columns(context.base_cursor, table)
 
 
 def _read_probe_result(
@@ -620,7 +636,7 @@ def _probe_has_duplicate_target_rows(
 ) -> bool:
     """Return whether probe returns duplicate target PK rows."""
 
-    pk_count = len(primary_key_columns(context.base_cursor, metadata.table_updated))
+    pk_count = len(_primary_key_columns(context, metadata.table_updated))
     if pk_count == 0:
         return True
 

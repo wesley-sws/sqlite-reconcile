@@ -811,7 +811,7 @@ def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
             theirs,
         )
 
-    assert conflict_kinds(result) == ["write_write", "unsafe_replay"]
+    assert conflict_kinds(result) == ["unsafe_replay"]
     assert result.of_kind("unsafe_replay")[0].scope == "ours"
 
 

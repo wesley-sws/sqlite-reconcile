@@ -88,7 +88,29 @@ def test_conflict_detection_blocks_unsafe_replay_statement():
 
     result = conflict_detection.conflict_detection(context, ours, theirs)
 
-    assert "unsafe_replay" in conflict_kinds(result)
+    assert conflict_kinds(result) == ["unsafe_replay"]
+
+
+def test_conflict_detection_blocks_unparseable_statement_before_pair_checks():
+    table_columns = {
+        "products": {"id", "discount"},
+    }
+    context = make_context(table_columns)
+    ours = make_statement(
+        "NOT VALID SQL @@@",
+        table_columns,
+        branch="ours",
+    )
+    theirs = make_statement(
+        "UPDATE products SET discount = 9 WHERE id = 1",
+        table_columns,
+        branch="theirs",
+    )
+
+    result = conflict_detection.conflict_detection(context, ours, theirs)
+
+    assert conflict_kinds(result) == ["unsafe_replay"]
+    assert log_merge.METADATA_PARSE_ERROR_REASON in result.conflicts[0].message
 
 
 def test_conflict_detection_blocks_update_from_duplicate_target_rows():

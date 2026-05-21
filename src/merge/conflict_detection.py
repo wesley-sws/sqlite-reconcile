@@ -26,6 +26,9 @@ def conflict_detection(
         ours_statement,
         theirs_statement,
     )
+    if unsafe_result.has_conflict:
+        return unsafe_result
+
     replay_result = _with_update_from_replay_conflicts(
         context,
         unsafe_result,
@@ -33,17 +36,14 @@ def conflict_detection(
         theirs_statement,
     )
     if replay_result.has_conflict:
-        return static_analysis_matching(
-            context,
-            ours_statement,
-            theirs_statement,
-        ).add_conflicts(*replay_result.conflicts)
-
-    conflict = integrity_conflict(context, ours_statement, theirs_statement)
-    if conflict is not None:
-        return ConflictCheckResult((conflict,))
+        return replay_result
 
     static_result = static_analysis_matching(context, ours_statement, theirs_statement)
+    conflict = integrity_conflict(context, ours_statement, theirs_statement)
+    if conflict is not None:
+        return static_result.add_conflicts(conflict)
+
+    
     return execution_based_matching(
         context,
         ours_statement,

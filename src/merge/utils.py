@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Container
+from collections.abc import Container, Iterable
 from typing import TYPE_CHECKING
 
 from sqlglot import expressions as exp
@@ -11,6 +11,8 @@ if TYPE_CHECKING:
 
 ALL_COLUMNS = "*"
 TableColumns = dict[str, set[str]]
+TablePrimaryKeyColumns = dict[str, tuple[str, ...]]
+TableKeyColumnSets = dict[str, tuple[set[str], ...]]
 
 
 def is_sql_expression(value: object) -> bool:
@@ -118,6 +120,30 @@ def load_table_columns(
             for pragma_row in pragma_rows
         }
     return table_columns
+
+
+def load_primary_key_columns(
+    cursor: sqlite3.Cursor,
+    tables: Iterable[str],
+) -> TablePrimaryKeyColumns:
+    """Return table names mapped to ordered primary-key columns."""
+
+    return {
+        table: primary_key_columns(cursor, table)
+        for table in tables
+    }
+
+
+def load_key_column_sets(
+    cursor: sqlite3.Cursor,
+    tables: Iterable[str],
+) -> TableKeyColumnSets:
+    """Return table names mapped to primary-key and unique-key column sets."""
+
+    return {
+        table: key_column_sets(cursor, table)
+        for table in tables
+    }
 
 
 def rollback_savepoint(

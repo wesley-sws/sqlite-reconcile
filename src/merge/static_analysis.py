@@ -13,7 +13,6 @@ from .utils import (
     ALL_COLUMNS,
     is_delete_statement,
     is_insert_statement,
-    key_columns as schema_key_columns,
     key_column_sets as schema_key_column_sets,
 )
 
@@ -262,7 +261,7 @@ def _omitted_insert_key_columns(
     if not is_insert_statement(metadata) or metadata.table_updated is None:
         return set()
 
-    key_sets = schema_key_column_sets(context.base_cursor, metadata.table_updated)
+    key_sets = _key_column_sets(context, metadata.table_updated)
     if not key_sets:
         return set()
 
@@ -275,6 +274,22 @@ def _omitted_insert_key_columns(
         if not key_set <= explicit_columns:
             omitted_columns.update(key_set - explicit_columns)
     return omitted_columns
+
+
+def _key_column_sets(
+    context: ConflictCheckContext,
+    table: str | None,
+) -> tuple[set[str], ...]:
+    """Return cached PK/unique-key column sets, falling back to schema lookup."""
+
+    if table is None:
+        return ()
+
+    key_sets = context.key_column_sets.get(table)
+    if key_sets is not None:
+        return key_sets
+
+    return schema_key_column_sets(context.base_cursor, table)
 
 
 def _insert_explicit_columns(

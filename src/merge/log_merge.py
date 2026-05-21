@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import closing
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -21,8 +21,12 @@ from .statement_metadata import (
 )
 from .utils import (
     ALL_COLUMNS,
+    TableKeyColumnSets,
     TableColumns,
+    TablePrimaryKeyColumns,
     is_sql_expression,
+    load_key_column_sets,
+    load_primary_key_columns,
     load_table_columns as load_user_table_columns,
     rollback_savepoint,
     sql_expression_to_sql,
@@ -81,6 +85,8 @@ class ConflictCheckContext:
     base_cursor: sqlite3.Cursor
     base_db_path: str | Path
     table_columns: TableColumns
+    primary_key_columns: TablePrimaryKeyColumns = field(default_factory=dict)
+    key_column_sets: TableKeyColumnSets = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -91,9 +97,9 @@ class StatementConflict:
     details: tuple[tuple[str, str], ...] = ()
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(init=False)
 class ConflictCheckResult:
-    conflicts_by_kind: dict[ConflictKind, tuple[StatementConflict, ...]]
+    conflicts_by_kind: dict[ConflictKind, list[StatementConflict]]
 
     def __init__(
         self,
@@ -113,11 +119,7 @@ class ConflictCheckResult:
                 if kind_conflicts:
                     grouped[kind] = list(kind_conflicts)
 
-        object.__setattr__(
-            self,
-            "conflicts_by_kind",
-            {kind: tuple(values) for kind, values in grouped.items()},
-        )
+        self.conflicts_by_kind = grouped
 
     @property
     def conflicts(self) -> tuple[StatementConflict, ...]:
@@ -136,7 +138,7 @@ class ConflictCheckResult:
     def of_kind(self, kind: ConflictKind) -> tuple[StatementConflict, ...]:
         """Return conflicts of one kind."""
 
-        return self.conflicts_by_kind.get(kind, ())
+        return tuple(self.conflicts_by_kind.get(kind, ()))
 
     def has_kind(self, kind: ConflictKind) -> bool:
         """Return whether any conflicts of kind are present."""
@@ -144,45 +146,32 @@ class ConflictCheckResult:
         return kind in self.conflicts_by_kind
 
     def without_kind(self, kind: ConflictKind) -> ConflictCheckResult:
-        """Return a copy without conflicts of kind."""
+        """Remove conflicts of kind and return this result."""
 
-        return ConflictCheckResult(
-            conflicts_by_kind={
-                existing_kind: conflicts
-                for existing_kind, conflicts in self.conflicts_by_kind.items()
-                if existing_kind != kind
-            }
-        )
+        self.conflicts_by_kind.pop(kind, None)
+        return self
 
     def replace_kind(
         self,
         kind: ConflictKind,
         conflicts: Sequence[StatementConflict],
     ) -> ConflictCheckResult:
-        """Return a copy with conflicts of kind replaced."""
+        """Replace conflicts of kind and return this result."""
 
-        grouped = {
-            existing_kind: kind_conflicts
-            for existing_kind, kind_conflicts in self.conflicts_by_kind.items()
-            if existing_kind != kind
-        }
+        self.conflicts_by_kind.pop(kind, None)
         if conflicts:
-            grouped[kind] = tuple(conflicts)
-        return ConflictCheckResult(conflicts_by_kind=grouped)
+            self.conflicts_by_kind[kind] = list(conflicts)
+        return self
 
     def add_conflicts(
         self,
         *conflicts: StatementConflict,
     ) -> ConflictCheckResult:
-        """Return a copy with conflicts appended to their kind groups."""
+        """Append conflicts to their kind groups and return this result."""
 
-        grouped = {
-            kind: list(kind_conflicts)
-            for kind, kind_conflicts in self.conflicts_by_kind.items()
-        }
         for conflict in conflicts:
-            grouped.setdefault(conflict.kind, []).append(conflict)
-        return ConflictCheckResult(conflicts_by_kind=grouped)
+            self.conflicts_by_kind.setdefault(conflict.kind, []).append(conflict)
+        return self
 
 
 ConflictDetector = Callable[
@@ -584,6 +573,14 @@ def build_merge_plan(
         theirs_cursor = theirs_conn.cursor()
 
         table_columns = load_table_columns(base_cursor)
+        primary_key_columns = load_primary_key_columns(
+            base_cursor,
+            table_columns,
+        )
+        key_column_sets = load_key_column_sets(
+            base_cursor,
+            table_columns,
+        )
         base_transaction_id = get_base_watermark(base_cursor, base_db_path)
         ours = load_logged_statements(
             ours_cursor,
@@ -604,6 +601,8 @@ def build_merge_plan(
             base_cursor=base_cursor,
             base_db_path=base_db_path,
             table_columns=table_columns,
+            primary_key_columns=primary_key_columns,
+            key_column_sets=key_column_sets,
         )
         first_conflict = find_first_pairwise_conflict(
             ours,
