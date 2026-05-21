@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .execution_based_analysis import (
     execution_based_matching,
+    integrity_conflict,
     update_from_has_duplicate_target_rows,
 )
 from .log_merge import (
@@ -20,9 +21,8 @@ def conflict_detection(
 ) -> ConflictCheckResult:
     """Coordinate static checks, replay safety checks, and execution checks."""
 
-    static_result = static_analysis_matching(context, ours_statement, theirs_statement)
     unsafe_result = _with_unsafe_replay_conflicts(
-        static_result,
+        ConflictCheckResult(),
         ours_statement,
         theirs_statement,
     )
@@ -32,14 +32,24 @@ def conflict_detection(
         ours_statement,
         theirs_statement,
     )
-    if replay_result is not static_result:
-        return replay_result
+    if replay_result.has_conflict:
+        return static_analysis_matching(
+            context,
+            ours_statement,
+            theirs_statement,
+        ).add_conflicts(*replay_result.conflicts)
 
+    conflict = integrity_conflict(context, ours_statement, theirs_statement)
+    if conflict is not None:
+        return ConflictCheckResult((conflict,))
+
+    static_result = static_analysis_matching(context, ours_statement, theirs_statement)
     return execution_based_matching(
         context,
         ours_statement,
         theirs_statement,
         static_result,
+        check_integrity=False,
     )
 
 

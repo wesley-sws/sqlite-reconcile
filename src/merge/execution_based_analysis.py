@@ -29,8 +29,16 @@ from .utils import (
     table_expression,
 )
 
-WriteReadProbeOutcome = Literal["changed", "unchanged", "unsupported"]
-ReadProbeStatus = Literal["ok", "no_read", "unsupported"]
+WriteReadProbeStatus = Literal["changed", "unchanged", "not_refined"]
+ReadProbeStatus = Literal["ok", "no_read", "not_refined"]
+
+
+@dataclass(frozen=True)
+class WriteReadProbeResult:
+    """Result of trying to refine one static write-read conflict."""
+
+    status: WriteReadProbeStatus
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,7 @@ class ReadProbeResult:
 
     status: ReadProbeStatus
     sql: str | None = None
+    reason: str | None = None
 
 
 def commutativity_check(
@@ -84,14 +93,15 @@ def execution_based_matching(
     ours_statement: LoggedStatement,
     theirs_statement: LoggedStatement,
     static_result: ConflictCheckResult,
+    *,
+    check_integrity: bool = True,
 ) -> ConflictCheckResult:
     """Recheck static conflicts with targeted SQLite execution where possible."""
 
-    integrity_error = _pair_integrity_error(context, ours_statement, theirs_statement)
-    if integrity_error is not None:
-        return ConflictCheckResult((
-            StatementConflict(kind="integrity", message=integrity_error),
-        ))
+    if check_integrity:
+        conflict = integrity_conflict(context, ours_statement, theirs_statement)
+        if conflict is not None:
+            return ConflictCheckResult((conflict,))
 
     result = static_result
     result = _check_write_read(
@@ -107,6 +117,20 @@ def execution_based_matching(
         result,
     )
     return result
+
+
+def integrity_conflict(
+    context: ConflictCheckContext,
+    ours_statement: LoggedStatement,
+    theirs_statement: LoggedStatement,
+) -> StatementConflict | None:
+    """Return an integrity conflict if either pair replay order fails."""
+
+    integrity_error = _pair_integrity_error(context, ours_statement, theirs_statement)
+    if integrity_error is None:
+        return None
+
+    return StatementConflict(kind="integrity", message=integrity_error)
 
 
 def _check_write_write(
@@ -167,18 +191,21 @@ def write_read_dependency_outcome(
     context: ConflictCheckContext,
     writer_statement: LoggedStatement,
     reader_metadata: StatementMetadata,
-) -> WriteReadProbeOutcome:
+) -> WriteReadProbeResult:
     """Return whether reader output changes after writer runs in a savepoint."""
 
     writer_metadata = writer_statement.metadata
     if not _can_simulate_writer(writer_metadata):
-        return "unsupported"
+        return WriteReadProbeResult(
+            "not_refined",
+            "writer statement cannot be simulated safely",
+        )
 
     probe_result = _read_probe_result(context, reader_metadata)
     if probe_result.status == "no_read":
-        return "unchanged"
-    if probe_result.status == "unsupported" or probe_result.sql is None:
-        return "unsupported"
+        return WriteReadProbeResult("unchanged")
+    if probe_result.status == "not_refined" or probe_result.sql is None:
+        return WriteReadProbeResult("not_refined", probe_result.reason)
 
     base_probe = probe_result.sql
     cursor = context.base_cursor
@@ -195,16 +222,21 @@ def write_read_dependency_outcome(
         if _is_update_from_statement(
             reader_metadata,
         ) and _probe_has_duplicate_target_rows(context, reader_metadata, base_probe):
-            return "unsupported"
+            return WriteReadProbeResult(
+                "not_refined",
+                "reader UPDATE FROM has multiple source rows after writer replay",
+            )
 
         query = _stored_probe_difference_query(before_table, base_probe)
-        return (
-            "changed"
-            if cursor.execute(query).fetchone() is not None
-            else "unchanged"
+        status: WriteReadProbeStatus = (
+            "changed" if cursor.execute(query).fetchone() is not None else "unchanged"
         )
+        return WriteReadProbeResult(status)
     except sqlite3.Error:
-        return "unsupported"
+        return WriteReadProbeResult(
+            "not_refined",
+            "write-read probe failed during SQLite execution",
+        )
     finally:
         if savepoint_started:
             rollback_savepoint(cursor, savepoint)
@@ -234,7 +266,7 @@ def _check_write_read(
         "ours": ours_statement,
         "theirs": theirs_statement,
     }
-    checks: list[tuple[str, WriteReadProbeOutcome]] = []
+    checks: list[tuple[str, WriteReadProbeResult]] = []
     for writer_label, reader_label in directions:
         checks.append((
             f"{writer_label} writes; {reader_label} reads",
@@ -245,13 +277,13 @@ def _check_write_read(
             ),
         ))
 
-    if not checks or any(outcome == "unsupported" for _, outcome in checks):
+    if not checks or any(check.status == "not_refined" for _, check in checks):
         return result
 
     changed_labels = [
         label
-        for label, outcome in checks
-        if outcome == "changed"
+        for label, check in checks
+        if check.status == "changed"
     ]
     if not changed_labels:
         return result.without_kind("write_read")
@@ -357,14 +389,17 @@ def _read_probe_result(
         return _probe_result(_affected_primary_key_select(context, metadata))
     if isinstance(expression, exp.Insert):
         return _insert_probe_select(context, expression)
-    return ReadProbeResult("unsupported")
+    return ReadProbeResult("not_refined", reason="reader statement has no supported probe")
 
 
 def _probe_result(sql: str | None) -> ReadProbeResult:
-    """Return an ok/unsupported probe result for UPDATE and DELETE probes."""
+    """Return an ok/not-refined probe result for UPDATE and DELETE probes."""
 
     if sql is None:
-        return ReadProbeResult("unsupported")
+        return ReadProbeResult(
+            "not_refined",
+            reason="reader probe could not be built",
+        )
     return ReadProbeResult("ok", sql)
 
 
@@ -475,7 +510,7 @@ def _insert_select_probe_select(
         return None
 
     output_count = _select_output_count(context.base_cursor, source_sql)
-    if output_count is None or output_count == 0:
+    if output_count is None:
         return None
 
     group_columns = ", ".join(str(index) for index in range(1, output_count + 1))
@@ -509,7 +544,7 @@ def _select_output_count(cursor: sqlite3.Cursor, select_sql: str) -> int | None:
         probe_cursor = cursor.execute(f"SELECT * FROM ({select_sql}) LIMIT 0")
     except sqlite3.Error:
         return None
-    return len(probe_cursor.description or ())
+    return len(probe_cursor.description)
 
 
 def _value_row_expressions(row: exp.Expression) -> list[exp.Expression]:

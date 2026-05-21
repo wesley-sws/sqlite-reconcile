@@ -130,6 +130,33 @@ def test_conflict_detection_blocks_update_from_duplicate_target_rows():
     assert result.conflicts[0].scope == "ours"
 
 
+def test_conflict_detection_reports_integrity_before_static_conflicts():
+    table_columns = {
+        "products": {"id", "name"},
+    }
+    context = make_context(
+        table_columns,
+        schema=[
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        ],
+    )
+    ours = make_statement(
+        "INSERT INTO products(id, name) VALUES (1, 'A')",
+        table_columns,
+        branch="ours",
+    )
+    theirs = make_statement(
+        "INSERT INTO products(id, name) VALUES (1, 'B')",
+        table_columns,
+        branch="theirs",
+    )
+
+    result = conflict_detection.conflict_detection(context, ours, theirs)
+
+    assert conflict_kinds(result) == ["integrity"]
+    assert "UNIQUE constraint failed" in result.conflicts[0].message
+
+
 def test_static_analysis_allows_update_different_columns():
     table_columns = {
         "products": {"id", "discount", "name"},

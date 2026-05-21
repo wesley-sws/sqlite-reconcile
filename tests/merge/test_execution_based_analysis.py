@@ -813,3 +813,47 @@ def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
 
     assert conflict_kinds(result) == ["write_write", "unsafe_replay"]
     assert result.of_kind("unsafe_replay")[0].scope == "ours"
+
+
+def test_write_read_probe_reports_not_refined_reason_for_update_from_duplicates(tmp_path):
+    table_columns = {
+        "products": {"id", "category_id", "discount"},
+        "categories": {"id", "rate"},
+        "stats": {"id", "value"},
+    }
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)",
+            "CREATE TABLE categories (id INTEGER, rate INTEGER)",
+            "CREATE TABLE stats (id INTEGER PRIMARY KEY, value INTEGER)",
+            "INSERT INTO products VALUES (1, 1, 0)",
+            "INSERT INTO categories VALUES (1, 5)",
+            "INSERT INTO stats VALUES (1, 0)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        writer = make_statement(
+            "INSERT INTO categories(id, rate) VALUES (1, 7)",
+            table_columns,
+            branch="ours",
+        )
+        reader = make_statement(
+            "UPDATE products "
+            "SET discount = categories.rate "
+            "FROM categories "
+            "WHERE products.category_id = categories.id "
+            "AND products.id = 1",
+            table_columns,
+            branch="theirs",
+        )
+
+        outcome = execution_based_analysis.write_read_dependency_outcome(
+            context,
+            writer,
+            reader.metadata,
+        )
+
+    assert outcome.status == "not_refined"
+    assert "multiple source rows" in outcome.reason
