@@ -736,9 +736,45 @@ def test_execution_reports_integrity_conflict_for_duplicate_insert_key(tmp_path)
 
     assert conflict_kinds(result) == ["integrity"]
     assert "UNIQUE constraint failed" in result.conflicts[0].message
+    assert result.conflicts[0].scope == "pair"
 
 
-def test_execution_reports_integrity_conflict_when_only_one_order_fails(tmp_path):
+def test_execution_reports_both_statements_blocked_by_prefix(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO products VALUES (1, 'base one')",
+            "INSERT INTO products VALUES (2, 'base two')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT INTO products(id, name) VALUES (1, 'ours')",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT INTO products(id, name) VALUES (2, 'theirs')",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == ["integrity", "integrity"]
+    assert {conflict.scope for conflict in result.conflicts} == {"ours", "theirs"}
+    assert all("current prefix" in conflict.message for conflict in result.conflicts)
+
+
+def test_execution_scopes_first_statement_integrity_failure_to_branch(tmp_path):
     table_columns = {"products": {"id", "name"}}
     base_path = init_base_db(
         tmp_path,
@@ -768,8 +804,42 @@ def test_execution_reports_integrity_conflict_when_only_one_order_fails(tmp_path
         )
 
     assert conflict_kinds(result) == ["integrity"]
-    assert "theirs then ours" in result.conflicts[0].message
+    assert result.conflicts[0].scope == "theirs"
+    assert "current prefix" in result.conflicts[0].message
     assert "UNIQUE constraint failed" in result.conflicts[0].message
+
+
+def test_execution_reports_non_integrity_sqlite_error_as_replay_error(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT INTO missing_table(id, name) VALUES (1, 'bad')",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT INTO products(id, name) VALUES (1, 'ok')",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_based_analysis.execution_based_matching(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == ["replay_error"]
+    assert result.conflicts[0].scope == "ours"
+    assert "no such table" in result.conflicts[0].message
 
 
 def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
@@ -805,7 +875,7 @@ def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
             table_columns,
             branch="theirs",
         )
-        result = conflict_detection.conflict_detection(
+        result = conflict_detection.statements_conflict(
             context,
             ours,
             theirs,

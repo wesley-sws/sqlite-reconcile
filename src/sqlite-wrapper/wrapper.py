@@ -26,7 +26,6 @@ Limitations:
 import re
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import datetime
 import sqlglot
 from sqlglot import exp
 
@@ -425,7 +424,7 @@ INCLUDED = (
 INIT_SQL = [
     f"""CREATE TABLE IF NOT EXISTS {TX_TABLE} (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        committed_at TEXT NOT NULL
+        committed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );""",
     f"""CREATE TABLE IF NOT EXISTS {LOG_TABLE} (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -666,10 +665,9 @@ class SQLiteWrapper:
         """
         self._conn.set_trace_callback(None)
         try:
-            # Insert transaction record and get its id
+            # Insert transaction record and let SQLite fill committed_at.
             cursor = self._conn.execute(
-                f"INSERT INTO {TX_TABLE} (committed_at) VALUES (?)",
-                (datetime.now().isoformat(),)
+                f"INSERT INTO {TX_TABLE} DEFAULT VALUES"
             )
             tx_id = cursor.lastrowid
 

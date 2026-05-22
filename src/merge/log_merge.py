@@ -4,13 +4,14 @@ import argparse
 import json
 import shutil
 import sqlite3
+from collections import defaultdict
 from contextlib import closing
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
+import uuid
 
 from sqlglot.errors import ParseError
 
@@ -99,7 +100,7 @@ class StatementConflict:
 
 @dataclass(init=False)
 class ConflictCheckResult:
-    conflicts_by_kind: dict[ConflictKind, list[StatementConflict]]
+    conflicts_by_kind: defaultdict[ConflictKind, list[StatementConflict]]
 
     def __init__(
         self,
@@ -110,10 +111,10 @@ class ConflictCheckResult:
             Sequence[StatementConflict],
         ] | None = None,
     ):
-        grouped: dict[ConflictKind, list[StatementConflict]] = {}
+        grouped: defaultdict[ConflictKind, list[StatementConflict]] = defaultdict(list)
         if conflicts_by_kind is None:
             for conflict in conflicts:
-                grouped.setdefault(conflict.kind, []).append(conflict)
+                grouped[conflict.kind].append(conflict)
         else:
             for kind, kind_conflicts in conflicts_by_kind.items():
                 if kind_conflicts:
@@ -170,7 +171,7 @@ class ConflictCheckResult:
         """Append conflicts to their kind groups and return this result."""
 
         for conflict in conflicts:
-            self.conflicts_by_kind.setdefault(conflict.kind, []).append(conflict)
+            self.conflicts_by_kind[conflict.kind].append(conflict)
         return self
 
 
@@ -178,6 +179,18 @@ ConflictDetector = Callable[
     [ConflictCheckContext, "LoggedStatement", "LoggedStatement"],
     ConflictCheckResult,
 ]
+StatementApplier = Callable[
+    [ConflictCheckContext, Sequence["LoggedStatement"]],
+    StatementConflict | None,
+]
+
+
+def default_conflict_detector() -> ConflictDetector:
+    """Load the default detector lazily to avoid circular imports."""
+
+    from .conflict_detection import statements_conflict
+
+    return statements_conflict
 
 
 @dataclass(frozen=True)
@@ -238,18 +251,6 @@ class MergeNotApplicableError(Exception):
             f"{role} database is not applicable for log-based SQLite merge: "
             f"{self.db_path} is missing {missing}"
         )
-
-
-def statements_conflict(
-    context: ConflictCheckContext,
-    ours_statement: LoggedStatement,
-    theirs_statement: LoggedStatement,
-) -> ConflictCheckResult:
-    """Default per-statement conflict detector."""
-
-    from .conflict_detection import conflict_detection
-
-    return conflict_detection(context, ours_statement, theirs_statement)
 
 
 def make_logged_statement(
@@ -361,6 +362,8 @@ def _conflict_pair(
     theirs_index: int,
     result: ConflictCheckResult | None = None,
 ) -> ConflictPair:
+    """Build report-friendly conflict data using original SQL for display."""
+
     return ConflictPair(
         ours_index=ours_index,
         theirs_index=theirs_index,
@@ -374,14 +377,85 @@ def find_first_pairwise_conflict(
     ours: Sequence[LoggedStatement],
     theirs: Sequence[LoggedStatement],
     context: ConflictCheckContext,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
+    statement_applier: StatementApplier | None = None,
 ) -> ConflictPair | None:
-    """Compare X1/Y1, X2/Y2, ... and return the first conflict."""
+    """Compare X1/Y1, X2/Y2, ..., applying clean pairs as it advances."""
+
+    conflict_detector = conflict_detector or default_conflict_detector()
+    statement_applier = statement_applier or apply_statement_sequence
     for index, (ours_statement, theirs_statement) in enumerate(zip(ours, theirs)):
         result = conflict_detector(context, ours_statement, theirs_statement)
         if result.has_conflict:
             return _conflict_pair(ours, theirs, index, index, result)
+
+        # Execution-based checks for later pairs must see earlier accepted
+        # effects, so planning advances the working database after each clean pair.
+        replay_error = statement_applier(context, (ours_statement, theirs_statement))
+        if replay_error is not None:
+            return _conflict_pair(
+                ours,
+                theirs,
+                index,
+                index,
+                ConflictCheckResult((replay_error,)),
+            )
     return None
+
+
+def apply_statement_sequence(
+    context: ConflictCheckContext,
+    statements: Sequence[LoggedStatement],
+) -> StatementConflict | None:
+    """
+    The conflict detector checks the current pair, but prefix replay can still 
+    fail because the greedy algorithm does not validate every cross-branch pair 
+    inside the prefix.
+    """
+
+    savepoint = f"sqlite_merge_plan_{uuid.uuid4().hex}"
+    cursor = context.base_cursor
+    cursor.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in statements:
+            cursor.execute(statement.sql_text)
+        cursor.execute(f"RELEASE {savepoint}")
+    except sqlite3.Error as exc:
+        rollback_savepoint(cursor, savepoint)
+        return StatementConflict(kind="replay_error", message=str(exc))
+    return None
+
+
+def _conflict_after_prefix(
+    ours: Sequence[LoggedStatement],
+    theirs: Sequence[LoggedStatement],
+    ours_index: int,
+    theirs_index: int,
+    context: ConflictCheckContext,
+    conflict_detector: ConflictDetector,
+    statement_applier: StatementApplier,
+) -> ConflictCheckResult:
+    """Check one pair after applying the prefix that would precede it."""
+
+    prefix = ordered_statement_plan(
+        ours,
+        theirs,
+        FrontierCandidate(
+            name="prefix",
+            ours_count=ours_index,
+            theirs_count=theirs_index,
+            next_conflict=None,
+        ),
+    )
+    savepoint = f"sqlite_merge_backtrack_{uuid.uuid4().hex}"
+    context.base_cursor.execute(f"SAVEPOINT {savepoint}")
+    try:
+        replay_error = statement_applier(context, prefix)
+        if replay_error is not None:
+            return ConflictCheckResult((replay_error,))
+        return conflict_detector(context, ours[ours_index], theirs[theirs_index])
+    finally:
+        rollback_savepoint(context.base_cursor, savepoint)
 
 
 def search_by_backtracking_ours(
@@ -389,7 +463,8 @@ def search_by_backtracking_ours(
     theirs: Sequence[LoggedStatement],
     conflict_index: int,
     context: ConflictCheckContext,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
+    statement_applier: StatementApplier | None = None,
 ) -> FrontierCandidate:
     """
     Keep backing up the local side and advance the remote side.
@@ -399,8 +474,18 @@ def search_by_backtracking_ours(
     and tries the same Y again. The search stops once X1 conflicts or the
     remote side is exhausted.
     """
+    conflict_detector = conflict_detector or default_conflict_detector()
+    statement_applier = statement_applier or apply_statement_sequence
     if conflict_index == 0:
-        result = conflict_detector(context, ours[0], theirs[conflict_index])
+        result = _conflict_after_prefix(
+            ours,
+            theirs,
+            0,
+            conflict_index,
+            context,
+            conflict_detector,
+            statement_applier,
+        )
         return FrontierCandidate(
             name="backtrack_ours",
             ours_count=0,
@@ -409,14 +494,32 @@ def search_by_backtracking_ours(
         )
     ours_index = conflict_index - 1
     theirs_index = conflict_index
+    candidates: list[FrontierCandidate] = []
 
     while theirs_index < len(theirs):
-        result = conflict_detector(context, ours[ours_index], theirs[theirs_index])
+        result = _conflict_after_prefix(
+            ours,
+            theirs,
+            ours_index,
+            theirs_index,
+            context,
+            conflict_detector,
+            statement_applier,
+        )
         if result.has_conflict:
-            if ours_index == 0:
-                return FrontierCandidate(
+            if (
+                _standalone_replay_branches(result) == {"theirs"}
+                and ours_index > 0
+            ):
+                # The fixed remote statement is already blocked by the retained
+                # prefix, so keep moving backwards to find the earlier cause.
+                ours_index -= 1
+                continue
+
+            candidates.append(
+                FrontierCandidate(
                     name="backtrack_ours",
-                    ours_count=0,
+                    ours_count=ours_index,
                     theirs_count=theirs_index,
                     next_conflict=_conflict_pair(
                         ours,
@@ -426,16 +529,22 @@ def search_by_backtracking_ours(
                         result,
                     ),
                 )
+            )
+            if ours_index == 0:
+                return choose_frontier(candidates)
             ours_index -= 1
             continue
         theirs_index += 1
 
-    return FrontierCandidate(
-        name="backtrack_ours",
-        ours_count=ours_index + 1,
-        theirs_count=len(theirs),
-        next_conflict=None,
+    candidates.append(
+        FrontierCandidate(
+            name="backtrack_ours",
+            ours_count=ours_index + 1,
+            theirs_count=len(theirs),
+            next_conflict=None,
+        )
     )
+    return choose_frontier(candidates)
 
 
 def search_by_backtracking_theirs(
@@ -443,14 +552,26 @@ def search_by_backtracking_theirs(
     theirs: Sequence[LoggedStatement],
     conflict_index: int,
     context: ConflictCheckContext,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
+    statement_applier: StatementApplier | None = None,
 ) -> FrontierCandidate:
     """Mirror of search_by_backtracking_ours, keeping more local statements."""
+
+    conflict_detector = conflict_detector or default_conflict_detector()
+    statement_applier = statement_applier or apply_statement_sequence
     theirs_index = conflict_index - 1
     ours_index = conflict_index
 
     if theirs_index < 0:
-        result = conflict_detector(context, ours[conflict_index], theirs[0])
+        result = _conflict_after_prefix(
+            ours,
+            theirs,
+            conflict_index,
+            0,
+            context,
+            conflict_detector,
+            statement_applier,
+        )
         return FrontierCandidate(
             name="backtrack_theirs",
             ours_count=conflict_index,
@@ -458,14 +579,32 @@ def search_by_backtracking_theirs(
             next_conflict=_conflict_pair(ours, theirs, conflict_index, 0, result),
         )
 
+    candidates: list[FrontierCandidate] = []
     while ours_index < len(ours):
-        result = conflict_detector(context, ours[ours_index], theirs[theirs_index])
+        result = _conflict_after_prefix(
+            ours,
+            theirs,
+            ours_index,
+            theirs_index,
+            context,
+            conflict_detector,
+            statement_applier,
+        )
         if result.has_conflict:
-            if theirs_index == 0:
-                return FrontierCandidate(
+            if (
+                _standalone_replay_branches(result) == {"ours"}
+                and theirs_index > 0
+            ):
+                # The fixed local statement is already blocked by the retained
+                # prefix, so keep moving backwards to find the earlier cause.
+                theirs_index -= 1
+                continue
+
+            candidates.append(
+                FrontierCandidate(
                     name="backtrack_theirs",
                     ours_count=ours_index,
-                    theirs_count=0,
+                    theirs_count=theirs_index,
                     next_conflict=_conflict_pair(
                         ours,
                         theirs,
@@ -474,20 +613,27 @@ def search_by_backtracking_theirs(
                         result,
                     ),
                 )
+            )
+            if theirs_index == 0:
+                return choose_frontier(candidates)
             theirs_index -= 1
             continue
         ours_index += 1
 
-    return FrontierCandidate(
-        name="backtrack_theirs",
-        ours_count=len(ours),
-        theirs_count=theirs_index + 1,
-        next_conflict=None,
+    candidates.append(
+        FrontierCandidate(
+            name="backtrack_theirs",
+            ours_count=len(ours),
+            theirs_count=theirs_index + 1,
+            next_conflict=None,
+        )
     )
+    return choose_frontier(candidates)
 
 
 def choose_frontier(candidates: Sequence[FrontierCandidate]) -> FrontierCandidate:
     """Pick the candidate with the most applied statements, then the least skew."""
+
     return max(
         candidates,
         key=lambda candidate: (
@@ -503,13 +649,63 @@ def frontier_candidates_for_conflict(
     theirs: Sequence[LoggedStatement],
     first_conflict: ConflictPair,
     context: ConflictCheckContext,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
+    statement_applier: StatementApplier | None = None,
 ) -> list[FrontierCandidate]:
     """Return backtracking candidates, narrowing unsafe replay to its branch."""
 
+    conflict_detector = conflict_detector or default_conflict_detector()
+    statement_applier = statement_applier or apply_statement_sequence
+
+    standalone_replay_branches = _standalone_replay_branches(first_conflict)
+    if standalone_replay_branches == {"ours", "theirs"}:
+        return [
+            FrontierCandidate(
+                name="replay_prefix",
+                ours_count=first_conflict.ours_index,
+                theirs_count=first_conflict.theirs_index,
+                next_conflict=first_conflict,
+            )
+        ]
+    if standalone_replay_branches:
+        candidates: list[FrontierCandidate] = []
+        if "theirs" in standalone_replay_branches:
+            candidates.append(
+                search_by_backtracking_ours(
+                    ours,
+                    theirs,
+                    first_conflict.ours_index,
+                    context,
+                    conflict_detector,
+                    statement_applier,
+                )
+            )
+        if "ours" in standalone_replay_branches:
+            candidates.append(
+                search_by_backtracking_theirs(
+                    ours,
+                    theirs,
+                    first_conflict.ours_index,
+                    context,
+                    conflict_detector,
+                    statement_applier,
+                )
+            )
+        return candidates
+
     unsafe_branches = _unsafe_replay_branches(first_conflict)
+    if unsafe_branches == {"ours", "theirs"}:
+        return [
+            FrontierCandidate(
+                name="unsafe_prefix",
+                ours_count=first_conflict.ours_index,
+                theirs_count=first_conflict.theirs_index,
+                next_conflict=first_conflict,
+            )
+        ]
+
     candidates: list[FrontierCandidate] = []
-    if not unsafe_branches or "ours" in unsafe_branches:
+    if "theirs" not in unsafe_branches:
         candidates.append(
             search_by_backtracking_ours(
                 ours,
@@ -517,9 +713,10 @@ def frontier_candidates_for_conflict(
                 first_conflict.ours_index,
                 context,
                 conflict_detector,
+                statement_applier,
             )
         )
-    if not unsafe_branches or "theirs" in unsafe_branches:
+    if "ours" not in unsafe_branches:
         candidates.append(
             search_by_backtracking_theirs(
                 ours,
@@ -527,6 +724,7 @@ def frontier_candidates_for_conflict(
                 first_conflict.ours_index,
                 context,
                 conflict_detector,
+                statement_applier,
             )
         )
     return candidates
@@ -535,14 +733,34 @@ def frontier_candidates_for_conflict(
 def _unsafe_replay_branches(conflict: ConflictPair) -> set[BranchName]:
     """Return branches that are blocked by standalone unsafe replay conflicts."""
 
-    branches: set[BranchName] = set()
-    for statement_conflict in conflict.conflicts:
-        if statement_conflict.kind != "unsafe_replay":
-            continue
+    branches: tuple[BranchName, BranchName] = ("ours", "theirs")
+    return {
+        branch
+        for branch in branches
+        if any(
+            statement_conflict.kind == "unsafe_replay"
+            and statement_conflict.scope == branch
+            for statement_conflict in conflict.conflicts
+        )
+    }
 
-        if statement_conflict.scope in {"ours", "theirs"}:
-            branches.add(statement_conflict.scope)
-    return branches
+
+def _standalone_replay_branches(
+    conflict: ConflictPair | ConflictCheckResult,
+) -> set[BranchName]:
+    """Return branches blocked by already-replayed state, not by the pair."""
+
+    branches: tuple[BranchName, BranchName] = ("ours", "theirs")
+    conflicts = conflict.conflicts
+    return {
+        branch
+        for branch in branches
+        if any(
+            statement_conflict.kind in {"integrity", "replay_error"}
+            and statement_conflict.scope == branch
+            for statement_conflict in conflicts
+        )
+    }
 
 
 def ordered_statement_plan(
@@ -550,17 +768,24 @@ def ordered_statement_plan(
     theirs: Sequence[LoggedStatement],
     frontier: FrontierCandidate,
 ) -> list[LoggedStatement]:
-    ours_prefix = list(ours[: frontier.ours_count])
-    theirs_prefix = list(theirs[: frontier.theirs_count])
-    return ours_prefix + theirs_prefix
+    """Return the replay order used by pairwise planning: X1, Y1, X2, Y2."""
+
+    plan: list[LoggedStatement] = []
+    for index in range(max(frontier.ours_count, frontier.theirs_count)):
+        if index < frontier.ours_count:
+            plan.append(ours[index])
+        if index < frontier.theirs_count:
+            plan.append(theirs[index])
+    return plan
 
 
 def build_merge_plan(
     base_db_path: str | Path,
     ours_db_path: str | Path,
     theirs_db_path: str | Path,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
 ) -> MergePlan:
+    conflict_detector = conflict_detector or default_conflict_detector()
     with closing(sqlite3.connect(base_db_path)) as base_conn, \
          closing(sqlite3.connect(ours_db_path)) as ours_conn, \
          closing(sqlite3.connect(theirs_db_path)) as theirs_conn:
@@ -597,19 +822,26 @@ def build_merge_plan(
             table_columns=table_columns,
         )
 
-        context = ConflictCheckContext(
-            base_cursor=base_cursor,
-            base_db_path=base_db_path,
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
-        )
-        first_conflict = find_first_pairwise_conflict(
-            ours,
-            theirs,
-            context,
-            conflict_detector,
-        )
+        # Plan on an in-memory copy so accepted pairs can affect later checks
+        # without mutating the real Git merge-base file.
+        with closing(sqlite3.connect(":memory:")) as planning_conn:
+            base_conn.backup(planning_conn)
+            planning_conn.row_factory = sqlite3.Row
+            planning_conn.execute("PRAGMA foreign_keys = ON")
+            context = ConflictCheckContext(
+                base_cursor=planning_conn.cursor(),
+                base_db_path=":memory:",
+                table_columns=table_columns,
+                primary_key_columns=primary_key_columns,
+                key_column_sets=key_column_sets,
+            )
+            first_conflict = find_first_pairwise_conflict(
+                ours,
+                theirs,
+                context,
+                conflict_detector,
+            )
+
         if first_conflict is None:
             selected = FrontierCandidate(
                 name="clean",
@@ -626,13 +858,26 @@ def build_merge_plan(
                 statement_plan=ordered_statement_plan(ours, theirs, selected),
             )
 
-        candidates = frontier_candidates_for_conflict(
-            ours,
-            theirs,
-            first_conflict,
-            context,
-            conflict_detector,
-        )
+        # Backtracking checks each candidate frontier against the prefix state
+        # it would actually replay, then rolls that candidate state back.
+        with closing(sqlite3.connect(":memory:")) as backtrack_conn:
+            base_conn.backup(backtrack_conn)
+            backtrack_conn.row_factory = sqlite3.Row
+            backtrack_conn.execute("PRAGMA foreign_keys = ON")
+            context = ConflictCheckContext(
+                base_cursor=backtrack_conn.cursor(),
+                base_db_path=":memory:",
+                table_columns=table_columns,
+                primary_key_columns=primary_key_columns,
+                key_column_sets=key_column_sets,
+            )
+            candidates = frontier_candidates_for_conflict(
+                ours,
+                theirs,
+                first_conflict,
+                context,
+                conflict_detector,
+            )
         selected = choose_frontier(candidates)
         return MergePlan(
             status="conflict",
@@ -647,10 +892,10 @@ def build_merge_plan(
 
 
 def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) -> None:
-    committed_at = statement.committed_at or datetime.now().isoformat()
+    """Record a replayed statement in the output database's merge log."""
+
     cursor = con.execute(
-        f"INSERT INTO {TX_TABLE} (committed_at) VALUES (?)",
-        (committed_at,),
+        f"INSERT INTO {TX_TABLE} DEFAULT VALUES",
     )
     con.execute(
         f"""
@@ -674,6 +919,8 @@ def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) ->
 
 
 def validate_database(con: sqlite3.Connection) -> list[str]:
+    """Return post-statement integrity errors, including deferred FK failures."""
+
     errors: list[str] = []
     integrity_row = con.execute("PRAGMA integrity_check").fetchone()
     if integrity_row is not None and integrity_row[0] != "ok":
@@ -698,6 +945,8 @@ def replay_statement_plan(
 
         for applied_count, statement in enumerate(statement_plan):
             if not statement.is_replay_safe:
+                # Planning should already exclude unsafe statements, but replay
+                # is the final guard before mutating the output database.
                 return ReplayResult(
                     ok=False,
                     output_path=str(output_path),
@@ -715,6 +964,8 @@ def replay_statement_plan(
             con.execute(f"SAVEPOINT {savepoint_name}")
             try:
                 con.execute(statement.sql_text)
+                # Some problems, especially deferred foreign keys, are only
+                # visible after SQLite accepts the statement itself.
                 integrity_errors = validate_database(con)
                 if integrity_errors:
                     rollback_savepoint(con, savepoint_name)
@@ -805,7 +1056,7 @@ def merge_databases(
     ours_db_path: str | Path,
     theirs_db_path: str | Path,
     report_path: str | Path | None = None,
-    conflict_detector: ConflictDetector = statements_conflict,
+    conflict_detector: ConflictDetector | None = None,
 ) -> MergeOutcome:
     plan = build_merge_plan(base_db_path, ours_db_path, theirs_db_path, conflict_detector)
     replay = replay_statement_plan(base_db_path, ours_db_path, plan.statement_plan)

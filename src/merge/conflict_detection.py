@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .execution_based_analysis import (
     execution_based_matching,
-    integrity_conflict,
+    sqlite_replay_conflicts,
     update_from_has_duplicate_target_rows,
 )
 from .log_merge import (
@@ -14,7 +14,7 @@ from .log_merge import (
 from .static_analysis import static_analysis_matching
 
 
-def conflict_detection(
+def statements_conflict(
     context: ConflictCheckContext,
     ours_statement: LoggedStatement,
     theirs_statement: LoggedStatement,
@@ -39,11 +39,10 @@ def conflict_detection(
         return replay_result
 
     static_result = static_analysis_matching(context, ours_statement, theirs_statement)
-    conflict = integrity_conflict(context, ours_statement, theirs_statement)
-    if conflict is not None:
-        return static_result.add_conflicts(conflict)
+    conflicts = sqlite_replay_conflicts(context, ours_statement, theirs_statement)
+    if conflicts:
+        return static_result.add_conflicts(*conflicts)
 
-    
     return execution_based_matching(
         context,
         ours_statement,

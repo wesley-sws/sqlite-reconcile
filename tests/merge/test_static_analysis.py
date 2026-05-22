@@ -86,7 +86,7 @@ def test_conflict_detection_blocks_unsafe_replay_statement():
         branch="theirs",
     )
 
-    result = conflict_detection.conflict_detection(context, ours, theirs)
+    result = conflict_detection.statements_conflict(context, ours, theirs)
 
     assert conflict_kinds(result) == ["unsafe_replay"]
 
@@ -107,7 +107,7 @@ def test_conflict_detection_blocks_unparseable_statement_before_pair_checks():
         branch="theirs",
     )
 
-    result = conflict_detection.conflict_detection(context, ours, theirs)
+    result = conflict_detection.statements_conflict(context, ours, theirs)
 
     assert conflict_kinds(result) == ["unsafe_replay"]
     assert log_merge.METADATA_PARSE_ERROR_REASON in result.conflicts[0].message
@@ -145,7 +145,7 @@ def test_conflict_detection_blocks_update_from_duplicate_target_rows():
         branch="theirs",
     )
 
-    result = conflict_detection.conflict_detection(context, ours, theirs)
+    result = conflict_detection.statements_conflict(context, ours, theirs)
 
     assert conflict_kinds(result) == ["unsafe_replay"]
     assert "multiple source rows" in result.conflicts[0].message
@@ -173,7 +173,7 @@ def test_conflict_detection_reports_integrity_before_static_conflicts():
         branch="theirs",
     )
 
-    result = conflict_detection.conflict_detection(context, ours, theirs)
+    result = conflict_detection.statements_conflict(context, ours, theirs)
 
     assert conflict_kinds(result) == ["integrity"]
     assert "UNIQUE constraint failed" in result.conflicts[0].message

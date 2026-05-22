@@ -153,41 +153,35 @@ def _implicit_insert_key_conflicts(
     """Return conflicts caused by INSERTs omitting explicit PK/UK values."""
 
     conflicts: list[StatementConflict] = []
-    if (
-        _is_insert_without_explicit_key(context, ours_metadata)
-        and _same_written_table(ours_metadata, theirs_metadata)
-        and is_insert_statement(theirs_metadata)
+    for insert_label, insert, other_label, other in (
+        ("ours", ours_metadata, "theirs", theirs_metadata),
+        ("theirs", theirs_metadata, "ours", ours_metadata),
     ):
-        conflicts.append(
-            _implicit_insert_key_conflict("ours", "theirs", ours_metadata.table_updated)
-        )
-    elif (
-        _is_insert_without_explicit_key(context, theirs_metadata)
-        and _same_written_table(ours_metadata, theirs_metadata)
-        and is_insert_statement(ours_metadata)
-    ):
-        conflicts.append(
-            _implicit_insert_key_conflict("theirs", "ours", theirs_metadata.table_updated)
-        )
+        if (
+            not _is_insert_without_explicit_key(context, insert)
+            or not _same_written_table(insert, other)
+        ):
+            continue
 
-    conflicts.extend(
-        _implicit_insert_key_dml_conflicts(
-            context,
-            insert_label="ours",
-            insert=ours_metadata,
-            other_label="theirs",
-            other=theirs_metadata,
+        if is_insert_statement(other):
+            conflicts.append(
+                _implicit_insert_key_conflict(
+                    insert_label,
+                    other_label,
+                    insert.table_updated,
+                )
+            )
+            break
+
+        conflicts.extend(
+            _implicit_insert_key_dml_conflicts(
+                context,
+                insert_label=insert_label,
+                insert=insert,
+                other_label=other_label,
+                other=other,
+            )
         )
-    )
-    conflicts.extend(
-        _implicit_insert_key_dml_conflicts(
-            context,
-            insert_label="theirs",
-            insert=theirs_metadata,
-            other_label="ours",
-            other=ours_metadata,
-        )
-    )
     return conflicts
 
 

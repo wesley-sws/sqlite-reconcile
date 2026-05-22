@@ -14,6 +14,8 @@ from sqlglot import expressions as exp
 
 from .log_merge import (
     ConflictCheckContext,
+    ConflictScope,
+    ConflictKind,
     ConflictCheckResult,
     LoggedStatement,
     StatementConflict,
@@ -48,6 +50,16 @@ class ReadProbeResult:
     status: ReadProbeStatus
     sql: str | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SQLiteReplayFailure:
+    """SQLite failure observed while trying one replay order."""
+
+    kind: ConflictKind
+    scope: ConflictScope
+    message: str
+    order_label: str
 
 
 def commutativity_check(
@@ -99,9 +111,9 @@ def execution_based_matching(
     """Recheck static conflicts with targeted SQLite execution where possible."""
 
     if check_integrity:
-        conflict = integrity_conflict(context, ours_statement, theirs_statement)
-        if conflict is not None:
-            return ConflictCheckResult((conflict,))
+        conflicts = sqlite_replay_conflicts(context, ours_statement, theirs_statement)
+        if conflicts:
+            return ConflictCheckResult(conflicts)
 
     result = static_result
     result = _check_write_read(
@@ -119,18 +131,35 @@ def execution_based_matching(
     return result
 
 
-def integrity_conflict(
+def sqlite_replay_conflicts(
     context: ConflictCheckContext,
     ours_statement: LoggedStatement,
     theirs_statement: LoggedStatement,
-) -> StatementConflict | None:
-    """Return an integrity conflict if either pair replay order fails."""
+) -> tuple[StatementConflict, ...]:
+    """Return integrity or replay conflicts from trying both pair orders."""
 
-    integrity_error = _pair_integrity_error(context, ours_statement, theirs_statement)
-    if integrity_error is None:
-        return None
+    failures = _pair_replay_failures(context, ours_statement, theirs_statement)
+    if not failures:
+        return ()
 
-    return StatementConflict(kind="integrity", message=integrity_error)
+    branch_failures = [
+        failure
+        for failure in failures
+        if failure.scope in {"ours", "theirs"}
+    ]
+    if branch_failures:
+        return tuple(
+            _standalone_replay_conflict(failure)
+            for failure in branch_failures
+        )
+
+    failure = failures[0]
+    return (
+        StatementConflict(
+            kind=failure.kind,
+            message=f"{failure.order_label}: {failure.message}",
+        ),
+    )
 
 
 def _check_write_write(
@@ -697,42 +726,82 @@ def _create_probe_result_table(
     )
 
 
-def _pair_integrity_error(
+def _pair_replay_failures(
     context: ConflictCheckContext,
     first: LoggedStatement,
     second: LoggedStatement,
-) -> str | None:
-    """Return the first integrity error found when replaying both pair orders."""
+) -> tuple[SQLiteReplayFailure, ...]:
+    """Return SQLite failures found from trying both pair orders."""
 
     cursor = context.base_cursor
     cursor.execute("PRAGMA foreign_keys = ON")
+    failures: list[SQLiteReplayFailure] = []
     for label, statements in (
         ("ours then theirs", (first, second)),
         ("theirs then ours", (second, first)),
     ):
-        error = _savepoint_integrity_error(cursor, statements)
-        if error is not None:
-            return f"{label}: {error}"
+        failure = _savepoint_replay_failure(cursor, statements, label)
+        if failure is not None:
+            failures.append(failure)
 
-    return None
+    return tuple(failures)
 
 
-def _savepoint_integrity_error(
+def _standalone_replay_conflict(
+    failure: SQLiteReplayFailure,
+) -> StatementConflict:
+    """Return a scoped conflict for a statement blocked by the prefix."""
+
+    return StatementConflict(
+        kind=failure.kind,
+        scope=failure.scope,
+        message=(
+            f"{failure.scope} statement cannot be applied under the "
+            f"current prefix: {failure.message}"
+        ),
+    )
+
+
+def _savepoint_replay_failure(
     cursor: sqlite3.Cursor,
     statements: Sequence[LoggedStatement],
-) -> str | None:
-    """Try statements inside a savepoint, then discard all effects."""
+    order_label: str,
+) -> SQLiteReplayFailure | None:
+    """Try one pair order inside a savepoint, then discard all effects."""
 
-    savepoint = quote_identifier(f"sqlite_merge_integrity_{uuid.uuid4().hex}")
+    savepoint = quote_identifier(f"sqlite_merge_replay_{uuid.uuid4().hex}")
     cursor.execute(f"SAVEPOINT {savepoint}")
     try:
-        for statement in statements:
-            cursor.execute(statement.sql_text)
-        return _foreign_key_check_error(cursor)
-    except sqlite3.IntegrityError as exc:
-        return str(exc)
+        for index, statement in enumerate(statements):
+            try:
+                cursor.execute(statement.sql_text)
+            except sqlite3.Error as exc:
+                return SQLiteReplayFailure(
+                    kind=_sqlite_error_conflict_kind(exc),
+                    scope=statement.branch if index == 0 else "pair",
+                    message=str(exc),
+                    order_label=order_label,
+                )
+
+            deferred_error = _foreign_key_check_error(cursor)
+            if deferred_error is not None:
+                return SQLiteReplayFailure(
+                    kind="integrity",
+                    scope=statement.branch if index == 0 else "pair",
+                    message=deferred_error,
+                    order_label=order_label,
+                )
+        return None
     finally:
         rollback_savepoint(cursor, savepoint)
+
+
+def _sqlite_error_conflict_kind(error: sqlite3.Error) -> ConflictKind:
+    """Map SQLite exceptions to merge conflict kinds."""
+
+    if isinstance(error, sqlite3.IntegrityError):
+        return "integrity"
+    return "replay_error"
 
 
 def _foreign_key_check_error(cursor: sqlite3.Cursor) -> str | None:
