@@ -441,7 +441,7 @@ def test_backtracking_ours_keeps_backtracking_after_later_conflict(conflict_cont
     candidate = log_merge.search_by_backtracking_ours(
         ours,
         theirs,
-        first.ours_index,
+        first,
         conflict_context,
         detector,
         noop_applier,
@@ -516,7 +516,18 @@ def test_backtracking_checks_candidates_in_rolled_back_prefix_state(tmp_path):
         candidate = log_merge.search_by_backtracking_ours(
             ours,
             theirs,
-            conflict_index=2,
+            initial_conflict=log_merge.ConflictPair(
+                ours_index=2,
+                theirs_index=2,
+                ours_sql=ours[2].sql_text,
+                theirs_sql=theirs[2].sql_text,
+                conflicts=(
+                    log_merge.StatementConflict(
+                        kind="write_write",
+                        message="test conflict",
+                    ),
+                ),
+            ),
             context=context,
             conflict_detector=detector,
         )
@@ -613,13 +624,17 @@ def test_standalone_integrity_backtracks_to_earlier_retained_cause(tmp_path):
     assert first.conflicts[0].kind == "integrity"
     assert first.conflicts[0].scope == "theirs"
 
-    assert [candidate.name for candidate in candidates] == ["backtrack_ours"]
+    assert [candidate.name for candidate in candidates] == [
+        "backtrack_ours",
+        "standalone_replay",
+    ]
     assert candidates[0].ours_count == 0
     assert candidates[0].theirs_count == 1
     assert candidates[0].next_conflict is not None
     assert candidates[0].next_conflict.ours_index == 0
     assert candidates[0].next_conflict.theirs_index == 1
     assert candidates[0].next_conflict.conflicts[0].scope == "pair"
+    assert candidates[1].scope == "theirs"
 
 
 def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
@@ -644,7 +659,7 @@ def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
         log_merge.search_by_backtracking_ours(
             ours,
             theirs,
-            first.ours_index,
+            first,
             conflict_context,
             detector,
             noop_applier,
@@ -652,7 +667,7 @@ def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
         log_merge.search_by_backtracking_theirs(
             ours,
             theirs,
-            first.ours_index,
+            first,
             conflict_context,
             detector,
             noop_applier,
@@ -666,7 +681,95 @@ def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
     assert selected.score == 5
 
 
-def test_unsafe_replay_only_backtracks_unsafe_branch(conflict_context):
+def test_backtracking_keeps_larger_pairwise_candidate_when_smaller_prefix_is_standalone(
+    conflict_context,
+):
+    ours = [make_statement("ours", index) for index in range(3)]
+    theirs = [make_statement("theirs", index) for index in range(3)]
+
+    def detector(context, ours_statement, theirs_statement):
+        pair = (ours_statement.sql_text, theirs_statement.sql_text)
+        if pair == ("OURS2", "THEIRS3"):
+            return log_merge.ConflictCheckResult((
+                log_merge.StatementConflict(
+                    kind="integrity",
+                    message="theirs blocked by retained prefix",
+                    scope="theirs",
+                ),
+            ))
+        if pair == ("OURS1", "THEIRS3"):
+            return log_merge.ConflictCheckResult((
+                log_merge.StatementConflict(
+                    kind="write_write",
+                    message="earlier retained cause",
+                ),
+            ))
+        return log_merge.ConflictCheckResult()
+
+    candidate = log_merge.search_by_backtracking_ours(
+        ours,
+        theirs,
+        initial_conflict=log_merge.ConflictPair(
+            ours_index=2,
+            theirs_index=2,
+            ours_sql=ours[2].sql_text,
+            theirs_sql=theirs[2].sql_text,
+            conflicts=(
+                log_merge.StatementConflict(
+                    kind="write_write",
+                    message="test conflict",
+                ),
+            ),
+        ),
+        context=conflict_context,
+        conflict_detector=detector,
+        statement_applier=noop_applier,
+    )
+
+    assert candidate.name == "pairwise"
+    assert candidate.ours_count == 2
+    assert candidate.theirs_count == 2
+    assert candidate.next_conflict is not None
+    assert candidate.next_conflict.ours_index == 2
+    assert candidate.next_conflict.theirs_index == 2
+    assert candidate.next_conflict.conflicts[0].kind == "write_write"
+
+
+def test_backtracking_reports_standalone_when_no_earlier_prefix_exists(
+    conflict_context,
+):
+    ours = [make_statement("ours", 0)]
+    theirs = [make_statement("theirs", 0)]
+    first = log_merge.ConflictPair(
+        ours_index=0,
+        theirs_index=0,
+        ours_sql=ours[0].sql_text,
+        theirs_sql=theirs[0].sql_text,
+        conflicts=(
+            log_merge.StatementConflict(
+                kind="integrity",
+                message="theirs blocked by retained prefix",
+                scope="theirs",
+            ),
+        ),
+    )
+
+    candidate = log_merge.search_by_backtracking_ours(
+        ours,
+        theirs,
+        initial_conflict=first,
+        context=conflict_context,
+        statement_applier=noop_applier,
+    )
+
+    assert candidate.name == "standalone_replay"
+    assert candidate.ours_count == 0
+    assert candidate.theirs_count == 0
+    assert candidate.next_conflict == first
+    assert candidate.scope == "theirs"
+
+
+def test_unsafe_replay_on_ours_stops_as_standalone(conflict_context):
     ours = [make_statement("ours", index) for index in range(3)]
     theirs = [make_statement("theirs", index) for index in range(3)]
     detector = make_unsafe_detector("ours")
@@ -687,10 +790,15 @@ def test_unsafe_replay_only_backtracks_unsafe_branch(conflict_context):
         noop_applier,
     )
 
-    assert [candidate.name for candidate in candidates] == ["backtrack_ours"]
+    assert len(candidates) == 1
+    assert candidates[0].name == "unsafe_replay"
+    assert candidates[0].ours_count == first.ours_index
+    assert candidates[0].theirs_count == first.theirs_index
+    assert candidates[0].next_conflict == first
+    assert candidates[0].scope == "ours"
 
 
-def test_unsafe_replay_on_theirs_backtracks_theirs(conflict_context):
+def test_unsafe_replay_on_theirs_stops_as_standalone(conflict_context):
     ours = [make_statement("ours", index) for index in range(3)]
     theirs = [make_statement("theirs", index) for index in range(3)]
     detector = make_unsafe_detector("theirs")
@@ -711,7 +819,12 @@ def test_unsafe_replay_on_theirs_backtracks_theirs(conflict_context):
         noop_applier,
     )
 
-    assert [candidate.name for candidate in candidates] == ["backtrack_theirs"]
+    assert len(candidates) == 1
+    assert candidates[0].name == "unsafe_replay"
+    assert candidates[0].ours_count == first.ours_index
+    assert candidates[0].theirs_count == first.theirs_index
+    assert candidates[0].next_conflict == first
+    assert candidates[0].scope == "theirs"
 
 
 def test_unsafe_replay_on_both_branches_keeps_accepted_prefix(conflict_context):
@@ -736,10 +849,11 @@ def test_unsafe_replay_on_both_branches_keeps_accepted_prefix(conflict_context):
     )
 
     assert len(candidates) == 1
-    assert candidates[0].name == "unsafe_prefix"
+    assert candidates[0].name == "unsafe_replay"
     assert candidates[0].ours_count == 1
     assert candidates[0].theirs_count == 1
     assert candidates[0].next_conflict == first
+    assert candidates[0].scope == "both"
 
 
 def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
