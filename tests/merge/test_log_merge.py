@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from merge import log_merge
+from merge import session as merge_session
 
 
 def make_statement(branch, index):
@@ -35,37 +36,6 @@ def make_detector(conflicting_pairs):
                 ),
             ))
         return log_merge.ConflictCheckResult()
-
-    return detector
-
-
-def make_unsafe_detector(branch):
-    def detector(context, ours_statement, theirs_statement):
-        return log_merge.ConflictCheckResult((
-            log_merge.StatementConflict(
-                kind="unsafe_replay",
-                message=f"{branch} statement is unsafe for replay",
-                scope=branch,
-            ),
-        ))
-
-    return detector
-
-
-def make_both_unsafe_detector():
-    def detector(context, ours_statement, theirs_statement):
-        return log_merge.ConflictCheckResult((
-            log_merge.StatementConflict(
-                kind="unsafe_replay",
-                message="ours statement is unsafe for replay",
-                scope="ours",
-            ),
-            log_merge.StatementConflict(
-                kind="unsafe_replay",
-                message="theirs statement is unsafe for replay",
-                scope="theirs",
-            ),
-        ))
 
     return detector
 
@@ -423,6 +393,74 @@ def test_ordered_statement_plan_interleaves_branch_prefixes():
     ]
 
 
+def test_build_merge_plan_reports_replay_failure_in_unpaired_tail(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("CREATE TABLE coupons (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(db_path)
+    )
+    ours = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="INSERT INTO coupons (id, code) VALUES (1, 'shared')",
+            table_columns=table_columns,
+        )
+    ]
+    theirs = [
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            log_id=2,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="INSERT INTO coupons (id, code) VALUES (2, 'remote-only')",
+            table_columns=table_columns,
+        ),
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=1,
+            log_id=3,
+            transaction_id=3,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="INSERT INTO coupons (id, code) VALUES (3, 'shared')",
+            table_columns=table_columns,
+        ),
+    ]
+
+    with closing(sqlite3.connect(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        plan = log_merge.build_merge_plan_from_connection(
+            con,
+            str(db_path),
+            0,
+            ours,
+            theirs,
+            table_columns,
+            primary_key_columns,
+            key_column_sets,
+        )
+
+    assert plan.status == "conflict"
+    assert plan.selected.name == "standalone_replay"
+    assert plan.selected.scope == "theirs"
+    assert plan.selected.ours_count == 1
+    assert plan.selected.theirs_count == 1
+    assert [statement.sql_text for statement in plan.statement_plan] == [
+        "INSERT INTO coupons (id, code) VALUES (1, 'shared')",
+        "INSERT INTO coupons (id, code) VALUES (2, 'remote-only')",
+    ]
+    assert plan.selected.next_conflict is not None
+    assert plan.selected.next_conflict.theirs_index == 1
+    assert plan.selected.next_conflict.conflicts[0].kind == "integrity"
+
+
 def test_backtracking_ours_keeps_backtracking_after_later_conflict(conflict_context):
     ours = [make_statement("ours", index) for index in range(3)]
     theirs = [make_statement("theirs", index) for index in range(4)]
@@ -454,9 +492,9 @@ def test_backtracking_ours_keeps_backtracking_after_later_conflict(conflict_cont
     assert first.conflicts == (
         log_merge.StatementConflict(kind="write_write", message="test conflict"),
     )
-    assert candidate.ours_count == 1
-    assert candidate.theirs_count == 4
-    assert candidate.next_conflict is None
+    assert candidate.ours_count == 2
+    assert candidate.theirs_count == 2
+    assert candidate.next_conflict == first
 
 
 def test_backtracking_checks_candidates_in_rolled_back_prefix_state(tmp_path):
@@ -536,8 +574,9 @@ def test_backtracking_checks_candidates_in_rolled_back_prefix_state(tmp_path):
     assert observations[(ours[1].sql_text, theirs[2].sql_text)] == {1, 10, 20}
     assert observations[(ours[1].sql_text, theirs[3].sql_text)] == {1, 10, 20, 30}
     assert rows_after == []
-    assert candidate.ours_count == 1
-    assert candidate.theirs_count == 4
+    assert candidate.ours_count == 2
+    assert candidate.theirs_count == 2
+    assert candidate.next_conflict is not None
 
 
 def test_standalone_integrity_backtracks_to_earlier_retained_cause(tmp_path):
@@ -769,93 +808,6 @@ def test_backtracking_reports_standalone_when_no_earlier_prefix_exists(
     assert candidate.scope == "theirs"
 
 
-def test_unsafe_replay_on_ours_stops_as_standalone(conflict_context):
-    ours = [make_statement("ours", index) for index in range(3)]
-    theirs = [make_statement("theirs", index) for index in range(3)]
-    detector = make_unsafe_detector("ours")
-
-    first = log_merge.find_first_pairwise_conflict(
-        ours,
-        theirs,
-        conflict_context,
-        detector,
-        statement_applier=noop_applier,
-    )
-    candidates = log_merge.frontier_candidates_for_conflict(
-        ours,
-        theirs,
-        first,
-        conflict_context,
-        detector,
-        noop_applier,
-    )
-
-    assert len(candidates) == 1
-    assert candidates[0].name == "unsafe_replay"
-    assert candidates[0].ours_count == first.ours_index
-    assert candidates[0].theirs_count == first.theirs_index
-    assert candidates[0].next_conflict == first
-    assert candidates[0].scope == "ours"
-
-
-def test_unsafe_replay_on_theirs_stops_as_standalone(conflict_context):
-    ours = [make_statement("ours", index) for index in range(3)]
-    theirs = [make_statement("theirs", index) for index in range(3)]
-    detector = make_unsafe_detector("theirs")
-
-    first = log_merge.find_first_pairwise_conflict(
-        ours,
-        theirs,
-        conflict_context,
-        detector,
-        statement_applier=noop_applier,
-    )
-    candidates = log_merge.frontier_candidates_for_conflict(
-        ours,
-        theirs,
-        first,
-        conflict_context,
-        detector,
-        noop_applier,
-    )
-
-    assert len(candidates) == 1
-    assert candidates[0].name == "unsafe_replay"
-    assert candidates[0].ours_count == first.ours_index
-    assert candidates[0].theirs_count == first.theirs_index
-    assert candidates[0].next_conflict == first
-    assert candidates[0].scope == "theirs"
-
-
-def test_unsafe_replay_on_both_branches_keeps_accepted_prefix(conflict_context):
-    ours = [make_statement("ours", index) for index in range(3)]
-    theirs = [make_statement("theirs", index) for index in range(3)]
-    detector = make_both_unsafe_detector()
-
-    first = log_merge.ConflictPair(
-        ours_index=1,
-        theirs_index=1,
-        ours_sql="OURS2",
-        theirs_sql="THEIRS2",
-        conflicts=detector(conflict_context, ours[1], theirs[1]).conflicts,
-    )
-    candidates = log_merge.frontier_candidates_for_conflict(
-        ours,
-        theirs,
-        first,
-        conflict_context,
-        detector,
-        noop_applier,
-    )
-
-    assert len(candidates) == 1
-    assert candidates[0].name == "unsafe_replay"
-    assert candidates[0].ours_count == 1
-    assert candidates[0].theirs_count == 1
-    assert candidates[0].next_conflict == first
-    assert candidates[0].scope == "both"
-
-
 def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
     base = tmp_path / "base.db"
     output = tmp_path / "merged.db"
@@ -975,7 +927,11 @@ def test_replay_statement_plan_blocks_unsafe_replay_statement(tmp_path):
     assert "unsafe for automatic replay" in result.failure.error
 
 
-def test_conflict_report_serializes_logged_statement_metadata(tmp_path):
+def test_merge_session_serializes_compact_statement_handoff(tmp_path):
+    base = tmp_path / "base.db"
+    merged = tmp_path / "merged.db"
+    init_logged_db(base)
+
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
@@ -984,34 +940,30 @@ def test_conflict_report_serializes_logged_statement_metadata(tmp_path):
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO user_archive SELECT * FROM users",
     )
-    frontier = log_merge.FrontierCandidate(
-        name="clean",
-        ours_count=1,
-        theirs_count=0,
-        next_conflict=None,
+    replay = log_merge.ReplayResult(
+        ok=True,
+        output_path=str(merged),
+        applied_count=1,
     )
-    plan = log_merge.MergePlan(
-        status="clean",
+    session_path = tmp_path / "merge-session.json"
+
+    merge_session.write_merge_session(
+        session_path,
+        status="conflict",
+        base_db_path=base,
+        merged_db_path=merged,
         base_transaction_id=0,
         ours=[statement],
         theirs=[],
-        selected=frontier,
-        statement_plan=[statement],
+        replay=replay,
     )
-    replay = log_merge.ReplayResult(
-        ok=True,
-        output_path=str(tmp_path / "merged.db"),
-        applied_count=1,
-    )
-    report_path = tmp_path / "report.json"
 
-    log_merge.write_conflict_report(report_path, plan, replay)
-
-    payload = json.loads(report_path.read_text())
-    assert payload["statement_plan"][0]["metadata"]["parsed_sql_text"] == (
+    payload = json.loads(session_path.read_text())
+    assert Path(payload["paths"]["base"]).exists()
+    assert payload["paths"]["merged"] == str(merged)
+    assert set(payload["paths"]) == {"base", "merged"}
+    assert "first_conflict" not in payload
+    assert payload["ours_transactions"][0]["statements"][0]["to_replay_sql_text"] == (
         "INSERT INTO user_archive SELECT * FROM users"
     )
-    metadata = payload["statement_plan"][0]["metadata"]
-    assert metadata["tables_referenced_to_columns_referenced"] == {
-        "users": [log_merge.ALL_COLUMNS],
-    }
+    assert payload["theirs_transactions"] == []

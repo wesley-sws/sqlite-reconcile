@@ -31,19 +31,6 @@ def make_statement(sql_text, table_columns, branch="ours", index=0):
     )
 
 
-def make_unsafe_statement(sql_text, table_columns, branch="ours", index=0):
-    return log_merge.make_logged_statement(
-        branch=branch,
-        branch_index=index,
-        log_id=index + 1,
-        transaction_id=index + 1,
-        committed_at="2026-01-01T00:00:00",
-        sql_text=sql_text,
-        table_columns=table_columns,
-        is_replay_safe=False,
-    )
-
-
 def conflict_kinds(result):
     return [conflict.kind for conflict in result.conflicts]
 
@@ -68,88 +55,6 @@ def test_static_analysis_flags_update_same_column_write_write():
 
     assert conflict_kinds(result) == ["write_write"]
     assert "products.discount" in result.conflicts[0].message
-
-
-def test_conflict_detection_blocks_unsafe_replay_statement():
-    table_columns = {
-        "products": {"id", "discount"},
-    }
-    context = make_context(table_columns)
-    ours = make_unsafe_statement(
-        "UPDATE products SET discount = random()",
-        table_columns,
-        branch="ours",
-    )
-    theirs = make_statement(
-        "UPDATE products SET discount = 9 WHERE id = 1",
-        table_columns,
-        branch="theirs",
-    )
-
-    result = conflict_detection.statements_conflict(context, ours, theirs)
-
-    assert conflict_kinds(result) == ["unsafe_replay"]
-
-
-def test_conflict_detection_blocks_unparseable_statement_before_pair_checks():
-    table_columns = {
-        "products": {"id", "discount"},
-    }
-    context = make_context(table_columns)
-    ours = make_statement(
-        "NOT VALID SQL @@@",
-        table_columns,
-        branch="ours",
-    )
-    theirs = make_statement(
-        "UPDATE products SET discount = 9 WHERE id = 1",
-        table_columns,
-        branch="theirs",
-    )
-
-    result = conflict_detection.statements_conflict(context, ours, theirs)
-
-    assert conflict_kinds(result) == ["unsafe_replay"]
-    assert log_merge.METADATA_PARSE_ERROR_REASON in result.conflicts[0].message
-
-
-def test_conflict_detection_blocks_update_from_duplicate_target_rows():
-    table_columns = {
-        "products": {"id", "category_id", "discount"},
-        "categories": {"id", "rate"},
-        "audit": {"id", "value"},
-    }
-    context = make_context(
-        table_columns,
-        schema=[
-            "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)",
-            "CREATE TABLE categories (id INTEGER, rate INTEGER)",
-            "CREATE TABLE audit (id INTEGER PRIMARY KEY, value INTEGER)",
-            "INSERT INTO products VALUES (1, 1, 0)",
-            "INSERT INTO categories VALUES (1, 5)",
-            "INSERT INTO categories VALUES (1, 7)",
-            "INSERT INTO audit VALUES (1, 0)",
-        ],
-    )
-    ours = make_statement(
-        "UPDATE products "
-        "SET discount = categories.rate "
-        "FROM categories "
-        "WHERE products.category_id = categories.id",
-        table_columns,
-        branch="ours",
-    )
-    theirs = make_statement(
-        "UPDATE audit SET value = 1 WHERE id = 1",
-        table_columns,
-        branch="theirs",
-    )
-
-    result = conflict_detection.statements_conflict(context, ours, theirs)
-
-    assert conflict_kinds(result) == ["unsafe_replay"]
-    assert "multiple source rows" in result.conflicts[0].message
-    assert result.conflicts[0].scope == "ours"
 
 
 def test_conflict_detection_reports_integrity_before_static_conflicts():

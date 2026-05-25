@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import uuid
+from contextlib import closing
 from pathlib import Path
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -696,7 +697,7 @@ def _from_expression_sql(from_expression: exp.Expression) -> str:
 def _can_simulate_writer(metadata: StatementMetadata) -> bool:
     """
     Return whether writer can be replayed inside a rollback-only savepoint.
-    Unsupported or unsafe statements are kept as static conflicts instead.
+    Unsupported writers are kept as static conflicts instead.
     """
 
     return (
@@ -820,7 +821,7 @@ def _replay_statements(
     """Apply statements to db_path and return an error string on failure."""
 
     try:
-        with sqlite3.connect(db_path) as con:
+        with closing(sqlite3.connect(db_path)) as con:
             con.execute("PRAGMA foreign_keys = ON")
             for statement in statements:
                 con.execute(statement.sql_text)

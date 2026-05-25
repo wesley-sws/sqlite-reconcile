@@ -842,49 +842,6 @@ def test_execution_reports_non_integrity_sqlite_error_as_replay_error(tmp_path):
     assert "no such table" in result.conflicts[0].message
 
 
-def test_conflict_detection_blocks_update_from_duplicate_source_rows(tmp_path):
-    table_columns = {
-        "products": {"id", "category_id", "discount"},
-        "categories": {"id", "rate"},
-    }
-    base_path = init_base_db(
-        tmp_path,
-        [
-            "CREATE TABLE products (id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)",
-            "CREATE TABLE categories (id INTEGER, rate INTEGER)",
-            "INSERT INTO products VALUES (1, 1, 0)",
-            "INSERT INTO products VALUES (2, 2, 0)",
-            "INSERT INTO categories VALUES (1, 5)",
-            "INSERT INTO categories VALUES (1, 7)",
-            "INSERT INTO categories VALUES (2, 9)",
-        ],
-    )
-    con, context = make_context(base_path, table_columns)
-    with closing(con):
-        ours = make_statement(
-            "UPDATE products "
-            "SET discount = categories.rate "
-            "FROM categories "
-            "WHERE products.category_id = categories.id "
-            "AND products.id = 1",
-            table_columns,
-            branch="ours",
-        )
-        theirs = make_statement(
-            "UPDATE products SET discount = 9 WHERE id = 2",
-            table_columns,
-            branch="theirs",
-        )
-        result = conflict_detection.statements_conflict(
-            context,
-            ours,
-            theirs,
-        )
-
-    assert conflict_kinds(result) == ["unsafe_replay"]
-    assert result.of_kind("unsafe_replay")[0].scope == "ours"
-
-
 def test_write_read_probe_reports_not_refined_reason_for_update_from_duplicates(tmp_path):
     table_columns = {
         "products": {"id", "category_id", "discount"},
