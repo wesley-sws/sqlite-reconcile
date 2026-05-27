@@ -97,12 +97,38 @@ def _standalone_conflict_message(conflict: ConflictPair, scope: BranchName) -> s
     )
 
 
-def _edit_label_hint(labels: Sequence[str]) -> str:
+def _edit_label_hint(
+    lookup: dict[str, tuple[str, LoggedTransaction, LoggedStatement]],
+) -> str:
     """Return a compact hint for the labels that can be edited."""
 
-    if len(labels) == 1:
-        return labels[0]
-    return f"{labels[0]}-{labels[-1]}"
+    if not lookup:
+        return "none"
+
+    hints: list[str] = []
+    for branch, prefix in (("ours", "L"), ("theirs", "R")):
+        original_indexes = sorted(
+            statement.branch_index
+            for _, _, statement in lookup.values()
+            if statement.branch == branch and statement.branch_index >= 0
+        )
+        if original_indexes:
+            first = f"{prefix}{original_indexes[0] + 1}"
+            last = f"{prefix}{original_indexes[-1] + 1}"
+            hints.append(first if first == last else f"{first}-{last}")
+
+        new_indexes = sorted(
+            abs(statement.branch_index)
+            for _, _, statement in lookup.values()
+            if statement.branch == branch and statement.branch_index < 0
+        )
+        if new_indexes:
+            new_prefix = f"{prefix}N"
+            first = f"{new_prefix}{new_indexes[0]}"
+            last = f"{new_prefix}{new_indexes[-1]}"
+            hints.append(first if first == last else f"{first}-{last}")
+    return ", ".join(hints)
+
 
 def _replace_statement_sql(
     statement: LoggedStatement,
@@ -132,10 +158,14 @@ def _new_statement_sql(
 ) -> LoggedStatement:
     """Create a user-inserted statement inside an existing transaction."""
 
-    branch_index = max(
-        (statement.branch_index for statement in statements),
-        default=transaction.branch_index,
-    ) + 1
+    branch_index = min(
+        (
+            statement.branch_index
+            for statement in statements
+            if statement.branch_index < 0
+        ),
+        default=0,
+    ) - 1
     log_id = min((statement.log_id for statement in statements), default=0)
     return make_logged_statement(
         branch=transaction.branch,
@@ -230,7 +260,7 @@ def _parse_order(
     raw: str,
     labels: dict[str, LoggedTransaction],
 ) -> list[LoggedTransaction] | None:
-    """Parse semicolon-separated labels like L1; R2;."""
+    """Parse semicolon-separated transaction labels like A; B;."""
 
     text = raw.strip()
     if not text:
@@ -428,24 +458,23 @@ def _statement_labels(
 ) -> list[str]:
     """Return editable statement labels from transaction values."""
 
-    return [
-        statement_label(statement)
-        for transaction in transactions_by_label.values()
-        for statement in transaction.statements
-    ]
+    return list(_statement_lookup(transactions_by_label))
 
 
-def _find_labeled_statement(
+def _statement_lookup(
     transactions_by_label: dict[str, LoggedTransaction],
-    label: str,
-) -> tuple[str, LoggedTransaction, LoggedStatement] | None:
-    """Find one statement by terminal label in editable transactions."""
+) -> dict[str, tuple[str, LoggedTransaction, LoggedStatement]]:
+    """Return editable statement labels mapped to their transaction context."""
 
+    lookup: dict[str, tuple[str, LoggedTransaction, LoggedStatement]] = {}
     for transaction_label_text, transaction in transactions_by_label.items():
         for statement in transaction.statements:
-            if statement_label(statement) == label:
-                return transaction_label_text, transaction, statement
-    return None
+            lookup[statement_label(statement)] = (
+                transaction_label_text,
+                transaction,
+                statement,
+            )
+    return lookup
 
 
 def _replace_transaction_statement(
@@ -515,19 +544,21 @@ def _handle_transaction_edit_command(
 ) -> str:
     """Apply edit/delete/insert commands to editable transactions."""
 
-    labels = _statement_labels(transactions_by_label)
+    lookup = _statement_lookup(transactions_by_label)
+    first_label = next(iter(lookup), None)
+    label_hint = _edit_label_hint(lookup)
 
     delete_label = _parse_delete_command(raw)
     if delete_label is not None:
-        if not labels:
+        if first_label is None:
             print("No statements left to delete.")
             return "handled"
         if not delete_label:
-            print(f"Choose a statement to delete, e.g. 'delete {labels[0]}'.")
+            print(f"Choose a statement to delete, e.g. 'delete {first_label}'.")
             return "handled"
-        found = _find_labeled_statement(transactions_by_label, delete_label)
+        found = lookup.get(delete_label)
         if found is None:
-            print(f"Unknown label {delete_label}. Valid labels: {', '.join(labels)}")
+            print(f"Unknown label {delete_label}. Valid labels: {label_hint}")
             return "handled"
         transaction_label_text, transaction, statement = found
         updated = _replace_transaction_statement(transaction, statement, None)
@@ -538,13 +569,13 @@ def _handle_transaction_edit_command(
 
     insert_command = _parse_insert_command(raw)
     if insert_command is not None:
-        if not labels:
+        if first_label is None:
             print("No statements left to use as an insert position.")
             return "handled"
         position, anchor_label = insert_command
-        found = _find_labeled_statement(transactions_by_label, anchor_label)
+        found = lookup.get(anchor_label)
         if found is None:
-            print(f"Unknown label {anchor_label}. Valid labels: {', '.join(labels)}")
+            print(f"Unknown label {anchor_label}. Valid labels: {label_hint}")
             return "handled"
         transaction_label_text, transaction, anchor = found
         edited_sql = _edit_sql_in_editor(f"insert {position} {anchor_label}", "")
@@ -569,15 +600,15 @@ def _handle_transaction_edit_command(
 
     edit_label = _parse_edit_command(raw)
     if edit_label is not None:
-        if not labels:
+        if first_label is None:
             print("No statements left to edit.")
             return "handled"
         if not edit_label:
-            print(f"Choose a statement to edit, e.g. 'edit {labels[0]}'.")
+            print(f"Choose a statement to edit, e.g. 'edit {first_label}'.")
             return "handled"
-        found = _find_labeled_statement(transactions_by_label, edit_label)
+        found = lookup.get(edit_label)
         if found is None:
-            print(f"Unknown label {edit_label}. Valid labels: {', '.join(labels)}")
+            print(f"Unknown label {edit_label}. Valid labels: {label_hint}")
             return "handled"
         transaction_label_text, transaction, statement = found
         edited_sql = _edit_sql_in_editor(edit_label, statement.original_sql_text)
@@ -613,6 +644,8 @@ def _prompt_pair_resolution(
     theirs_statements = list(theirs[conflict.theirs_index].statements)
     ours_label = statement_group_label(ours_statements)
     theirs_label = statement_group_label(theirs_statements)
+    ours_order_label = "A"
+    theirs_order_label = "B"
     print()
     print(
         f"{_group_title(ours_label, ours_statements)} and "
@@ -621,20 +654,28 @@ def _prompt_pair_resolution(
     print(_conflict_messages(conflict))
     _print_statement_group(ours_label, ours_statements)
     _print_statement_group(theirs_label, theirs_statements)
+    print(
+        f"{ours_order_label} = {ours_label} "
+        f"({_group_title(ours_label, ours_statements)})"
+    )
+    print(
+        f"{theirs_order_label} = {theirs_label} "
+        f"({_group_title(theirs_label, theirs_statements)})"
+    )
     resolved_labels = {
-        ours_label: _transaction_with_statements(
+        ours_order_label: _transaction_with_statements(
             ours[conflict.ours_index],
             ours_statements,
         ),
-        theirs_label: _transaction_with_statements(
+        theirs_order_label: _transaction_with_statements(
             theirs[conflict.theirs_index],
             theirs_statements,
         ),
     }
     valid_edit_labels = _statement_labels(resolved_labels)
     print(
-        f"Enter replay order such as '{ours_label}; {theirs_label};', "
-        f"'{theirs_label};', or ';' for neither."
+        f"Enter replay order such as '{ours_order_label}; {theirs_order_label};', "
+        f"'{theirs_order_label};', or ';' for neither."
     )
     _print_transaction_edit_help(valid_edit_labels)
     while True:
@@ -707,6 +748,3 @@ def _prompt_standalone_resolution(
         if edit_result == "handled":
             continue
         print(f"Unknown action. Use 'edit {valid_labels[0]};', DELETE, or ;.")
-
-
-

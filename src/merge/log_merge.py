@@ -28,6 +28,7 @@ from .models import (
     ReplayFailure,
     ReplayResult,
     StatementConflict,
+    transaction_label,
 )
 from .sql_metadata import (
     parse_statement_metadata,
@@ -57,6 +58,7 @@ ACKNOWLEDGEABLE_REPLAY_REASONS = (
 UPDATE_FROM_DUPLICATE_TARGET_WARNING = (
     "UPDATE FROM has multiple source rows for the same target row"
 )
+DEBUG_MERGE_TRACE = True
 
 
 def default_conflict_detector() -> ConflictDetector:
@@ -354,6 +356,41 @@ def _transaction_conflict_pair(
     )
 
 
+def _debug_pair_result(
+    phase: str,
+    ours_transaction: LoggedTransaction,
+    theirs_transaction: LoggedTransaction,
+    result: ConflictCheckResult,
+) -> None:
+    """Temporarily print each transaction-pair check and its result."""
+
+    if not DEBUG_MERGE_TRACE:
+        return
+
+    label = (
+        f"{transaction_label(ours_transaction)} <-> "
+        f"{transaction_label(theirs_transaction)}"
+    )
+    if not result.has_conflict:
+        print(f"[merge-debug] {phase}: {label}: no conflict")
+        return
+
+    standalone = _standalone_replay_branches(result)
+    standalone_text = (
+        "none"
+        if not standalone
+        else ", ".join(sorted(standalone))
+    )
+    conflicts = "; ".join(
+        f"{conflict.kind}/{conflict.scope}: {conflict.message}"
+        for conflict in result.conflicts
+    )
+    print(
+        f"[merge-debug] {phase}: {label}: conflict; "
+        f"standalone={standalone_text}; {conflicts}"
+    )
+
+
 def find_first_pairwise_conflict(
     ours: Sequence[LoggedTransaction],
     theirs: Sequence[LoggedTransaction],
@@ -365,6 +402,7 @@ def find_first_pairwise_conflict(
     conflict_detector = conflict_detector or default_conflict_detector()
     for index, (ours_tx, theirs_tx) in enumerate(zip(ours, theirs)):
         result = conflict_detector(context, ours_tx, theirs_tx)
+        _debug_pair_result("lockstep check", ours_tx, theirs_tx, result)
         if result.has_conflict:
             return _transaction_conflict_pair(
                 ours,
@@ -381,6 +419,12 @@ def find_first_pairwise_conflict(
             (*ours_tx.statements, *theirs_tx.statements),
         )
         if replay_error is not None:
+            if DEBUG_MERGE_TRACE:
+                print(
+                    "[merge-debug] lockstep apply failed after "
+                    f"{transaction_label(ours_tx)} + {transaction_label(theirs_tx)}: "
+                    f"{replay_error.kind}/{replay_error.scope}: {replay_error.message}"
+                )
             return _transaction_conflict_pair(
                 ours,
                 theirs,
@@ -429,20 +473,22 @@ def apply_transaction_sequence(
 def _conflict_after_prefix(
     ours: Sequence[LoggedTransaction],
     theirs: Sequence[LoggedTransaction],
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
+    ours_index: int,
+    theirs_index: int,
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector,
 ) -> ConflictCheckResult:
     """Check one pair after applying the prefix that would precede it."""
 
+    ours_transaction = ours[ours_index]
+    theirs_transaction = theirs[theirs_index]
     prefix = ordered_transaction_plan(
         ours,
         theirs,
         FrontierCandidate(
             name="prefix",
-            ours_count=ours_transaction.branch_index,
-            theirs_count=theirs_transaction.branch_index,
+            ours_count=ours_index,
+            theirs_count=theirs_index,
             next_conflict=None,
         ),
     )
@@ -452,7 +498,14 @@ def _conflict_after_prefix(
         replay_error = apply_transaction_sequence(context, prefix)
         if replay_error is not None:
             return ConflictCheckResult((replay_error,))
-        return conflict_detector(context, ours_transaction, theirs_transaction)
+        result = conflict_detector(context, ours_transaction, theirs_transaction)
+        _debug_pair_result(
+            "backtrack check",
+            ours_transaction,
+            theirs_transaction,
+            result,
+        )
+        return result
     finally:
         rollback_savepoint(context.base_cursor, savepoint)
 
@@ -505,13 +558,11 @@ def search_by_backtracking_ours(
         )
 
     while ours_tx_index >= 0 and theirs_tx_index < len(theirs):
-        ours_transaction = ours[ours_tx_index]
-        theirs_transaction = theirs[theirs_tx_index]
         result = _conflict_after_prefix(
             ours,
             theirs,
-            ours_transaction,
-            theirs_transaction,
+            ours_tx_index,
+            theirs_tx_index,
             context,
             conflict_detector,
         )
@@ -593,13 +644,11 @@ def search_by_backtracking_theirs(
         )
 
     while theirs_tx_index >= 0 and ours_tx_index < len(ours):
-        ours_transaction = ours[ours_tx_index]
-        theirs_transaction = theirs[theirs_tx_index]
         result = _conflict_after_prefix(
             ours,
             theirs,
-            ours_transaction,
-            theirs_transaction,
+            ours_tx_index,
+            theirs_tx_index,
             context,
             conflict_detector,
         )
@@ -899,10 +948,8 @@ def _standalone_replay_failure_candidate(
 ) -> FrontierCandidate:
     """Build a standalone replay frontier for one failing transaction."""
 
-    ours_index = transaction.branch_index if branch == "ours" else max(ours_count - 1, 0)
-    theirs_index = (
-        transaction.branch_index if branch == "theirs" else max(theirs_count - 1, 0)
-    )
+    ours_index = ours_count if branch == "ours" else max(ours_count - 1, 0)
+    theirs_index = theirs_count if branch == "theirs" else max(theirs_count - 1, 0)
     pair = ConflictPair(
         ours_index=ours_index,
         theirs_index=theirs_index,

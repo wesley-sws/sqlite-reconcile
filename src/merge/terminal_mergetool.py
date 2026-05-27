@@ -4,7 +4,6 @@ import argparse
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
-from dataclasses import replace
 from pathlib import Path
 
 from .execution_based_analysis import update_from_has_duplicate_target_rows
@@ -23,7 +22,7 @@ from .log_merge import (
     replay_transaction_plan,
     validate_database,
 )
-from .models import statement_label
+from .models import statement_label, transaction_label
 from .session import read_merge_session
 from .terminal_ui import (
     STANDALONE_RESOLUTION_SCOPE,
@@ -35,6 +34,7 @@ from .terminal_ui import (
     _transaction_with_statements,
 )
 
+DEBUG_MERGETOOL_TRACE = True
 
 
 def _session_logged_statements(
@@ -90,6 +90,12 @@ def _apply_to_planning_db(
 
     try:
         for transaction in transactions:
+            if DEBUG_MERGETOOL_TRACE:
+                print(
+                    "[mergetool-debug] applying "
+                    f"{transaction_label(transaction)} "
+                    f"({transaction.branch} tx {transaction.branch_index + 1})"
+                )
             for statement in transaction.statements:
                 if not statement.is_replay_safe:
                     con.rollback()
@@ -102,6 +108,11 @@ def _apply_to_planning_db(
             if errors:
                 con.rollback()
                 return "\n".join(errors)
+            if DEBUG_MERGETOOL_TRACE:
+                print(
+                    "[mergetool-debug] applied "
+                    f"{transaction_label(transaction)}"
+                )
     except sqlite3.Error as exc:
         con.rollback()
         return str(exc)
@@ -274,8 +285,8 @@ def _replace_remaining_standalone(
         else:
             next_ours = next_ours[1:]
         return (
-            _reindex_transactions(next_ours),
-            _reindex_transactions(theirs[frontier_theirs_count:]),
+            next_ours,
+            list(theirs[frontier_theirs_count:]),
         )
 
     next_theirs = list(theirs[conflict.theirs_index:])
@@ -287,34 +298,8 @@ def _replace_remaining_standalone(
     else:
         next_theirs = next_theirs[1:]
     return (
-        _reindex_transactions(ours[frontier_ours_count:]),
-        _reindex_transactions(next_theirs),
-    )
-
-
-def _reindex_transactions(
-    transactions: Sequence[LoggedTransaction],
-) -> list[LoggedTransaction]:
-    """Keep transaction indexes relative to the current remaining list."""
-
-    return [
-        replace(transaction, branch_index=index)
-        if transaction.branch_index != index
-        else transaction
-        for index, transaction in enumerate(transactions)
-    ]
-
-
-def _consume_pair_indexes(
-    conflict: ConflictPair,
-    frontier_ours_count: int,
-    frontier_theirs_count: int,
-) -> tuple[int, int]:
-    """Return remaining-list starts after the user resolves a pair conflict."""
-
-    return (
-        max(conflict.ours_index + 1, frontier_ours_count),
-        max(conflict.theirs_index + 1, frontier_theirs_count),
+        list(ours[frontier_ours_count:]),
+        next_theirs,
     )
 
 
@@ -375,6 +360,7 @@ def resolve_session(session_path: str | Path) -> int:
                 table_columns,
                 primary_key_columns,
                 key_column_sets,
+                search_frontier = False,
             )
 
             prefix = plan.transaction_plan
@@ -393,12 +379,8 @@ def resolve_session(session_path: str | Path) -> int:
             conflict = plan.selected.next_conflict
             if conflict is None:
                 ours_transactions, theirs_transactions = (
-                    _reindex_transactions(
-                        ours_transactions[plan.selected.ours_count:]
-                    ),
-                    _reindex_transactions(
-                        theirs_transactions[plan.selected.theirs_count:]
-                    ),
+                    list(ours_transactions[plan.selected.ours_count:]),
+                    list(theirs_transactions[plan.selected.theirs_count:]),
                 )
                 if not prefix and (ours_transactions or theirs_transactions):
                     # Avoid spinning if a no-conflict frontier consumes no
@@ -442,16 +424,11 @@ def resolve_session(session_path: str | Path) -> int:
                     error = _apply_to_planning_db(planning_conn, resolution)
                     if error is None:
                         resolved_plan.extend(resolution)
-                        ours_start, theirs_start = _consume_pair_indexes(
-                            conflict,
-                            plan.selected.ours_count,
-                            plan.selected.theirs_count,
+                        ours_transactions = list(
+                            ours_transactions[conflict.ours_index + 1:]
                         )
-                        ours_transactions = _reindex_transactions(
-                            ours_transactions[ours_start:]
-                        )
-                        theirs_transactions = _reindex_transactions(
-                            theirs_transactions[theirs_start:]
+                        theirs_transactions = list(
+                            theirs_transactions[conflict.theirs_index + 1:]
                         )
                         break
                     print(f"Resolution failed: {error}")

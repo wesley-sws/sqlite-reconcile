@@ -243,6 +243,10 @@ class MergeNotApplicableError(Exception):
 def statement_label(statement: LoggedStatement) -> str:
     """Return a user-facing branch label for one statement."""
 
+    if statement.branch_index < 0:
+        prefix = "LN" if statement.branch == "ours" else "RN"
+        return f"{prefix}{abs(statement.branch_index)}"
+
     prefix = "L" if statement.branch == "ours" else "R"
     return f"{prefix}{statement.branch_index + 1}"
 

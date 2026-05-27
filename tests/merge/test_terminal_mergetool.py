@@ -118,7 +118,7 @@ def test_prompt_pair_resolution_accepts_order_without_replacement_prompts(
             ),
         ),
     )
-    monkeypatch.setattr("builtins.input", lambda _: "R3;")
+    monkeypatch.setattr("builtins.input", lambda _: "B;")
 
     resolution = terminal_ui._prompt_pair_resolution(
         conflict,
@@ -130,6 +130,8 @@ def test_prompt_pair_resolution_accepts_order_without_replacement_prompts(
     assert list(log_merge.flatten_transactions(resolution)) == [theirs[0]]
     output = capsys.readouterr().out
     assert "R3 replacement SQL" not in output
+    assert "A = L3" in output
+    assert "B = R3" in output
     assert "Use 'edit L3;' or 'edit R3;'" in output
 
 
@@ -169,7 +171,7 @@ def test_prompt_pair_resolution_edits_statement_before_order(monkeypatch):
             ),
         ),
     )
-    responses = iter([":edit L3", "L3; R3;"])
+    responses = iter([":edit L3", "A; B;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -238,7 +240,7 @@ def test_prompt_pair_resolution_empty_edit_deletes_statement(monkeypatch):
             ),
         ),
     )
-    responses = iter(["edit L4;", "L3-L4; R3;"])
+    responses = iter(["edit L4;", "A; B;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(terminal_ui, "_edit_sql_in_editor", lambda label, sql: "")
 
@@ -258,7 +260,7 @@ def test_prompt_pair_resolution_empty_edit_deletes_statement(monkeypatch):
     ]
 
 
-def test_prompt_pair_resolution_inserts_statement_after_label(monkeypatch):
+def test_prompt_pair_resolution_inserts_statement_after_label(monkeypatch, capsys):
     table_columns = {"products": {"id", "price"}}
     ours = [
         log_merge.make_logged_statement(
@@ -295,7 +297,71 @@ def test_prompt_pair_resolution_inserts_statement_after_label(monkeypatch):
         ),
     )
     inserted_sql = "UPDATE products SET price = price + 5 WHERE id = 76"
-    responses = iter(["insert after L3;", "L3;"])
+    responses = iter(["insert after L3;", "A;"])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    monkeypatch.setattr(
+        terminal_ui,
+        "_edit_sql_in_editor",
+        lambda label, sql: inserted_sql,
+    )
+
+    resolution = terminal_ui._prompt_pair_resolution(
+        conflict,
+        txs(ours),
+        txs(theirs),
+        table_columns,
+    )
+
+    flattened = list(log_merge.flatten_transactions(resolution))
+    assert [statement.sql_text for statement in flattened] == [
+        ours[0].sql_text,
+        inserted_sql,
+    ]
+    assert [terminal_ui.statement_label(statement) for statement in flattened] == [
+        "L3",
+        "LN1",
+    ]
+    assert "LN1:" in capsys.readouterr().out
+
+
+def test_prompt_pair_resolution_inserts_multiple_new_statement_labels(monkeypatch):
+    table_columns = {"products": {"id", "price"}}
+    ours = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=2,
+            log_id=1,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE products SET price = price + 100 WHERE id = 75",
+            table_columns=table_columns,
+        )
+    ]
+    theirs = [
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=2,
+            log_id=2,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE products SET price = price - 50 WHERE id = 75",
+            table_columns=table_columns,
+        )
+    ]
+    conflict = log_merge.ConflictPair(
+        ours_index=0,
+        theirs_index=0,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            log_merge.StatementConflict(
+                kind="write_write",
+                message="write-write row overlap",
+            ),
+        ),
+    )
+    inserted_sql = "UPDATE products SET price = price + 5 WHERE id = 76"
+    responses = iter(["insert after L3;", "insert after LN1;", "A;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -311,10 +377,19 @@ def test_prompt_pair_resolution_inserts_statement_after_label(monkeypatch):
     )
 
     assert [
+        terminal_ui.statement_label(statement)
+        for statement in log_merge.flatten_transactions(resolution)
+    ] == [
+        "L3",
+        "LN1",
+        "LN2",
+    ]
+    assert [
         statement.sql_text
         for statement in log_merge.flatten_transactions(resolution)
     ] == [
         ours[0].sql_text,
+        inserted_sql,
         inserted_sql,
     ]
 
@@ -786,4 +861,3 @@ def test_branch_replay_safety_ignores_stale_update_from_warning(
     )
 
     assert resolved == [statement]
-
