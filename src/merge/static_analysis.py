@@ -5,10 +5,9 @@ from sqlglot import expressions as exp
 from .log_merge import (
     ConflictCheckContext,
     ConflictCheckResult,
-    LoggedStatement,
     StatementConflict,
 )
-from .statement_metadata import StatementMetadata
+from .sql_metadata import StatementMetadata, TransactionMetadata
 from .utils import (
     ALL_COLUMNS,
     is_delete_statement,
@@ -19,19 +18,163 @@ from .utils import (
 
 def static_analysis_matching(
     context: ConflictCheckContext,
-    ours_statement: LoggedStatement,
-    theirs_statement: LoggedStatement,
+    ours_metadata: TransactionMetadata,
+    theirs_metadata: TransactionMetadata,
 ) -> ConflictCheckResult:
-    """Return table/column based conflicts between two logged statements."""
+    """Return table/column based conflicts between two transactions."""
 
-    return _match_metadata(
+    if len(ours_metadata.statements) == 1 and len(theirs_metadata.statements) == 1:
+        return _match_statement_metadata(
+            context,
+            ours_metadata.statements[0],
+            theirs_metadata.statements[0],
+        )
+
+    result = ConflictCheckResult()
+    if _transaction_has_implicit_insert_key_conflict(
         context,
-        ours_statement.metadata,
-        theirs_statement.metadata,
+        ours_metadata,
+        theirs_metadata,
+    ):
+        result.add_conflicts(
+            StatementConflict(
+                kind="implicit_insert_key",
+                message="transactions may conflict through implicit insert keys",
+            )
+        )
+
+    if _transaction_write_write_overlap(ours_metadata, theirs_metadata):
+        result.add_conflicts(
+            StatementConflict(
+                kind="write_write",
+                message="transactions write overlapping table columns",
+            )
+        )
+
+    for writer_label, writer, reader_label, reader in (
+        ("ours", ours_metadata, "theirs", theirs_metadata),
+        ("theirs", theirs_metadata, "ours", ours_metadata),
+    ):
+        if _transaction_write_read_overlap(writer, reader):
+            result.add_conflicts(
+                StatementConflict(
+                    kind="write_read",
+                    message=(
+                        f"{writer_label} transaction writes columns read by "
+                        f"{reader_label} transaction"
+                    ),
+                    details=_write_read_details(
+                        writer_label,
+                        reader_label,
+                    ),
+                )
+            )
+    return result
+
+
+def write_write_candidate_pairs(
+    ours_metadata: TransactionMetadata,
+    theirs_metadata: TransactionMetadata,
+) -> tuple[tuple[int, int], ...]:
+    """Return statement pairs that may have a write/write conflict."""
+
+    return tuple(
+        (ours_index, theirs_index)
+        for ours_index, ours_statement in enumerate(ours_metadata.statements)
+        for theirs_index, theirs_statement in enumerate(theirs_metadata.statements)
+        if _metadata_write_write_overlap(ours_statement, theirs_statement)
     )
 
 
-def _match_metadata(
+def write_read_candidate_indexes(
+    writer_metadata: TransactionMetadata,
+    reader_metadata: TransactionMetadata,
+) -> tuple[int, ...]:
+    """Return reader statement indexes that may read writer output."""
+
+    return tuple(
+        index
+        for index, reader_statement in enumerate(reader_metadata.statements)
+        if _metadata_reads_any(
+            reader_statement,
+            writer_metadata.tables_updated_to_columns_updated,
+        )
+    )
+
+
+def _transaction_has_implicit_insert_key_conflict(
+    context: ConflictCheckContext,
+    ours_metadata: TransactionMetadata,
+    theirs_metadata: TransactionMetadata,
+) -> bool:
+    """Return whether any statement pair has an implicit-key risk."""
+
+    return any(
+        _implicit_insert_key_conflicts(context, ours_statement, theirs_statement)
+        for ours_statement in ours_metadata.statements
+        for theirs_statement in theirs_metadata.statements
+    )
+
+
+def _transaction_write_write_overlap(
+    ours_metadata: TransactionMetadata,
+    theirs_metadata: TransactionMetadata,
+) -> bool:
+    """Return whether the two transactions may write the same table columns."""
+
+    return _columns_by_table_overlap(
+        ours_metadata.tables_updated_to_columns_updated,
+        theirs_metadata.tables_updated_to_columns_updated,
+    )
+
+
+def _transaction_write_read_overlap(
+    writer_metadata: TransactionMetadata,
+    reader_metadata: TransactionMetadata,
+) -> bool:
+    """Return whether any reader statement may read writer transaction output."""
+
+    return _columns_by_table_overlap(
+        writer_metadata.tables_updated_to_columns_updated,
+        reader_metadata.tables_referenced_to_columns_referenced,
+    )
+
+
+def _columns_by_table_overlap(
+    left: dict[str, set[str]],
+    right: dict[str, set[str]],
+) -> bool:
+    """Return whether two table-to-column maps overlap."""
+
+    for table, left_columns in left.items():
+        right_columns = right.get(table)
+        if right_columns is not None and _column_overlap(left_columns, right_columns):
+            return True
+    return False
+
+
+def _metadata_write_write_overlap(
+    ours_metadata: StatementMetadata,
+    theirs_metadata: StatementMetadata,
+) -> bool:
+    """Return whether two statements may write overlapping table columns."""
+
+    return _write_write_conflict(ours_metadata, theirs_metadata) is not None
+
+
+def _metadata_reads_any(
+    metadata: StatementMetadata,
+    columns_by_table: dict[str, set[str]],
+) -> bool:
+    """Return whether metadata reads any provided table columns."""
+
+    return any(
+        _metadata_read_overlap(metadata, table, columns)
+        for table, columns in columns_by_table.items()
+    )
+
+
+def _match_statement_metadata(
     context: ConflictCheckContext,
     ours_metadata: StatementMetadata,
     theirs_metadata: StatementMetadata,
@@ -142,7 +285,10 @@ def _write_read_details(
 ) -> tuple[tuple[str, str], ...]:
     """Return structured direction data for execution-based refinement."""
 
-    return (("writer", writer_label), ("reader", reader_label))
+    return (
+        ("writer", writer_label),
+        ("reader", reader_label),
+    )
 
 
 def _implicit_insert_key_conflicts(
@@ -338,6 +484,9 @@ def _metadata_read_overlap(
     columns: set[str],
 ) -> set[str]:
     """Return columns metadata reads on table."""
+
+    if table is None:
+        return set()
 
     references = metadata.tables_referenced_to_columns_referenced
     return _column_overlap(references.get(table, set()), columns)

@@ -15,7 +15,8 @@ from merge import session as merge_session
 
 
 def make_statement(branch, index):
-    sql_text = f"{branch.upper()}{index + 1}"
+    label = f"{branch.upper()}{index + 1}"
+    sql_text = f"SELECT {index + 1} /* {label} */"
     return log_merge.make_logged_statement(
         branch=branch,
         branch_index=index,
@@ -26,9 +27,21 @@ def make_statement(branch, index):
     )
 
 
+def synthetic_label(value):
+    statement = value.statements[0] if hasattr(value, "statements") else value
+    return f"{statement.branch.upper()}{statement.branch_index + 1}"
+
+
+def txs(statements):
+    return log_merge.group_logged_transactions(statements)
+
+
 def make_detector(conflicting_pairs):
-    def detector(context, ours_statement, theirs_statement):
-        if (ours_statement.sql_text, theirs_statement.sql_text) in conflicting_pairs:
+    def detector(context, ours_transaction, theirs_transaction):
+        if (
+            synthetic_label(ours_transaction),
+            synthetic_label(theirs_transaction),
+        ) in conflicting_pairs:
             return log_merge.ConflictCheckResult((
                 log_merge.StatementConflict(
                     kind="write_write",
@@ -38,10 +51,6 @@ def make_detector(conflicting_pairs):
         return log_merge.ConflictCheckResult()
 
     return detector
-
-
-def noop_applier(context, statements):
-    return None
 
 
 @pytest.fixture
@@ -364,7 +373,11 @@ def test_pairwise_detection_uses_state_from_previous_clean_pairs(tmp_path):
             ),
         ]
 
-        first = log_merge.find_first_pairwise_conflict(ours, theirs, context)
+        first = log_merge.find_first_pairwise_conflict(
+            txs(ours),
+            txs(theirs),
+            context,
+        )
 
     assert first is not None
     assert first.ours_index == 1
@@ -382,14 +395,59 @@ def test_ordered_statement_plan_interleaves_branch_prefixes():
         next_conflict=None,
     )
 
-    plan = log_merge.ordered_statement_plan(ours, theirs, frontier)
+    plan = log_merge.ordered_statement_plan(txs(ours), txs(theirs), frontier)
 
-    assert [statement.sql_text for statement in plan] == [
+    assert [synthetic_label(statement) for statement in plan] == [
         "OURS1",
         "THEIRS1",
         "OURS2",
         "THEIRS2",
         "THEIRS3",
+    ]
+
+
+def test_ordered_statement_plan_keeps_transaction_statements_together():
+    ours = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="OURS1",
+        ),
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=1,
+            log_id=2,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="OURS2",
+        ),
+    ]
+    theirs = [
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            log_id=3,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="THEIRS1",
+        )
+    ]
+    frontier = log_merge.FrontierCandidate(
+        name="test",
+        ours_count=1,
+        theirs_count=1,
+        next_conflict=None,
+    )
+
+    plan = log_merge.ordered_statement_plan(txs(ours), txs(theirs), frontier)
+
+    assert [statement.sql_text for statement in plan] == [
+        "OURS1",
+        "OURS2",
+        "THEIRS1",
     ]
 
 
@@ -440,8 +498,8 @@ def test_build_merge_plan_reports_replay_failure_in_unpaired_tail(tmp_path):
             con,
             str(db_path),
             0,
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             table_columns,
             primary_key_columns,
             key_column_sets,
@@ -470,25 +528,23 @@ def test_backtracking_ours_keeps_backtracking_after_later_conflict(conflict_cont
     })
 
     first = log_merge.find_first_pairwise_conflict(
-        ours,
-        theirs,
+        txs(ours),
+        txs(theirs),
         conflict_context,
         detector,
-        statement_applier=noop_applier,
     )
     candidate = log_merge.search_by_backtracking_ours(
-        ours,
-        theirs,
+        txs(ours),
+        txs(theirs),
         first,
         conflict_context,
         detector,
-        noop_applier,
     )
 
     assert first.ours_index == 2
     assert first.theirs_index == 2
-    assert first.ours_sql == "OURS3"
-    assert first.theirs_sql == "THEIRS3"
+    assert "OURS3" in first.ours_sql
+    assert "THEIRS3" in first.theirs_sql
     assert first.conflicts == (
         log_merge.StatementConflict(kind="write_write", message="test conflict"),
     )
@@ -552,8 +608,8 @@ def test_backtracking_checks_candidates_in_rolled_back_prefix_state(tmp_path):
             table_columns=table_columns,
         )
         candidate = log_merge.search_by_backtracking_ours(
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             initial_conflict=log_merge.ConflictPair(
                 ours_index=2,
                 theirs_index=2,
@@ -639,8 +695,8 @@ def test_standalone_integrity_backtracks_to_earlier_retained_cause(tmp_path):
             **context_kwargs,
         )
         first = log_merge.find_first_pairwise_conflict(
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             first_context,
         )
 
@@ -651,8 +707,8 @@ def test_standalone_integrity_backtracks_to_earlier_retained_cause(tmp_path):
             **context_kwargs,
         )
         candidates = log_merge.frontier_candidates_for_conflict(
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             first,
             backtrack_context,
         )
@@ -688,28 +744,25 @@ def test_frontier_choice_uses_highest_total_statement_count(conflict_context):
     })
 
     first = log_merge.find_first_pairwise_conflict(
-        ours,
-        theirs,
+        txs(ours),
+        txs(theirs),
         conflict_context,
         detector,
-        statement_applier=noop_applier,
     )
     candidates = [
         log_merge.search_by_backtracking_ours(
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             first,
             conflict_context,
             detector,
-            noop_applier,
         ),
         log_merge.search_by_backtracking_theirs(
-            ours,
-            theirs,
+            txs(ours),
+            txs(theirs),
             first,
             conflict_context,
             detector,
-            noop_applier,
         ),
     ]
     selected = log_merge.choose_frontier(candidates)
@@ -726,8 +779,11 @@ def test_backtracking_keeps_larger_pairwise_candidate_when_smaller_prefix_is_sta
     ours = [make_statement("ours", index) for index in range(3)]
     theirs = [make_statement("theirs", index) for index in range(3)]
 
-    def detector(context, ours_statement, theirs_statement):
-        pair = (ours_statement.sql_text, theirs_statement.sql_text)
+    def detector(context, ours_transaction, theirs_transaction):
+        pair = (
+            synthetic_label(ours_transaction),
+            synthetic_label(theirs_transaction),
+        )
         if pair == ("OURS2", "THEIRS3"):
             return log_merge.ConflictCheckResult((
                 log_merge.StatementConflict(
@@ -746,8 +802,8 @@ def test_backtracking_keeps_larger_pairwise_candidate_when_smaller_prefix_is_sta
         return log_merge.ConflictCheckResult()
 
     candidate = log_merge.search_by_backtracking_ours(
-        ours,
-        theirs,
+        txs(ours),
+        txs(theirs),
         initial_conflict=log_merge.ConflictPair(
             ours_index=2,
             theirs_index=2,
@@ -762,7 +818,6 @@ def test_backtracking_keeps_larger_pairwise_candidate_when_smaller_prefix_is_sta
         ),
         context=conflict_context,
         conflict_detector=detector,
-        statement_applier=noop_applier,
     )
 
     assert candidate.name == "pairwise"
@@ -794,11 +849,10 @@ def test_backtracking_reports_standalone_when_no_earlier_prefix_exists(
     )
 
     candidate = log_merge.search_by_backtracking_ours(
-        ours,
-        theirs,
+        txs(ours),
+        txs(theirs),
         initial_conflict=first,
         context=conflict_context,
-        statement_applier=noop_applier,
     )
 
     assert candidate.name == "standalone_replay"
@@ -808,7 +862,7 @@ def test_backtracking_reports_standalone_when_no_earlier_prefix_exists(
     assert candidate.scope == "theirs"
 
 
-def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
+def test_replay_transaction_plan_applies_sql_and_appends_merge_log(tmp_path):
     base = tmp_path / "base.db"
     output = tmp_path / "merged.db"
     init_logged_db(base)
@@ -824,7 +878,7 @@ def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
         sql_text=sql_text,
     )
 
-    result = log_merge.replay_statement_plan(base, output, [statement])
+    result = log_merge.replay_transaction_plan(base, output, txs([statement]))
 
     assert result.ok
     with closing(sqlite3.connect(output)) as con:
@@ -840,7 +894,129 @@ def test_replay_statement_plan_applies_sql_and_appends_merge_log(tmp_path):
     ]
 
 
-def test_replay_statement_plan_reports_deferred_foreign_key_failure_in_loop(tmp_path):
+def test_replay_transaction_plan_preserves_transaction_log_boundaries(tmp_path):
+    base = tmp_path / "base.db"
+    output = tmp_path / "merged.db"
+    init_logged_db(base)
+
+    statements = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (1, 'Bob')",
+        ),
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=1,
+            log_id=2,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (2, 'Cara')",
+        ),
+    ]
+
+    result = log_merge.replay_transaction_plan(base, output, txs(statements))
+
+    assert result.ok
+    with closing(sqlite3.connect(output)) as con:
+        rows = con.execute(
+            f"""
+            SELECT transaction_id, to_replay_sql_text
+            FROM {log_merge.LOG_TABLE}
+            ORDER BY id
+            """
+        ).fetchall()
+
+    assert len({transaction_id for transaction_id, _ in rows}) == 1
+    assert [sql_text for _, sql_text in rows] == [
+        "INSERT INTO users (id, name) VALUES (1, 'Bob')",
+        "INSERT INTO users (id, name) VALUES (2, 'Cara')",
+    ]
+
+
+def test_replay_transaction_plan_keeps_same_id_branch_transactions_separate(tmp_path):
+    base = tmp_path / "base.db"
+    output = tmp_path / "merged.db"
+    init_logged_db(base)
+
+    statements = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (1, 'Local')",
+        ),
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            log_id=1,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (2, 'Remote')",
+        ),
+    ]
+
+    result = log_merge.replay_transaction_plan(
+        base,
+        output,
+        [
+            txs([statements[0]])[0],
+            txs([statements[1]])[0],
+        ],
+    )
+
+    assert result.ok
+    with closing(sqlite3.connect(output)) as con:
+        rows = con.execute(
+            f"""
+            SELECT transaction_id, to_replay_sql_text
+            FROM {log_merge.LOG_TABLE}
+            ORDER BY id
+            """
+        ).fetchall()
+
+    assert len({transaction_id for transaction_id, _ in rows}) == 2
+
+
+def test_replay_transaction_plan_rolls_back_failed_transaction_group(tmp_path):
+    base = tmp_path / "base.db"
+    output = tmp_path / "merged.db"
+    init_logged_db(base)
+
+    statements = [
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (1, 'Bob')",
+        ),
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=1,
+            log_id=2,
+            transaction_id=2,
+            committed_at="2026-01-02T00:00:00",
+            sql_text="INSERT INTO users (id, name) VALUES (1, 'Duplicate')",
+        ),
+    ]
+
+    result = log_merge.replay_transaction_plan(base, output, txs(statements))
+
+    assert not result.ok
+    assert result.applied_count == 0
+    with closing(sqlite3.connect(output)) as con:
+        assert con.execute("SELECT * FROM users").fetchall() == []
+        assert con.execute(f"SELECT * FROM {log_merge.LOG_TABLE}").fetchall() == []
+
+
+def test_replay_transaction_plan_reports_deferred_foreign_key_failure_in_loop(tmp_path):
     base = tmp_path / "base.db"
     output = tmp_path / "merged.db"
     with closing(sqlite3.connect(base)) as con:
@@ -878,10 +1054,10 @@ def test_replay_statement_plan_reports_deferred_foreign_key_failure_in_loop(tmp_
         sql_text=invalid_sql_text,
     )
 
-    result = log_merge.replay_statement_plan(
+    result = log_merge.replay_transaction_plan(
         base,
         output,
-        [valid_statement, invalid_statement],
+        txs([valid_statement, invalid_statement]),
     )
 
     assert not result.ok
@@ -904,7 +1080,7 @@ def test_replay_statement_plan_reports_deferred_foreign_key_failure_in_loop(tmp_
     assert log_rows == [(valid_sql_text,)]
 
 
-def test_replay_statement_plan_blocks_unsafe_replay_statement(tmp_path):
+def test_replay_transaction_plan_blocks_unsafe_replay_statement(tmp_path):
     base = tmp_path / "base.db"
     output = tmp_path / "merged.db"
     init_logged_db(base)
@@ -919,7 +1095,7 @@ def test_replay_statement_plan_blocks_unsafe_replay_statement(tmp_path):
         is_replay_safe=False,
     )
 
-    result = log_merge.replay_statement_plan(base, output, [statement])
+    result = log_merge.replay_transaction_plan(base, output, txs([statement]))
 
     assert not result.ok
     assert result.applied_count == 0
@@ -953,7 +1129,7 @@ def test_merge_session_serializes_compact_statement_handoff(tmp_path):
         base_db_path=base,
         merged_db_path=merged,
         base_transaction_id=0,
-        ours=[statement],
+        ours=log_merge.group_logged_transactions([statement]),
         theirs=[],
         replay=replay,
     )

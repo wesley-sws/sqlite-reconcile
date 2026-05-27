@@ -2,19 +2,36 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
-from collections import defaultdict
 from contextlib import closing
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Iterator, Sequence
+from dataclasses import asdict, replace
+from itertools import groupby
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 import uuid
 
 from sqlglot.errors import ParseError
 
-from .statement_metadata import (
-    StatementMetadata,
+from .models import (
+    BranchName,
+    ConflictCheckContext,
+    ConflictCheckResult,
+    ConflictDetector,
+    ConflictKind,
+    ConflictPair,
+    ConflictScope,
+    FrontierCandidate,
+    LoggedStatement,
+    LoggedTransaction,
+    MergeNotApplicableError,
+    MergePlan,
+    ReplayFailure,
+    ReplayResult,
+    StatementConflict,
+)
+from .sql_metadata import (
     parse_statement_metadata,
+    transaction_metadata,
     unsupported_statement_metadata,
 )
 from .utils import (
@@ -41,212 +58,13 @@ UPDATE_FROM_DUPLICATE_TARGET_WARNING = (
     "UPDATE FROM has multiple source rows for the same target row"
 )
 
-BranchName = Literal["ours", "theirs"]
-ConflictScope = Literal["pair", "ours", "theirs", "both"]
-ConflictKind = Literal[
-    "write_write",
-    "write_read",
-    "implicit_insert_key",
-    "integrity",
-    "non_commutative",
-    "replay_error",
-]
-
-
-@dataclass(frozen=True)
-class LoggedStatement:
-    branch: BranchName
-    branch_index: int
-    log_id: int
-    transaction_id: int
-    committed_at: str
-    original_sql_text: str
-    to_replay_sql_text: str
-    is_replay_safe: bool
-    replay_block_reason: str | None
-    metadata: StatementMetadata
-    replay_warnings: tuple[str, ...] = ()
-
-    @property
-    def sql_text(self) -> str:
-        """Return the deterministic SQL used for analysis and replay."""
-
-        return self.to_replay_sql_text
-
-
-@dataclass(frozen=True)
-class ConflictPair:
-    ours_index: int
-    theirs_index: int
-    ours_sql: str
-    theirs_sql: str
-    conflicts: tuple["StatementConflict", ...] = ()
-
-
-@dataclass(frozen=True)
-class ConflictCheckContext:
-    base_cursor: sqlite3.Cursor
-    base_db_path: str | Path
-    table_columns: TableColumns
-    primary_key_columns: TablePrimaryKeyColumns = field(default_factory=dict)
-    key_column_sets: TableKeyColumnSets = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class StatementConflict:
-    kind: ConflictKind
-    message: str
-    scope: ConflictScope = "pair"
-    details: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(init=False)
-class ConflictCheckResult:
-    conflicts_by_kind: defaultdict[ConflictKind, list[StatementConflict]]
-
-    def __init__(
-        self,
-        conflicts: Sequence[StatementConflict] = (),
-        *,
-        conflicts_by_kind: Mapping[
-            ConflictKind,
-            Sequence[StatementConflict],
-        ] | None = None,
-    ):
-        grouped: defaultdict[ConflictKind, list[StatementConflict]] = defaultdict(list)
-        if conflicts_by_kind is None:
-            for conflict in conflicts:
-                grouped[conflict.kind].append(conflict)
-        else:
-            for kind, kind_conflicts in conflicts_by_kind.items():
-                if kind_conflicts:
-                    grouped[kind] = list(kind_conflicts)
-
-        self.conflicts_by_kind = grouped
-
-    @property
-    def conflicts(self) -> tuple[StatementConflict, ...]:
-        """Return conflicts flattened in insertion order."""
-
-        return tuple(
-            conflict
-            for kind_conflicts in self.conflicts_by_kind.values()
-            for conflict in kind_conflicts
-        )
-
-    @property
-    def has_conflict(self) -> bool:
-        return bool(self.conflicts_by_kind)
-
-    def of_kind(self, kind: ConflictKind) -> tuple[StatementConflict, ...]:
-        """Return conflicts of one kind."""
-
-        return tuple(self.conflicts_by_kind.get(kind, ()))
-
-    def has_kind(self, kind: ConflictKind) -> bool:
-        """Return whether any conflicts of kind are present."""
-
-        return kind in self.conflicts_by_kind
-
-    def without_kind(self, kind: ConflictKind) -> ConflictCheckResult:
-        """Remove conflicts of kind and return this result."""
-
-        self.conflicts_by_kind.pop(kind, None)
-        return self
-
-    def replace_kind(
-        self,
-        kind: ConflictKind,
-        conflicts: Sequence[StatementConflict],
-    ) -> ConflictCheckResult:
-        """Replace conflicts of kind and return this result."""
-
-        self.conflicts_by_kind.pop(kind, None)
-        if conflicts:
-            self.conflicts_by_kind[kind] = list(conflicts)
-        return self
-
-    def add_conflicts(
-        self,
-        *conflicts: StatementConflict,
-    ) -> ConflictCheckResult:
-        """Append conflicts to their kind groups and return this result."""
-
-        for conflict in conflicts:
-            self.conflicts_by_kind[conflict.kind].append(conflict)
-        return self
-
-
-ConflictDetector = Callable[
-    [ConflictCheckContext, "LoggedStatement", "LoggedStatement"],
-    ConflictCheckResult,
-]
-StatementApplier = Callable[
-    [ConflictCheckContext, Sequence["LoggedStatement"]],
-    StatementConflict | None,
-]
-
 
 def default_conflict_detector() -> ConflictDetector:
     """Load the default detector lazily to avoid circular imports."""
 
-    from .conflict_detection import statements_conflict
+    from .conflict_detection import transactions_conflict
 
-    return statements_conflict
-
-
-@dataclass(frozen=True)
-class FrontierCandidate:
-    name: str
-    ours_count: int
-    theirs_count: int
-    next_conflict: ConflictPair | None
-    scope: ConflictScope = "pair"
-
-    @property
-    def score(self) -> int:
-        return self.ours_count + self.theirs_count
-
-
-@dataclass(frozen=True)
-class ReplayFailure:
-    statement: dict[str, object] | None
-    error: str
-
-
-@dataclass(frozen=True)
-class ReplayResult:
-    ok: bool
-    output_path: str
-    applied_count: int
-    failure: ReplayFailure | None = None
-    integrity_errors: list[str] | None = None
-
-
-@dataclass(frozen=True)
-class MergePlan:
-    status: Literal["clean", "conflict"]
-    base_transaction_id: int
-    ours: list[LoggedStatement]
-    theirs: list[LoggedStatement]
-    selected: FrontierCandidate
-    statement_plan: list[LoggedStatement]
-    first_conflict: ConflictPair | None = None
-    candidates: list[FrontierCandidate] | None = None
-
-
-class MergeNotApplicableError(Exception):
-    """Raised when a database was not prepared with sqlite-reconcile logging."""
-
-    def __init__(self, db_path: str | Path, role: str, missing_tables: Sequence[str]):
-        self.db_path = str(db_path)
-        self.role = role
-        self.missing_tables = list(missing_tables)
-        missing = ", ".join(self.missing_tables)
-        super().__init__(
-            f"{role} database is not applicable for log-based SQLite merge: "
-            f"{self.db_path} is missing {missing}"
-        )
+    return transactions_conflict
 
 
 def make_logged_statement(
@@ -383,6 +201,26 @@ def load_logged_statements(
     ]
 
 
+def load_logged_transactions(
+    cursor: sqlite3.Cursor,
+    branch: BranchName,
+    since_transaction_id: int,
+    db_path: str | Path,
+    table_columns: TableColumns | None = None,
+) -> list[LoggedTransaction]:
+    """Load branch log entries grouped by committed transaction."""
+
+    return group_logged_transactions(
+        load_logged_statements(
+            cursor,
+            branch,
+            since_transaction_id,
+            db_path,
+            table_columns,
+        )
+    )
+
+
 def load_schema_metadata(
     cursor: sqlite3.Cursor,
 ) -> tuple[TableColumns, TablePrimaryKeyColumns, TableKeyColumnSets]:
@@ -411,13 +249,13 @@ def load_merge_inputs(
     theirs_db_path: str | Path,
 ) -> tuple[
     int,
-    list[LoggedStatement],
-    list[LoggedStatement],
+    list[LoggedTransaction],
+    list[LoggedTransaction],
     TableColumns,
     TablePrimaryKeyColumns,
     TableKeyColumnSets,
 ]:
-    """Load logged branch statements and schema metadata for one merge."""
+    """Load logged branch transactions and schema metadata for one merge."""
 
     with closing(sqlite3.connect(base_db_path)) as base_conn, \
          closing(sqlite3.connect(ours_db_path)) as ours_conn, \
@@ -431,14 +269,14 @@ def load_merge_inputs(
             base_cursor,
         )
         base_transaction_id = get_base_watermark(base_cursor, base_db_path)
-        ours = load_logged_statements(
+        ours = load_logged_transactions(
             ours_conn.cursor(),
             "ours",
             base_transaction_id,
             ours_db_path,
             table_columns=table_columns,
         )
-        theirs = load_logged_statements(
+        theirs = load_logged_transactions(
             theirs_conn.cursor(),
             "theirs",
             base_transaction_id,
@@ -456,9 +294,51 @@ def load_merge_inputs(
     )
 
 
-def _conflict_pair(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+def group_logged_transactions(
+    statements: Sequence[LoggedStatement],
+) -> list[LoggedTransaction]:
+    """Group consecutive logged statements by transaction id."""
+
+    return [
+        _logged_transaction(list(group), branch_index=index)
+        for index, (_, group) in enumerate(
+            groupby(statements, key=lambda statement: statement.transaction_id)
+        )
+    ]
+
+
+def flatten_transactions(
+    transactions: Sequence[LoggedTransaction],
+) -> Iterator[LoggedStatement]:
+    """Yield all statements from transactions in transaction order."""
+
+    for transaction in transactions:
+        yield from transaction.statements
+
+
+def _logged_transaction(
+    statements: Sequence[LoggedStatement],
+    *,
+    branch_index: int,
+) -> LoggedTransaction:
+    """Build one transaction wrapper from a non-empty statement sequence."""
+
+    first = statements[0]
+    return LoggedTransaction(
+        branch=first.branch,
+        branch_index=branch_index,
+        transaction_id=first.transaction_id,
+        committed_at=first.committed_at,
+        statements=tuple(statements),
+        metadata=transaction_metadata(
+            statement.metadata for statement in statements
+        ),
+    )
+
+
+def _transaction_conflict_pair(
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     ours_index: int,
     theirs_index: int,
     result: ConflictCheckResult | None = None,
@@ -475,26 +355,33 @@ def _conflict_pair(
 
 
 def find_first_pairwise_conflict(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector | None = None,
-    statement_applier: StatementApplier | None = None,
 ) -> ConflictPair | None:
-    """Compare X1/Y1, X2/Y2, ..., applying clean pairs as it advances."""
+    """Compare X1/Y1, X2/Y2, ..., applying clean transaction pairs."""
 
     conflict_detector = conflict_detector or default_conflict_detector()
-    statement_applier = statement_applier or apply_statement_sequence
-    for index, (ours_statement, theirs_statement) in enumerate(zip(ours, theirs)):
-        result = conflict_detector(context, ours_statement, theirs_statement)
+    for index, (ours_tx, theirs_tx) in enumerate(zip(ours, theirs)):
+        result = conflict_detector(context, ours_tx, theirs_tx)
         if result.has_conflict:
-            return _conflict_pair(ours, theirs, index, index, result)
+            return _transaction_conflict_pair(
+                ours,
+                theirs,
+                index,
+                index,
+                result,
+            )
 
         # Execution-based checks for later pairs must see earlier accepted
         # effects, so planning advances the working database after each clean pair.
-        replay_error = statement_applier(context, (ours_statement, theirs_statement))
+        replay_error = apply_statement_sequence(
+            context,
+            (*ours_tx.statements, *theirs_tx.statements),
+        )
         if replay_error is not None:
-            return _conflict_pair(
+            return _transaction_conflict_pair(
                 ours,
                 theirs,
                 index,
@@ -509,8 +396,8 @@ def apply_statement_sequence(
     statements: Sequence[LoggedStatement],
 ) -> StatementConflict | None:
     """
-    The conflict detector checks the current pair, but prefix replay can still 
-    fail because the greedy algorithm does not validate every cross-branch pair 
+    The conflict detector checks the current pair, but prefix replay can still
+    fail because the greedy algorithm does not validate every cross-branch pair
     inside the prefix.
     """
 
@@ -527,34 +414,45 @@ def apply_statement_sequence(
     return None
 
 
+def apply_transaction_sequence(
+    context: ConflictCheckContext,
+    transactions: Sequence[LoggedTransaction],
+) -> StatementConflict | None:
+    """Apply transactions in order while preserving each transaction's statements."""
+
+    return apply_statement_sequence(
+        context,
+        list(flatten_transactions(transactions)),
+    )
+
+
 def _conflict_after_prefix(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
-    ours_index: int,
-    theirs_index: int,
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
+    ours_transaction: LoggedTransaction,
+    theirs_transaction: LoggedTransaction,
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector,
-    statement_applier: StatementApplier,
 ) -> ConflictCheckResult:
     """Check one pair after applying the prefix that would precede it."""
 
-    prefix = ordered_statement_plan(
+    prefix = ordered_transaction_plan(
         ours,
         theirs,
         FrontierCandidate(
             name="prefix",
-            ours_count=ours_index,
-            theirs_count=theirs_index,
+            ours_count=ours_transaction.branch_index,
+            theirs_count=theirs_transaction.branch_index,
             next_conflict=None,
         ),
     )
     savepoint = f"sqlite_merge_backtrack_{uuid.uuid4().hex}"
     context.base_cursor.execute(f"SAVEPOINT {savepoint}")
     try:
-        replay_error = statement_applier(context, prefix)
+        replay_error = apply_transaction_sequence(context, prefix)
         if replay_error is not None:
             return ConflictCheckResult((replay_error,))
-        return conflict_detector(context, ours[ours_index], theirs[theirs_index])
+        return conflict_detector(context, ours_transaction, theirs_transaction)
     finally:
         rollback_savepoint(context.base_cursor, savepoint)
 
@@ -577,12 +475,11 @@ def _frontier_candidate(
 
 
 def search_by_backtracking_ours(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     initial_conflict: ConflictPair,
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector | None = None,
-    statement_applier: StatementApplier | None = None,
 ) -> FrontierCandidate:
     """
     Keep backing up the local side and advance the remote side.
@@ -593,14 +490,13 @@ def search_by_backtracking_ours(
     remote side is exhausted.
     """
     conflict_detector = conflict_detector or default_conflict_detector()
-    statement_applier = statement_applier or apply_statement_sequence
     candidates = _initial_frontier_candidates(
         initial_conflict,
         fixed_branch="theirs",
     )
-    ours_index = initial_conflict.ours_index - 1
-    theirs_index = initial_conflict.theirs_index
-    if ours_index < 0 and not candidates:
+    ours_tx_index = initial_conflict.ours_index - 1
+    theirs_tx_index = initial_conflict.theirs_index
+    if ours_tx_index < 0 and not candidates:
         return _frontier_candidate(
             "standalone_replay",
             initial_conflict.ours_index,
@@ -608,61 +504,63 @@ def search_by_backtracking_ours(
             initial_conflict,
         )
 
-    while ours_index >= 0 and theirs_index < len(theirs):
+    while ours_tx_index >= 0 and theirs_tx_index < len(theirs):
+        ours_transaction = ours[ours_tx_index]
+        theirs_transaction = theirs[theirs_tx_index]
         result = _conflict_after_prefix(
             ours,
             theirs,
-            ours_index,
-            theirs_index,
+            ours_transaction,
+            theirs_transaction,
             context,
             conflict_detector,
-            statement_applier,
         )
         if result.has_conflict:
             if "theirs" in _standalone_replay_branches(result):
                 # Do not treat this as a pair conflict: the remote statement is
                 # blocked before the local candidate is applied.
-                if ours_index == 0:
+                if ours_tx_index == 0:
                     candidates.append(
                         _frontier_candidate(
                             "standalone_replay",
-                            ours_index,
-                            theirs_index,
-                            _conflict_pair(
+                            ours_tx_index,
+                            theirs_tx_index,
+                            _transaction_conflict_pair(
                                 ours,
                                 theirs,
-                                ours_index,
-                                theirs_index,
+                                ours_tx_index,
+                                theirs_tx_index,
                                 result,
                             ),
                         )
                     )
-                ours_index -= 1
+                ours_tx_index -= 1
                 continue
 
             candidates.append(
                 _frontier_candidate(
                     "backtrack_ours",
-                    ours_index,
-                    theirs_index,
-                    _conflict_pair(
+                    ours_tx_index,
+                    theirs_tx_index,
+                    _transaction_conflict_pair(
                         ours,
                         theirs,
-                        ours_index,
-                        theirs_index,
+                        ours_tx_index,
+                        theirs_tx_index,
                         result,
                     ),
                 )
             )
-            ours_index -= 1
+            ours_tx_index -= 1
             continue
-        theirs_index += 1
+        theirs_tx_index += 1
 
-    if theirs_index >= len(theirs):
+    if theirs_tx_index >= len(theirs):
+        ours_count = max(ours_tx_index, 0)
         candidates.append(
             FrontierCandidate(
                 name="backtrack_ours",
-                ours_count=ours_index,
+                ours_count=ours_count,
                 theirs_count=len(theirs),
                 next_conflict=None,
             )
@@ -671,24 +569,22 @@ def search_by_backtracking_ours(
 
 
 def search_by_backtracking_theirs(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     initial_conflict: ConflictPair,
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector | None = None,
-    statement_applier: StatementApplier | None = None,
 ) -> FrontierCandidate:
     """Mirror of search_by_backtracking_ours, keeping more local statements."""
 
     conflict_detector = conflict_detector or default_conflict_detector()
-    statement_applier = statement_applier or apply_statement_sequence
     candidates = _initial_frontier_candidates(
         initial_conflict,
         fixed_branch="ours",
     )
-    theirs_index = initial_conflict.theirs_index - 1
-    ours_index = initial_conflict.ours_index
-    if theirs_index < 0 and not candidates:
+    theirs_tx_index = initial_conflict.theirs_index - 1
+    ours_tx_index = initial_conflict.ours_index
+    if theirs_tx_index < 0 and not candidates:
         return _frontier_candidate(
             "standalone_replay",
             initial_conflict.ours_index,
@@ -696,62 +592,64 @@ def search_by_backtracking_theirs(
             initial_conflict,
         )
 
-    while theirs_index >= 0 and ours_index < len(ours):
+    while theirs_tx_index >= 0 and ours_tx_index < len(ours):
+        ours_transaction = ours[ours_tx_index]
+        theirs_transaction = theirs[theirs_tx_index]
         result = _conflict_after_prefix(
             ours,
             theirs,
-            ours_index,
-            theirs_index,
+            ours_transaction,
+            theirs_transaction,
             context,
             conflict_detector,
-            statement_applier,
         )
         if result.has_conflict:
             if "ours" in _standalone_replay_branches(result):
                 # Do not treat this as a pair conflict: the local statement is
                 # blocked before the remote candidate is applied.
-                if theirs_index == 0:
+                if theirs_tx_index == 0:
                     candidates.append(
                         _frontier_candidate(
                             "standalone_replay",
-                            ours_index,
-                            theirs_index,
-                            _conflict_pair(
+                            ours_tx_index,
+                            theirs_tx_index,
+                            _transaction_conflict_pair(
                                 ours,
                                 theirs,
-                                ours_index,
-                                theirs_index,
+                                ours_tx_index,
+                                theirs_tx_index,
                                 result,
                             ),
                         )
                     )
-                theirs_index -= 1
+                theirs_tx_index -= 1
                 continue
 
             candidates.append(
                 _frontier_candidate(
                     "backtrack_theirs",
-                    ours_index,
-                    theirs_index,
-                    _conflict_pair(
+                    ours_tx_index,
+                    theirs_tx_index,
+                    _transaction_conflict_pair(
                         ours,
                         theirs,
-                        ours_index,
-                        theirs_index,
+                        ours_tx_index,
+                        theirs_tx_index,
                         result,
                     ),
                 )
             )
-            theirs_index -= 1
+            theirs_tx_index -= 1
             continue
-        ours_index += 1
+        ours_tx_index += 1
 
-    if ours_index >= len(ours):
+    if ours_tx_index >= len(ours):
+        theirs_count = max(theirs_tx_index, 0)
         candidates.append(
             FrontierCandidate(
                 name="backtrack_theirs",
                 ours_count=len(ours),
-                theirs_count=theirs_index,
+                theirs_count=theirs_count,
                 next_conflict=None,
             )
         )
@@ -760,8 +658,6 @@ def search_by_backtracking_theirs(
 
 def choose_frontier(candidates: Sequence[FrontierCandidate]) -> FrontierCandidate:
     """Pick the candidate with the most applied statements, then the least skew."""
-    for candidate in candidates:
-        print(candidate.ours_count + 1, candidate.theirs_count + 1)
     return max(
         candidates,
         key=lambda candidate: (
@@ -792,17 +688,15 @@ def _initial_frontier_candidates(
 
 
 def frontier_candidates_for_conflict(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     first_conflict: ConflictPair,
     context: ConflictCheckContext,
     conflict_detector: ConflictDetector | None = None,
-    statement_applier: StatementApplier | None = None,
 ) -> list[FrontierCandidate]:
     """Return candidate stopping points for a detected conflict."""
 
     conflict_detector = conflict_detector or default_conflict_detector()
-    statement_applier = statement_applier or apply_statement_sequence
 
     return [
         search_by_backtracking_ours(
@@ -811,7 +705,6 @@ def frontier_candidates_for_conflict(
             first_conflict,
             context,
             conflict_detector,
-            statement_applier,
         ),
         search_by_backtracking_theirs(
             ours,
@@ -819,7 +712,6 @@ def frontier_candidates_for_conflict(
             first_conflict,
             context,
             conflict_detector,
-            statement_applier,
         ),
     ]
 
@@ -829,13 +721,13 @@ def _standalone_replay_branches(
 ) -> set[BranchName]:
     """Return branches blocked by already-replayed state, not by the pair."""
 
-    conflicts = conflict.conflicts
-    return {
-        statement_conflict.scope
-        for statement_conflict in conflicts
-        if statement_conflict.kind in {"integrity", "replay_error"}
-        and statement_conflict.scope in {"ours", "theirs"}
-    } # type: ignore
+    branches: set[BranchName] = set()
+    for statement_conflict in conflict.conflicts:
+        if statement_conflict.kind not in {"integrity", "replay_error"}:
+            continue
+        if statement_conflict.scope in {"ours", "theirs"}:
+            branches.add(statement_conflict.scope)
+    return branches
 
 
 def _conflict_scope(conflict: ConflictPair | ConflictCheckResult) -> ConflictScope:
@@ -853,20 +745,32 @@ def _conflict_scope(conflict: ConflictPair | ConflictCheckResult) -> ConflictSco
     return "pair"
 
 
+def ordered_transaction_plan(
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
+    frontier: FrontierCandidate,
+) -> list[LoggedTransaction]:
+    """Return the replay order used by planning: X1, Y1, X2, Y2 by transaction."""
+
+    plan: list[LoggedTransaction] = []
+    ours_prefix = ours[:frontier.ours_count]
+    theirs_prefix = theirs[:frontier.theirs_count]
+    for index in range(max(len(ours_prefix), len(theirs_prefix))):
+        if index < len(ours_prefix):
+            plan.append(ours_prefix[index])
+        if index < len(theirs_prefix):
+            plan.append(theirs_prefix[index])
+    return plan
+
+
 def ordered_statement_plan(
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     frontier: FrontierCandidate,
 ) -> list[LoggedStatement]:
-    """Return the replay order used by pairwise planning: X1, Y1, X2, Y2."""
+    """Return the ordered transaction prefix flattened to statements."""
 
-    plan: list[LoggedStatement] = []
-    for index in range(max(frontier.ours_count, frontier.theirs_count)):
-        if index < frontier.ours_count:
-            plan.append(ours[index])
-        if index < frontier.theirs_count:
-            plan.append(theirs[index])
-    return plan
+    return list(flatten_transactions(ordered_transaction_plan(ours, theirs, frontier)))
 
 
 def _replay_error_conflict(error: sqlite3.Error, scope: BranchName) -> StatementConflict:
@@ -877,6 +781,14 @@ def _replay_error_conflict(error: sqlite3.Error, scope: BranchName) -> Statement
         message=str(error),
         scope=scope,
     )
+
+
+def _statement_conflict_details(
+    statement: LoggedStatement,
+) -> tuple[tuple[str, str], ...]:
+    """Return conflict metadata that lets the UI find the failing statement."""
+
+    return (("statement_log_id", str(statement.log_id)),)
 
 
 def _validation_error_conflict(errors: list[str], scope: BranchName) -> StatementConflict:
@@ -891,9 +803,8 @@ def _validation_error_conflict(errors: list[str], scope: BranchName) -> Statemen
 
 def _standalone_replay_failure_frontier(
     base_conn: sqlite3.Connection,
-    ours: Sequence[LoggedStatement],
-    theirs: Sequence[LoggedStatement],
-    statement_plan: Sequence[LoggedStatement],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
 ) -> FrontierCandidate | None:
     """Return the first standalone failure found while replaying a plan."""
 
@@ -903,71 +814,109 @@ def _standalone_replay_failure_frontier(
         base_conn.backup(replay_conn)
         replay_conn.execute("PRAGMA foreign_keys = ON")
 
-        for statement in statement_plan:
-            if statement.branch == "ours":
-                statement_ours_index = ours_count
-                statement_theirs_index = max(min(theirs_count, len(theirs) - 1), 0)
-            else:
-                statement_ours_index = max(min(ours_count, len(ours) - 1), 0)
-                statement_theirs_index = theirs_count
-
-            try:
-                replay_conn.execute(statement.sql_text)
-            except sqlite3.Error as exc:
-                conflict = ConflictPair(
-                    ours_index=statement_ours_index,
-                    theirs_index=statement_theirs_index,
-                    ours_sql=(
-                        ours[statement_ours_index].original_sql_text
-                        if ours else ""
-                    ),
-                    theirs_sql=(
-                        theirs[statement_theirs_index].original_sql_text
-                        if theirs else ""
-                    ),
-                    conflicts=(
-                        _replay_error_conflict(exc, statement.branch),
-                    ),
+        for index in range(max(len(ours), len(theirs))):
+            if index < len(ours):
+                failure = _standalone_replay_failure_for_transaction(
+                    replay_conn,
+                    "ours",
+                    ours[index],
+                    ours,
+                    theirs,
+                    ours_count,
+                    theirs_count,
                 )
-                return FrontierCandidate(
-                    name="standalone_replay",
-                    ours_count=ours_count,
-                    theirs_count=theirs_count,
-                    next_conflict=conflict,
-                    scope=statement.branch,
-                )
-
-            validation_errors = validate_database(replay_conn)
-            if validation_errors:
-                conflict = ConflictPair(
-                    ours_index=statement_ours_index,
-                    theirs_index=statement_theirs_index,
-                    ours_sql=(
-                        ours[statement_ours_index].original_sql_text
-                        if ours else ""
-                    ),
-                    theirs_sql=(
-                        theirs[statement_theirs_index].original_sql_text
-                        if theirs else ""
-                    ),
-                    conflicts=(
-                        _validation_error_conflict(validation_errors, statement.branch),
-                    ),
-                )
-                return FrontierCandidate(
-                    name="standalone_replay",
-                    ours_count=ours_count,
-                    theirs_count=theirs_count,
-                    next_conflict=conflict,
-                    scope=statement.branch,
-                )
-
-            if statement.branch == "ours":
+                if failure is not None:
+                    return failure
                 ours_count += 1
-            else:
+
+            if index < len(theirs):
+                failure = _standalone_replay_failure_for_transaction(
+                    replay_conn,
+                    "theirs",
+                    theirs[index],
+                    ours,
+                    theirs,
+                    ours_count,
+                    theirs_count,
+                )
+                if failure is not None:
+                    return failure
                 theirs_count += 1
 
     return None
+
+
+def _standalone_replay_failure_for_transaction(
+    con: sqlite3.Connection,
+    branch: BranchName,
+    transaction: LoggedTransaction,
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
+    ours_count: int,
+    theirs_count: int,
+) -> FrontierCandidate | None:
+    """Return a standalone failure if one transaction cannot replay."""
+
+    try:
+        for statement in transaction.statements:
+            con.execute(statement.sql_text)
+    except sqlite3.Error as exc:
+        return _standalone_replay_failure_candidate(
+            branch,
+            ours,
+            theirs,
+            ours_count,
+            theirs_count,
+            transaction,
+            replace(
+                _replay_error_conflict(exc, branch),
+                details=_statement_conflict_details(statement),
+            ),
+        )
+
+    validation_errors = validate_database(con)
+    if validation_errors:
+        return _standalone_replay_failure_candidate(
+            branch,
+            ours,
+            theirs,
+            ours_count,
+            theirs_count,
+            transaction,
+            _validation_error_conflict(validation_errors, branch),
+        )
+    return None
+
+
+def _standalone_replay_failure_candidate(
+    branch: BranchName,
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
+    ours_count: int,
+    theirs_count: int,
+    transaction: LoggedTransaction,
+    conflict: StatementConflict,
+) -> FrontierCandidate:
+    """Build a standalone replay frontier for one failing transaction."""
+
+    ours_index = transaction.branch_index if branch == "ours" else max(ours_count - 1, 0)
+    theirs_index = (
+        transaction.branch_index if branch == "theirs" else max(theirs_count - 1, 0)
+    )
+    pair = ConflictPair(
+        ours_index=ours_index,
+        theirs_index=theirs_index,
+        ours_sql=ours[ours_index].original_sql_text if ours else "",
+        theirs_sql=theirs[theirs_index].original_sql_text if theirs else "",
+        conflicts=(conflict,),
+    )
+    return FrontierCandidate(
+        name="standalone_replay",
+        ours_count=ours_count,
+        theirs_count=theirs_count,
+        next_conflict=pair,
+        scope=branch,
+    )
 
 
 def build_merge_plan(
@@ -1006,8 +955,8 @@ def build_merge_plan_from_connection(
     base_conn: sqlite3.Connection,
     base_db_path: str,
     base_transaction_id: int,
-    ours: list[LoggedStatement],
-    theirs: list[LoggedStatement],
+    ours: list[LoggedTransaction],
+    theirs: list[LoggedTransaction],
     table_columns: TableColumns,
     primary_key_columns: TablePrimaryKeyColumns,
     key_column_sets: TableKeyColumnSets,
@@ -1046,12 +995,11 @@ def build_merge_plan_from_connection(
             theirs_count=len(theirs),
             next_conflict=None,
         )
-        statement_plan = ordered_statement_plan(ours, theirs, selected)
+        transaction_plan = ordered_transaction_plan(ours, theirs, selected)
         replay_failure = _standalone_replay_failure_frontier(
             base_conn,
             ours,
             theirs,
-            statement_plan,
         )
         if replay_failure is not None:
             return MergePlan(
@@ -1060,7 +1008,11 @@ def build_merge_plan_from_connection(
                 ours=ours,
                 theirs=theirs,
                 selected=replay_failure,
-                statement_plan=ordered_statement_plan(ours, theirs, replay_failure),
+                transaction_plan=ordered_transaction_plan(
+                    ours,
+                    theirs,
+                    replay_failure,
+                ),
                 first_conflict=replay_failure.next_conflict,
                 candidates=[replay_failure],
             )
@@ -1071,7 +1023,7 @@ def build_merge_plan_from_connection(
             ours=ours,
             theirs=theirs,
             selected=selected,
-            statement_plan=statement_plan,
+            transaction_plan=transaction_plan,
         )
 
     if not search_frontier:
@@ -1088,7 +1040,7 @@ def build_merge_plan_from_connection(
             ours=ours,
             theirs=theirs,
             selected=selected,
-            statement_plan=ordered_statement_plan(ours, theirs, selected),
+            transaction_plan=ordered_transaction_plan(ours, theirs, selected),
             first_conflict=first_conflict,
         )
 
@@ -1119,19 +1071,22 @@ def build_merge_plan_from_connection(
         ours=ours,
         theirs=theirs,
         selected=selected,
-        statement_plan=ordered_statement_plan(ours, theirs, selected),
+        transaction_plan=ordered_transaction_plan(ours, theirs, selected),
         first_conflict=first_conflict,
         candidates=candidates,
     )
 
 
-def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) -> None:
-    """Record a replayed statement in the output database's merge log."""
+def _append_replayed_log(
+    con: sqlite3.Connection,
+    statements: Sequence[LoggedStatement],
+) -> None:
+    """Record one replayed transaction group in the output database's merge log."""
 
     cursor = con.execute(
         f"INSERT INTO {TX_TABLE} DEFAULT VALUES",
     )
-    con.execute(
+    con.executemany(
         f"""
         INSERT INTO {LOG_TABLE} (
             transaction_id,
@@ -1142,13 +1097,16 @@ def _append_replayed_log(con: sqlite3.Connection, statement: LoggedStatement) ->
         )
         VALUES (?, ?, ?, ?, ?)
         """,
-        (
-            cursor.lastrowid,
-            statement.original_sql_text,
-            statement.to_replay_sql_text,
-            int(statement.is_replay_safe),
-            statement.replay_block_reason,
-        ),
+        [
+            (
+                cursor.lastrowid,
+                statement.original_sql_text,
+                statement.to_replay_sql_text,
+                int(statement.is_replay_safe),
+                statement.replay_block_reason,
+            )
+            for statement in statements
+        ],
     )
 
 
@@ -1166,19 +1124,30 @@ def validate_database(con: sqlite3.Connection) -> list[str]:
     return errors
 
 
-def replay_statement_plan(
+def replay_transaction_plan(
     base_db_path: str | Path,
     output_db_path: str | Path,
-    statement_plan: Sequence[LoggedStatement],
+    transaction_plan: Sequence[LoggedTransaction],
 ) -> ReplayResult:
+    """Replay an ordered transaction plan into a fresh output database."""
+
     output_path = Path(output_db_path)
     shutil.copy2(base_db_path, output_path)
+    total_statements = sum(
+        len(transaction.statements) for transaction in transaction_plan
+    )
 
     with closing(sqlite3.connect(output_path)) as con:
         con.execute("PRAGMA foreign_keys = ON")
 
-        for applied_count, statement in enumerate(statement_plan):
-            if not statement.is_replay_safe:
+        applied_count = 0
+        for group_index, transaction in enumerate(transaction_plan):
+            statements = transaction.statements
+            unsafe_statement = next(
+                (statement for statement in statements if not statement.is_replay_safe),
+                None,
+            )
+            if unsafe_statement is not None:
                 # Planning should already exclude unsafe statements, but replay
                 # is the final guard before mutating the output database.
                 return ReplayResult(
@@ -1186,20 +1155,21 @@ def replay_statement_plan(
                     output_path=str(output_path),
                     applied_count=applied_count,
                     failure=ReplayFailure(
-                        statement=asdict(statement),
+                        statement=asdict(unsafe_statement),
                         error=(
-                            statement.replay_block_reason
+                            unsafe_statement.replay_block_reason
                             or "statement is unsafe for automatic replay"
                         ),
                     ),
                 )
 
-            savepoint_name = f"replay_statement_{applied_count}"
+            savepoint_name = f"replay_transaction_{group_index}"
             con.execute(f"SAVEPOINT {savepoint_name}")
             try:
-                con.execute(statement.sql_text)
+                for statement in statements:
+                    con.execute(statement.sql_text)
                 # Some problems, especially deferred foreign keys, are only
-                # visible after SQLite accepts the statement itself.
+                # visible after SQLite accepts the transaction statements.
                 integrity_errors = validate_database(con)
                 if integrity_errors:
                     rollback_savepoint(con, savepoint_name)
@@ -1208,13 +1178,14 @@ def replay_statement_plan(
                         output_path=str(output_path),
                         applied_count=applied_count,
                         failure=ReplayFailure(
-                            statement=asdict(statement),
-                            error="database validation failed after statement",
+                            statement=asdict(statements[-1]),
+                            error="database validation failed after transaction",
                         ),
                         integrity_errors=integrity_errors,
                     )
-                _append_replayed_log(con, statement)
+                _append_replayed_log(con, statements)
                 con.execute(f"RELEASE {savepoint_name}")
+                applied_count += len(statements)
             except sqlite3.Error as exc:
                 rollback_savepoint(con, savepoint_name)
                 return ReplayResult(
@@ -1222,7 +1193,7 @@ def replay_statement_plan(
                     output_path=str(output_path),
                     applied_count=applied_count,
                     failure=ReplayFailure(
-                        statement=asdict(statement),
+                        statement=asdict(statements[-1]),
                         error=str(exc),
                     ),
                 )
@@ -1232,5 +1203,5 @@ def replay_statement_plan(
     return ReplayResult(
         ok=True,
         output_path=str(output_path),
-        applied_count=len(statement_plan),
+        applied_count=total_statements,
     )

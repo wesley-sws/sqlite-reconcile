@@ -1,14 +1,15 @@
 """
-The metadata records:
-- the table written by INSERT, UPDATE, or DELETE;
-- the columns assigned by UPDATE;
-- tables and columns read by the statement - represented as a dictionary.
+SQL metadata used by merge analysis.
+
+Statement metadata records one SQL statement's reads and writes. Transaction
+metadata aggregates those statement-level facts across a transaction.
 """
 
 from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import sqlglot
@@ -51,6 +52,36 @@ class StatementMetadata:
     table_updated: str | None
     columns_updated: set[str]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
+
+
+@dataclass(frozen=True)
+class TransactionMetadata:
+    """Statement metadata plus aggregate transaction-level read/write sets."""
+
+    statements: tuple[StatementMetadata, ...]
+    tables_updated_to_columns_updated: dict[str, set[str]]
+    tables_referenced_to_columns_referenced: dict[str, set[str]]
+
+
+def transaction_metadata(
+    statements: Sequence[StatementMetadata],
+) -> TransactionMetadata:
+    """Aggregate statement metadata into transaction-level metadata."""
+
+    statement_tuple = tuple(statements)
+    updated: defaultdict[str, set[str]] = defaultdict(set)
+    referenced: defaultdict[str, set[str]] = defaultdict(set)
+    for statement in statement_tuple:
+        if statement.table_updated is not None:
+            updated[statement.table_updated].update(statement.columns_updated)
+        for table, columns in statement.tables_referenced_to_columns_referenced.items():
+            referenced[table].update(columns)
+
+    return TransactionMetadata(
+        statements=statement_tuple,
+        tables_updated_to_columns_updated=dict(updated),
+        tables_referenced_to_columns_referenced=dict(referenced),
+    )
 
 
 def parse_statement_metadata(

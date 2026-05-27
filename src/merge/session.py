@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .log_merge import (
-    BranchName,
     LoggedStatement,
+    LoggedTransaction,
     MergeNotApplicableError,
     ReplayResult,
 )
@@ -31,7 +31,6 @@ def _statement_payload(statement: LoggedStatement) -> dict[str, object]:
         "branch_index": statement.branch_index,
         "log_id": statement.log_id,
         "transaction_id": statement.transaction_id,
-        "committed_at": statement.committed_at,
         "original_sql_text": statement.original_sql_text,
         "to_replay_sql_text": statement.to_replay_sql_text,
         "is_replay_safe": statement.is_replay_safe,
@@ -41,28 +40,21 @@ def _statement_payload(statement: LoggedStatement) -> dict[str, object]:
 
 
 def _transactions_payload(
-    statements: list[LoggedStatement],
+    transactions: list[LoggedTransaction],
 ) -> list[dict[str, object]]:
-    """Group logged statements by transaction id for UI display."""
+    """Return compact transaction data for UI display."""
 
-    transactions: list[dict[str, object]] = []
-    transaction_by_id: dict[int, dict[str, object]] = {}
-    for statement in statements:
-        transaction = transaction_by_id.get(statement.transaction_id)
-        if transaction is None:
-            transaction = {
-                "transaction_id": statement.transaction_id,
-                "committed_at": statement.committed_at,
-                "statements": [],
-            }
-            transaction_by_id[statement.transaction_id] = transaction
-            transactions.append(transaction)
-
-        statement_payloads = transaction["statements"]
-        if isinstance(statement_payloads, list):
-            statement_payloads.append(_statement_payload(statement))
-
-    return transactions
+    return [
+        {
+            "transaction_id": transaction.transaction_id,
+            "committed_at": transaction.committed_at,
+            "statements": [
+                _statement_payload(statement)
+                for statement in transaction.statements
+            ],
+        }
+        for transaction in transactions
+    ]
 
 
 def _json_default(value: object) -> object:
@@ -80,8 +72,8 @@ def write_merge_session(
     base_db_path: str | Path,
     merged_db_path: str | Path,
     base_transaction_id: int,
-    ours: list[LoggedStatement],
-    theirs: list[LoggedStatement],
+    ours: list[LoggedTransaction],
+    theirs: list[LoggedTransaction],
     replay: ReplayResult | None = None,
 ) -> None:
     """Write a compact resolver handoff file plus a stable base snapshot."""

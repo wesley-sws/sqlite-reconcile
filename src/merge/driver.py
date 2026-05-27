@@ -22,9 +22,10 @@ from .log_merge import (
     acknowledgeable_replay_warning,
     build_merge_plan_from_connection,
     default_conflict_detector,
+    flatten_transactions,
+    group_logged_transactions,
     load_merge_inputs,
-    load_schema_metadata,
-    replay_statement_plan,
+    replay_transaction_plan,
     validate_database,
 )
 from .session import write_merge_session, write_not_applicable_session
@@ -78,12 +79,12 @@ def _with_replay_warning(
 def _update_from_warning(
     con: sqlite3.Connection,
     statement: LoggedStatement,
+    table_columns,
+    primary_key_columns,
+    key_column_sets,
 ) -> str | None:
     """Return an UPDATE FROM warning for the branch-local current state."""
 
-    table_columns, primary_key_columns, key_column_sets = load_schema_metadata(
-        con.cursor(),
-    )
     context = ConflictCheckContext(
         base_cursor=con.cursor(),
         base_db_path=":memory:",
@@ -99,6 +100,9 @@ def _update_from_warning(
 def _annotate_branch_replay_warnings(
     base_db_path: str | Path,
     statements: list[LoggedStatement],
+    table_columns,
+    primary_key_columns,
+    key_column_sets,
 ) -> list[LoggedStatement]:
     """Attach branch-local replay warnings before deciding auto-merge is clean."""
 
@@ -114,7 +118,15 @@ def _annotate_branch_replay_warnings(
                 updated[index] = statement = acknowledge_replay_warning(statement)
 
             if statement.is_replay_safe:
-                warning = _update_from_warning(branch_conn, statement)
+                # DDL is out of scope, so schema metadata stays fixed to the
+                # base schema; branch_conn only supplies branch-local row state.
+                warning = _update_from_warning(
+                    branch_conn,
+                    statement,
+                    table_columns,
+                    primary_key_columns,
+                    key_column_sets,
+                )
                 if warning is not None:
                     updated[index] = statement = _with_replay_warning(
                         statement,
@@ -147,15 +159,15 @@ def _branch_replay_plan(
     return MergePlan(
         status="conflict",
         base_transaction_id=base_transaction_id,
-        ours=ours,
-        theirs=theirs,
+        ours=group_logged_transactions(ours),
+        theirs=group_logged_transactions(theirs),
         selected=FrontierCandidate(
             name="branch_replay",
             ours_count=0,
             theirs_count=0,
             next_conflict=None,
         ),
-        statement_plan=[],
+        transaction_plan=[],
     )
 
 
@@ -172,15 +184,29 @@ def merge_databases(
     conflict_detector = conflict_detector or default_conflict_detector()
     (
         base_transaction_id,
-        ours,
-        theirs,
+        ours_transactions,
+        theirs_transactions,
         table_columns,
         primary_key_columns,
         key_column_sets,
     ) = load_merge_inputs(base_db_path, ours_db_path, theirs_db_path)
 
-    ours = _annotate_branch_replay_warnings(base_db_path, ours)
-    theirs = _annotate_branch_replay_warnings(base_db_path, theirs)
+    ours = _annotate_branch_replay_warnings(
+        base_db_path,
+        list(flatten_transactions(ours_transactions)),
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+    theirs = _annotate_branch_replay_warnings(
+        base_db_path,
+        list(flatten_transactions(theirs_transactions)),
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+    ours_transactions = group_logged_transactions(ours)
+    theirs_transactions = group_logged_transactions(theirs)
 
     if (
         _has_unsafe_replay(ours)
@@ -196,8 +222,8 @@ def merge_databases(
                 base_conn,
                 str(base_db_path),
                 base_transaction_id,
-                ours,
-                theirs,
+                ours_transactions,
+                theirs_transactions,
                 table_columns,
                 primary_key_columns,
                 key_column_sets,
@@ -213,10 +239,10 @@ def merge_databases(
     session: str | None = None
 
     if plan.status == "clean":
-        replay = replay_statement_plan(
+        replay = replay_transaction_plan(
             base_db_path,
             ours_db_path,
-            plan.statement_plan,
+            plan.transaction_plan,
         )
 
     if plan.status == "conflict" or not replay.ok:

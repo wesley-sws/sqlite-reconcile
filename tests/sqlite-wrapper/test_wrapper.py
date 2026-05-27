@@ -61,6 +61,15 @@ def make_wrapper(tmp_path: Path, wrapper_module):
         ("UPDATE users SET name = 'Alice' WHERE id = 1", True),
         ("DELETE FROM users WHERE id = 1", True),
         ("SELECT * FROM users", False),
+        ("WITH c AS (SELECT 1) SELECT * FROM c", False),
+        ("CREATE TABLE extra (id INTEGER PRIMARY KEY)", False),
+        ("ALTER TABLE users ADD COLUMN nickname TEXT", False),
+        ("DROP TABLE users", False),
+        (
+            "WITH c AS (SELECT 1 AS id) "
+            "INSERT INTO users (id, name) SELECT id, 'Alice' FROM c",
+            True,
+        ),
         ("PRAGMA table_info(users)", False),
         ("BEGIN TRANSACTION", False),
         ("COMMIT", False),
@@ -79,6 +88,21 @@ def test_autocommit_statements_are_logged_as_one_transaction(tmp_path, wrapper_m
         assert len(log_entries) == 1
         assert log_entries[0]["sql_text"] == "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')"
         assert log_entries[0]["transaction_id"] >= 1
+    finally:
+        wrapper.close()
+
+
+def test_with_insert_is_logged(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "WITH c AS (SELECT 1 AS id, 'Alice' AS name) "
+            "INSERT INTO users (id, name) SELECT id, name FROM c"
+        )
+
+        log_entries = wrapper.get_log()
+        assert len(log_entries) == 1
+        assert log_entries[0]["sql_text"].startswith("WITH c AS")
     finally:
         wrapper.close()
 

@@ -35,6 +35,14 @@ def conflict_kinds(result):
     return [conflict.kind for conflict in result.conflicts]
 
 
+def static_match(context, ours, theirs):
+    return static_analysis.static_analysis_matching(
+        context,
+        log_merge.group_logged_transactions([ours])[0].metadata,
+        log_merge.group_logged_transactions([theirs])[0].metadata,
+    )
+
+
 def test_static_analysis_flags_update_same_column_write_write():
     table_columns = {
         "products": {"id", "discount", "name"},
@@ -51,7 +59,7 @@ def test_static_analysis_flags_update_same_column_write_write():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["write_write"]
     assert "products.discount" in result.conflicts[0].message
@@ -100,7 +108,7 @@ def test_static_analysis_allows_update_different_columns():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -123,7 +131,7 @@ def test_static_analysis_flags_write_read_in_both_directions():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["write_read"]
     assert "ours writes products.discount" in result.conflicts[0].message
@@ -145,7 +153,7 @@ def test_static_analysis_treats_insert_as_writing_all_columns_for_write_read():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["write_read"]
     assert "ours writes products.id" in result.conflicts[0].message
@@ -167,7 +175,7 @@ def test_static_analysis_delete_delete_can_still_report_write_read():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["write_read", "write_read"]
 
@@ -196,7 +204,7 @@ def test_static_analysis_implicit_key_insert_conflicts_with_other_insert():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["implicit_insert_key"]
     assert "ours INSERT omits explicit key values" in result.conflicts[0].message
@@ -226,7 +234,7 @@ def test_static_analysis_unique_insert_still_conflicts_when_pk_is_omitted():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["implicit_insert_key"]
     assert "ours INSERT omits explicit key values" in result.conflicts[0].message
@@ -256,7 +264,7 @@ def test_static_analysis_all_key_sets_explicit_does_not_trigger_implicit_key():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -284,7 +292,7 @@ def test_static_analysis_implicit_key_insert_conflicts_with_key_update():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert "implicit_insert_key" in conflict_kinds(result)
 
@@ -312,7 +320,7 @@ def test_static_analysis_implicit_key_insert_allows_non_key_update():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -340,7 +348,7 @@ def test_static_analysis_implicit_key_insert_conflicts_with_key_read():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["implicit_insert_key", "write_read"]
     assert "references or writes id" in result.conflicts[0].message
@@ -371,7 +379,7 @@ def test_static_analysis_implicit_key_dml_uses_omitted_key_columns_only():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -401,7 +409,7 @@ def test_static_analysis_implicit_key_dml_conflicts_on_omitted_key_column():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["implicit_insert_key"]
     assert "user_id" in result.conflicts[0].message
@@ -433,7 +441,7 @@ def test_static_analysis_ignores_insert_omitting_current_timestamp_default():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -463,7 +471,7 @@ def test_static_analysis_ignores_insert_default_values_with_nondeterministic_def
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -493,7 +501,7 @@ def test_static_analysis_ignores_insert_omitting_random_default():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -526,7 +534,7 @@ def test_static_analysis_allows_explicit_or_deterministic_insert_defaults():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict
 
@@ -553,6 +561,6 @@ def test_static_analysis_ignores_ambiguous_unqualified_read():
         branch="theirs",
     )
 
-    result = static_analysis.static_analysis_matching(context, ours, theirs)
+    result = static_match(context, ours, theirs)
 
     assert not result.has_conflict

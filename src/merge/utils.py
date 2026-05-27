@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from sqlglot import expressions as exp
 
 if TYPE_CHECKING:
-    from .statement_metadata import StatementMetadata
+    from .sql_metadata import StatementMetadata
 
 ALL_COLUMNS = "*"
 TableColumns = dict[str, set[str]]
