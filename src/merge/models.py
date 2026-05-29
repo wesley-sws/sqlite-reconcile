@@ -227,16 +227,30 @@ class MergePlan:
 
 
 class MergeNotApplicableError(Exception):
-    """Raised when a database was not prepared with sqlite-reconcile logging."""
+    """Raised when a database cannot be used for log-based merge."""
 
-    def __init__(self, db_path: str | Path, role: str, missing_tables: Sequence[str]):
+    def __init__(
+        self,
+        db_path: str | Path,
+        role: str,
+        missing_tables: Sequence[str] = (),
+        *,
+        reason: str | None = None,
+        details: Sequence[str] = (),
+    ):
         self.db_path = str(db_path)
         self.role = role
         self.missing_tables = list(missing_tables)
-        missing = ", ".join(self.missing_tables)
+        self.details = list(details)
+
+        if reason is None:
+            missing = ", ".join(self.missing_tables)
+            reason = f"is missing {missing}"
+
+        detail_text = "" if not self.details else ": " + "; ".join(self.details)
         super().__init__(
             f"{role} database is not applicable for log-based SQLite merge: "
-            f"{self.db_path} is missing {missing}"
+            f"{self.db_path} {reason}{detail_text}"
         )
 
 

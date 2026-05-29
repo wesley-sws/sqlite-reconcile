@@ -160,6 +160,19 @@ def get_base_watermark(base_cursor: sqlite3.Cursor, base_db_path: str | Path) ->
     return int(row[0])
 
 
+def require_valid_base(con: sqlite3.Connection, base_db_path: str | Path) -> None:
+    """Reject merge bases with pre-existing integrity or FK errors."""
+
+    errors = validate_database(con)
+    if errors:
+        raise MergeNotApplicableError(
+            base_db_path,
+            "base",
+            reason="has pre-existing integrity errors",
+            details=errors,
+        )
+
+
 def load_logged_statements(
     cursor: sqlite3.Cursor,
     branch: BranchName,
@@ -271,6 +284,7 @@ def load_merge_inputs(
             base_cursor,
         )
         base_transaction_id = get_base_watermark(base_cursor, base_db_path)
+        require_valid_base(base_conn, base_db_path)
         ours = load_logged_transactions(
             ours_conn.cursor(),
             "ours",

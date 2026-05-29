@@ -125,6 +125,7 @@ def write_not_applicable_session(
         "database": error.db_path,
         "role": error.role,
         "missing_tables": error.missing_tables,
+        "details": error.details,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

@@ -183,6 +183,31 @@ def test_branch_without_log_tables_is_not_applicable(tmp_path):
     ]
 
 
+def test_invalid_base_database_is_not_applicable(tmp_path):
+    base = tmp_path / "base.db"
+    ours = tmp_path / "ours.db"
+    theirs = tmp_path / "theirs.db"
+    init_logged_db(base)
+    with closing(sqlite3.connect(base)) as con:
+        con.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)")
+        con.execute(
+            "CREATE TABLE children ("
+            "id INTEGER PRIMARY KEY, "
+            "parent_id INTEGER REFERENCES parents(id))"
+        )
+        con.execute("INSERT INTO children VALUES (1, 999)")
+        con.commit()
+    shutil.copy2(base, ours)
+    shutil.copy2(base, theirs)
+
+    with pytest.raises(log_merge.MergeNotApplicableError) as exc_info:
+        log_merge.load_merge_inputs(base, ours, theirs)
+
+    assert exc_info.value.role == "base"
+    assert exc_info.value.missing_tables == []
+    assert any("foreign_key_check" in error for error in exc_info.value.details)
+
+
 def test_load_table_columns_skips_only_internal_log_tables():
     with closing(sqlite3.connect(":memory:")) as con:
         con.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")

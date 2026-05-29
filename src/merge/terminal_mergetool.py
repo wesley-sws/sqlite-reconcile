@@ -13,12 +13,14 @@ from .log_merge import (
     ConflictPair,
     LoggedStatement,
     LoggedTransaction,
+    MergeNotApplicableError,
     UPDATE_FROM_DUPLICATE_TARGET_WARNING,
     acknowledgeable_replay_warning,
     build_merge_plan_from_connection,
     group_logged_transactions,
     load_schema_metadata_from_db,
     make_logged_statement,
+    require_valid_base,
     replay_transaction_plan,
     validate_database,
 )
@@ -314,6 +316,12 @@ def resolve_session(session_path: str | Path) -> int:
     paths = session["paths"]
     base_path = Path(paths["base"])
     merged_path = Path(paths["merged"])
+    try:
+        with closing(sqlite3.connect(base_path)) as base_conn:
+            require_valid_base(base_conn, base_path)
+    except MergeNotApplicableError as exc:
+        print(exc)
+        return 1
 
     base_transaction_id = int(session["base_transaction_id"])
     table_columns, primary_key_columns, key_column_sets = load_schema_metadata_from_db(
