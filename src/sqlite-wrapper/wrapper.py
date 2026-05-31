@@ -34,8 +34,11 @@ import sqlglot
 from sqlglot import exp
 
 _WRAPPER_DIR = Path(__file__).resolve().parent
+_SRC_DIR = _WRAPPER_DIR.parent
 if str(_WRAPPER_DIR) not in sys.path:
     sys.path.insert(0, str(_WRAPPER_DIR))
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from wrapper_replay_preparation import (  # noqa: E402
     LogEntry,

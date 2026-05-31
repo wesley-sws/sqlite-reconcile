@@ -7,6 +7,12 @@ from dataclasses import dataclass
 import sqlglot
 from sqlglot import exp
 
+from sqlite_conflict_resolution import (
+    CompatibleSQL,
+    normalize_sql_for_sqlglot,
+    restore_update_conflict_resolution,
+)
+
 STATEMENT_LEVEL_NONDETERMINISTIC = {
     "changes",
     "last_insert_rowid",
@@ -376,13 +382,20 @@ def _rewrite_default_values_insert(
 def prepare_logged_sql(sql: str, conn: sqlite3.Connection) -> LogEntry:
     """Build the original/replay log entry for one statement before execution."""
 
+    compatible_sql: CompatibleSQL | None = None
     try:
         tree = sqlglot.parse_one(sql, dialect="sqlite")
     except sqlglot.errors.ParseError:
         default_values_entry = _rewrite_default_values_insert(sql, conn)
         if default_values_entry is not None:
             return default_values_entry
-        return unsafe_log_entry(sql, PARSE_ERROR_REASON)
+        compatible_sql = normalize_sql_for_sqlglot(sql)
+        if compatible_sql.sql == sql:
+            return unsafe_log_entry(sql, PARSE_ERROR_REASON)
+        try:
+            tree = sqlglot.parse_one(compatible_sql.sql, dialect="sqlite")
+        except sqlglot.errors.ParseError:
+            return unsafe_log_entry(sql, PARSE_ERROR_REASON)
 
     if _unsafe_nondeterministic_functions(tree):
         return unsafe_log_entry(sql, UNSAFE_NONDETERMINISTIC_REASON)
@@ -396,5 +409,16 @@ def prepare_logged_sql(sql: str, conn: sqlite3.Connection) -> LogEntry:
     if not defaults_safe:
         return unsafe_log_entry(sql, UNSAFE_NONDETERMINISTIC_REASON)
     changed = changed or defaults_changed
+    if not changed:
+        return LogEntry(sql, sql, True)
 
-    return LogEntry(sql, tree.sql(dialect="sqlite") if changed else sql, True)
+    if compatible_sql is not None and compatible_sql.stripped_upsert:
+        return unsafe_log_entry(sql, UNSAFE_NONDETERMINISTIC_REASON)
+
+    replay_sql = tree.sql(dialect="sqlite")
+    if compatible_sql is not None:
+        replay_sql = restore_update_conflict_resolution(
+            replay_sql,
+            compatible_sql.conflict_resolution,
+        )
+    return LogEntry(sql, replay_sql, True)

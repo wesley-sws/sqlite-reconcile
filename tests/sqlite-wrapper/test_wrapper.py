@@ -107,6 +107,43 @@ def test_with_insert_is_logged(tmp_path, wrapper_module):
         wrapper.close()
 
 
+def test_update_or_clause_is_logged_as_replay_safe(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'a@example.com')"
+        )
+        wrapper.execute(
+            "UPDATE OR IGNORE users SET email = 'b@example.com' WHERE id = 1"
+        )
+
+        entry = wrapper.get_log()[-1]
+        assert entry["sql_text"] == (
+            "UPDATE OR IGNORE users SET email = 'b@example.com' WHERE id = 1"
+        )
+        assert entry["is_replay_safe"] == 1
+        assert entry["replay_block_reason"] is None
+    finally:
+        wrapper.close()
+
+
+def test_replace_into_is_logged_as_replay_safe(tmp_path, wrapper_module):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "REPLACE INTO users (id, name, email) VALUES (1, 'Alice', 'a@example.com')"
+        )
+
+        entry = wrapper.get_log()[0]
+        assert entry["sql_text"] == (
+            "REPLACE INTO users (id, name, email) VALUES (1, 'Alice', 'a@example.com')"
+        )
+        assert entry["is_replay_safe"] == 1
+        assert entry["replay_block_reason"] is None
+    finally:
+        wrapper.close()
+
+
 def test_explicit_transaction_buffers_until_commit(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
@@ -324,6 +361,53 @@ def test_logs_original_and_replay_sql_for_current_time_expression(tmp_path, wrap
         )
         assert "datetime('now', '-7 days')" not in entry["to_replay_sql_text"]
         assert "created_at <" in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_update_or_clause_is_preserved_when_replay_sql_is_rewritten(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "UPDATE OR IGNORE events "
+            "SET name = 'expired' "
+            "WHERE created_at < datetime('now', '-7 days')"
+        )
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == (
+            "UPDATE OR IGNORE events "
+            "SET name = 'expired' "
+            "WHERE created_at < datetime('now', '-7 days')"
+        )
+        assert "UPDATE OR IGNORE events" in entry["to_replay_sql_text"]
+        assert "datetime('now', '-7 days')" not in entry["to_replay_sql_text"]
+        assert entry["is_replay_safe"] == 1
+    finally:
+        wrapper.close()
+
+
+def test_replace_into_is_rendered_as_insert_or_replace_when_replay_sql_is_rewritten(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("REPLACE INTO random_events (id, name) VALUES (1, 'Alice')")
+
+        entry = wrapper.get_log()[0]
+        assert entry["original_sql_text"] == (
+            "REPLACE INTO random_events (id, name) VALUES (1, 'Alice')"
+        )
+        assert entry["to_replay_sql_text"].startswith(
+            "INSERT OR REPLACE INTO random_events"
+        )
+        assert "token" in entry["to_replay_sql_text"]
+        assert "RANDOM()" not in entry["to_replay_sql_text"]
         assert entry["is_replay_safe"] == 1
     finally:
         wrapper.close()

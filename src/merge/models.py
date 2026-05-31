@@ -17,6 +17,7 @@ ConflictKind = Literal[
     "write_read",
     "implicit_insert_key",
     "integrity",
+    "constraint_resolution",
     "non_commutative",
     "replay_error",
 ]

@@ -51,6 +51,72 @@ def test_logged_statement_metadata_for_insert_select_reads_source_columns():
     }
 
 
+def test_logged_statement_metadata_parses_sqlite_conflict_resolution_syntax():
+    table_columns = {"users": {"id", "email", "score"}}
+    statements = [
+        (
+            "UPDATE OR REPLACE users SET email = 'a' WHERE id = 1",
+            "users",
+            {"email"},
+            ("update", "REPLACE"),
+        ),
+        (
+            "REPLACE INTO users(id, email) VALUES (1, 'a')",
+            "users",
+            {log_merge.ALL_COLUMNS},
+            ("insert", "REPLACE"),
+        ),
+        (
+            "INSERT INTO users(id, email, score) VALUES (1, 'a', 5) "
+            "ON CONFLICT(id) DO UPDATE SET score = excluded.score "
+            "WHERE users.score < excluded.score",
+            "users",
+            {log_merge.ALL_COLUMNS},
+            None,
+        ),
+        (
+            "WITH incoming(id, email) AS (SELECT 2, 'b') "
+            "INSERT OR IGNORE INTO users(id, email) "
+            "SELECT id, email FROM incoming",
+            "users",
+            {log_merge.ALL_COLUMNS},
+            ("insert", "IGNORE"),
+        ),
+        (
+            "WITH target(id) AS (SELECT 1) "
+            "UPDATE OR REPLACE users SET email = 'a' "
+            "WHERE id IN (SELECT id FROM target)",
+            "users",
+            {"email"},
+            ("update", "REPLACE"),
+        ),
+    ]
+
+    for sql_text, table, columns, expected_resolution in statements:
+        statement = log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            log_id=1,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text=sql_text,
+            table_columns=table_columns,
+        )
+
+        assert statement.is_replay_safe
+        assert statement.metadata.table_updated == table
+        assert statement.metadata.columns_updated == columns
+        resolution = statement.metadata.conflict_resolution
+        if expected_resolution is None:
+            assert resolution is None
+        else:
+            assert resolution is not None
+            assert (
+                resolution.statement_kind,
+                resolution.algorithm,
+            ) == expected_resolution
+
+
 def test_logged_statement_metadata_for_insert_select_join_reads_join_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",

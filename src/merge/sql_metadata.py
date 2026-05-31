@@ -16,6 +16,11 @@ import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
+from sqlite_conflict_resolution import (
+    SQLiteConflictResolution,
+    normalize_sql_for_sqlglot,
+)
+
 from .utils import ALL_COLUMNS, TableColumns, table_expression, table_name
 
 IgnoredRelations = dict[str, set[str]]
@@ -49,6 +54,7 @@ class StatementMetadata:
     """Parsed SQL plus the statement-level read/write tables and columns."""
 
     parsed_sql_text: exp.Expression
+    conflict_resolution: SQLiteConflictResolution | None
     table_updated: str | None
     columns_updated: set[str]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
@@ -90,9 +96,11 @@ def parse_statement_metadata(
 ) -> StatementMetadata:
     """Parse one SQL statement and extract metadata used by conflict checks."""
 
-    parsed_sql_text = _parse_one(sql_text)
+    compatible = normalize_sql_for_sqlglot(sql_text)
+    parsed_sql_text = _parse_one(compatible.sql)
     return StatementMetadata(
         parsed_sql_text=parsed_sql_text,
+        conflict_resolution=compatible.conflict_resolution,
         table_updated=_target_table_name(parsed_sql_text),
         columns_updated=_updated_columns(parsed_sql_text),
         tables_referenced_to_columns_referenced=_referenced_tables_to_columns(
@@ -110,6 +118,7 @@ def unsupported_statement_metadata(sql_text: str) -> StatementMetadata:
             this="UNSUPPORTED_SQL",
             expression=exp.Literal.string(sql_text),
         ),
+        conflict_resolution=None,
         table_updated=None,
         columns_updated=set(),
         tables_referenced_to_columns_referenced={},

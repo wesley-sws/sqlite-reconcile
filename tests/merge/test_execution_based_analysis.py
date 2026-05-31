@@ -882,6 +882,182 @@ def test_execution_reports_non_integrity_sqlite_error_as_replay_error(tmp_path):
     assert "no such table" in result.conflicts[0].message
 
 
+def test_execution_reports_or_ignore_path_as_reviewable_conflict(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT OR IGNORE INTO products(id, name) VALUES (1, 'A')",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT OR IGNORE INTO products(id, name) VALUES (1, 'B')",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_match(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == [
+        "constraint_resolution",
+        "constraint_resolution",
+    ]
+    assert all(conflict.scope == "pair" for conflict in result.conflicts)
+    assert "conflict-resolution syntax" in result.conflicts[0].message
+
+
+def test_execution_reports_cte_or_ignore_path_as_reviewable_conflict(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "WITH incoming(id, name) AS (SELECT 1, 'A') "
+            "INSERT OR IGNORE INTO products(id, name) "
+            "SELECT id, name FROM incoming",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT OR IGNORE INTO products(id, name) VALUES (1, 'B')",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_match(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == [
+        "constraint_resolution",
+        "constraint_resolution",
+    ]
+
+
+def test_execution_reports_or_replace_path_as_reviewable_conflict(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO products VALUES (1, 'base')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT OR REPLACE INTO products(id, name) VALUES (1, 'ours')",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE products SET name = 'theirs' WHERE id = 1",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_match(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == ["constraint_resolution"]
+    assert result.conflicts[0].scope == "pair"
+    assert "under the current prefix" in result.conflicts[0].message
+
+
+def test_execution_reports_update_or_ignore_path_as_reviewable_conflict(tmp_path):
+    table_columns = {"users": {"id", "email"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+            "INSERT INTO users VALUES (1, 'a@example.com')",
+            "INSERT INTO users VALUES (2, 'b@example.com')",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "UPDATE OR IGNORE users SET email = 'a@example.com' WHERE id = 2",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "UPDATE users SET email = email WHERE id = 1",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_match(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == ["constraint_resolution"]
+    assert result.conflicts[0].scope == "pair"
+
+
+def test_execution_reports_upsert_path_as_reviewable_conflict(tmp_path):
+    table_columns = {"products": {"id", "name"}}
+    base_path = init_base_db(
+        tmp_path,
+        [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
+        ],
+    )
+    con, context = make_context(base_path, table_columns)
+    with closing(con):
+        ours = make_statement(
+            "INSERT INTO products(id, name) VALUES (1, 'A') "
+            "ON CONFLICT(id) DO NOTHING",
+            table_columns,
+            branch="ours",
+        )
+        theirs = make_statement(
+            "INSERT INTO products(id, name) VALUES (1, 'B') "
+            "ON CONFLICT(id) DO NOTHING",
+            table_columns,
+            branch="theirs",
+        )
+
+        result = execution_match(
+            context,
+            ours,
+            theirs,
+            static_result(context, ours, theirs),
+        )
+
+    assert conflict_kinds(result) == [
+        "constraint_resolution",
+        "constraint_resolution",
+    ]
+
+
 def test_write_read_probe_reports_not_refined_reason_for_update_from_duplicates(tmp_path):
     table_columns = {
         "products": {"id", "category_id", "discount"},

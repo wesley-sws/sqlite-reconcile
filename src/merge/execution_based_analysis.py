@@ -9,10 +9,11 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from sqlglot import expressions as exp
+from sqlite_conflict_resolution import strict_conflict_resolution_rewrite
 
 from .log_merge import (
     ConflictCheckContext,
@@ -150,7 +151,11 @@ def sqlite_replay_conflicts(
 
     failures = _pair_replay_failures(context, ours_transaction, theirs_transaction)
     if not failures:
-        return ()
+        return _constraint_resolution_conflicts(
+            context,
+            ours_transaction,
+            theirs_transaction,
+        )
 
     branch_failures = [
         failure
@@ -168,6 +173,129 @@ def sqlite_replay_conflicts(
         StatementConflict(
             kind=failure.kind,
             message=f"{failure.order_label}: {failure.message}",
+        ),
+    )
+
+
+def _constraint_resolution_conflicts(
+    context: ConflictCheckContext,
+    ours_transaction: LoggedTransaction,
+    theirs_transaction: LoggedTransaction,
+) -> tuple[StatementConflict, ...]:
+    """
+    Detect successful statements that only succeed due to conflict resolution.
+
+    The original SQL has already replayed successfully. Replaying a strict
+    version without OR IGNORE / OR REPLACE / UPSERT tells us whether SQLite's
+    conflict-resolution path was required under the current prefix.
+    """
+
+    conflicts: list[StatementConflict] = []
+    context.base_cursor.execute("PRAGMA foreign_keys = ON")
+    for transaction, other_transaction in (
+        (ours_transaction, theirs_transaction),
+        (theirs_transaction, ours_transaction),
+    ):
+        strict_transaction = _strict_conflict_resolution_transaction(transaction)
+        if strict_transaction is None:
+            continue
+
+        standalone_failure = _savepoint_replay_failure(
+            context.base_cursor,
+            strict_transaction.statements,
+            (),
+            f"strict {transaction_label(transaction)}",
+        )
+        if standalone_failure is not None:
+            conflicts.append(
+                _constraint_resolution_conflict(
+                    transaction,
+                    standalone_failure,
+                    scope=transaction.branch,
+                    after_transaction=None,
+                )
+            )
+            continue
+
+        pair_failure = _savepoint_replay_failure(
+            context.base_cursor,
+            other_transaction.statements,
+            strict_transaction.statements,
+            f"{transaction_label(other_transaction)} then strict "
+            f"{transaction_label(transaction)}",
+        )
+        if pair_failure is not None:
+            conflicts.append(
+                _constraint_resolution_conflict(
+                    transaction,
+                    pair_failure,
+                    scope="pair",
+                    after_transaction=other_transaction,
+                )
+            )
+
+    return tuple(conflicts)
+
+
+def _strict_conflict_resolution_transaction(
+    transaction: LoggedTransaction,
+) -> LoggedTransaction | None:
+    """Return a copy with reviewable conflict-resolution syntax stripped."""
+
+    changed = False
+    statements: list[LoggedStatement] = []
+    for statement in transaction.statements:
+        rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
+        if rewrite is None:
+            statements.append(statement)
+            continue
+
+        changed = True
+        statements.append(
+            replace(
+                statement,
+                to_replay_sql_text=rewrite.sql,
+                replay_warnings=(
+                    *statement.replay_warnings,
+                    f"strict replay removed {rewrite.label}",
+                ),
+            )
+        )
+
+    if not changed:
+        return None
+    return replace(transaction, statements=tuple(statements))
+
+
+def _constraint_resolution_conflict(
+    transaction: LoggedTransaction,
+    failure: SQLiteReplayFailure,
+    *,
+    scope: ConflictScope,
+    after_transaction: LoggedTransaction | None,
+) -> StatementConflict:
+    """Build a reviewable conflict-resolution warning from strict replay."""
+
+    if failure.kind != "integrity":
+        return StatementConflict(
+            kind=failure.kind,
+            scope=scope,
+            message=f"strict replay probe failed: {failure.message}",
+        )
+
+    after_text = (
+        f" after {transaction_label(after_transaction)}"
+        if after_transaction is not None
+        else " under the current prefix"
+    )
+    return StatementConflict(
+        kind="constraint_resolution",
+        scope="pair",
+        message=(
+            f"{transaction_label(transaction)} uses SQLite conflict-resolution "
+            f"syntax; removing it fails{after_text}: {failure.message}. "
+            "The original SQL succeeds, so this is reviewable rather than a "
+            "hard replay error."
         ),
     )
 

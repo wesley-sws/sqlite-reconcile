@@ -58,7 +58,7 @@ ACKNOWLEDGEABLE_REPLAY_REASONS = (
 UPDATE_FROM_DUPLICATE_TARGET_WARNING = (
     "UPDATE FROM has multiple source rows for the same target row"
 )
-DEBUG_MERGE_TRACE = True
+DEBUG_MERGE_TRACE = False
 
 
 def default_conflict_detector() -> ConflictDetector:

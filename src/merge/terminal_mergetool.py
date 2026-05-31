@@ -36,7 +36,7 @@ from .terminal_ui import (
     _transaction_with_statements,
 )
 
-DEBUG_MERGETOOL_TRACE = True
+DEBUG_MERGETOOL_TRACE = False
 
 
 def _session_logged_statements(
