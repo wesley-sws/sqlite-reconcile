@@ -1,2 +1,2 @@
-*.db merge=sqlite-reconcile
-*.sqlite merge=sqlite-reconcile
+*.db binary
+*.sqlite binary

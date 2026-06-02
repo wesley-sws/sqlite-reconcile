@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from merge import log_merge
+from merge.utils import ALL_COLUMNS
 
 
 def test_logged_statement_metadata_for_update_reads_and_writes():
@@ -45,7 +46,7 @@ def test_logged_statement_metadata_for_insert_select_reads_source_columns():
     )
 
     assert statement.metadata.table_updated == "users"
-    assert statement.metadata.columns_updated == {log_merge.ALL_COLUMNS}
+    assert statement.metadata.columns_updated == {ALL_COLUMNS}
     assert statement.metadata.tables_referenced_to_columns_referenced == {
         "staging_users": {"id", "name", "active"},
     }
@@ -59,28 +60,39 @@ def test_logged_statement_metadata_parses_sqlite_conflict_resolution_syntax():
             "users",
             {"email"},
             ("update", "REPLACE"),
+            True,
+        ),
+        (
+            "INSERT OR ABORT INTO users(id, email) VALUES (1, 'a')",
+            "users",
+            {ALL_COLUMNS},
+            ("insert", "ABORT"),
+            False,
         ),
         (
             "REPLACE INTO users(id, email) VALUES (1, 'a')",
             "users",
-            {log_merge.ALL_COLUMNS},
+            {ALL_COLUMNS},
             ("insert", "REPLACE"),
+            True,
         ),
         (
             "INSERT INTO users(id, email, score) VALUES (1, 'a', 5) "
             "ON CONFLICT(id) DO UPDATE SET score = excluded.score "
             "WHERE users.score < excluded.score",
             "users",
-            {log_merge.ALL_COLUMNS},
+            {ALL_COLUMNS},
             None,
+            True,
         ),
         (
             "WITH incoming(id, email) AS (SELECT 2, 'b') "
             "INSERT OR IGNORE INTO users(id, email) "
             "SELECT id, email FROM incoming",
             "users",
-            {log_merge.ALL_COLUMNS},
+            {ALL_COLUMNS},
             ("insert", "IGNORE"),
+            True,
         ),
         (
             "WITH target(id) AS (SELECT 1) "
@@ -89,10 +101,17 @@ def test_logged_statement_metadata_parses_sqlite_conflict_resolution_syntax():
             "users",
             {"email"},
             ("update", "REPLACE"),
+            True,
         ),
     ]
 
-    for sql_text, table, columns, expected_resolution in statements:
+    for (
+        sql_text,
+        table,
+        columns,
+        expected_resolution,
+        expected_reviewable,
+    ) in statements:
         statement = log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
@@ -115,6 +134,10 @@ def test_logged_statement_metadata_parses_sqlite_conflict_resolution_syntax():
                 resolution.statement_kind,
                 resolution.algorithm,
             ) == expected_resolution
+        assert (
+            statement.metadata.has_reviewable_constraint_resolution
+            is expected_reviewable
+        )
 
 
 def test_logged_statement_metadata_for_insert_select_join_reads_join_columns():
@@ -182,7 +205,7 @@ def test_logged_statement_metadata_for_delete_reads_predicate_columns():
     )
 
     assert statement.metadata.table_updated == "users"
-    assert statement.metadata.columns_updated == {log_merge.ALL_COLUMNS}
+    assert statement.metadata.columns_updated == {ALL_COLUMNS}
     assert statement.metadata.tables_referenced_to_columns_referenced == {
         "users": {"id"},
         "orders": {"user_id", "total"},
@@ -300,7 +323,7 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_star():
 
     assert statement.metadata.table_updated == "user_archive"
     assert statement.metadata.tables_referenced_to_columns_referenced == {
-        "users": {log_merge.ALL_COLUMNS},
+        "users": {ALL_COLUMNS},
     }
 
 
@@ -328,7 +351,7 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_insert_qualified_
     )
 
     assert statement.metadata.tables_referenced_to_columns_referenced == {
-        "users": {log_merge.ALL_COLUMNS},
+        "users": {ALL_COLUMNS},
         "orders": {"user_id"},
         "profiles": {"user_id"},
     }
@@ -355,8 +378,8 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_insert_bare_star_
     )
 
     assert statement.metadata.tables_referenced_to_columns_referenced == {
-        "users": {log_merge.ALL_COLUMNS},
-        "orders": {log_merge.ALL_COLUMNS},
+        "users": {ALL_COLUMNS},
+        "orders": {ALL_COLUMNS},
     }
 
 
@@ -374,7 +397,7 @@ def test_logged_statement_metadata_treats_count_star_as_all_columns_conservative
     )
 
     assert statement.metadata.tables_referenced_to_columns_referenced == {
-        "users": {log_merge.ALL_COLUMNS},
+        "users": {ALL_COLUMNS},
     }
 
 
@@ -722,6 +745,57 @@ def test_logged_statement_metadata_top_level_cte_does_not_use_update_from_alias(
     )
 
     assert statement.metadata.tables_referenced_to_columns_referenced == {}
+
+
+def test_logged_statement_metadata_cte_name_does_not_shadow_update_target():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "WITH users AS (SELECT id FROM archive) "
+            "UPDATE users "
+            "SET name = users.name "
+            "WHERE id = 1"
+        ),
+        table_columns={
+            "users": {"id", "name"},
+            "archive": {"id"},
+        },
+    )
+
+    assert statement.metadata.table_updated == "users"
+    assert statement.metadata.tables_referenced_to_columns_referenced == {
+        "archive": {"id"},
+        "users": {"id", "name"},
+    }
+
+
+def test_logged_statement_metadata_cte_name_does_not_shadow_delete_target():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "WITH users AS (SELECT id FROM archive) "
+            "DELETE FROM users "
+            "WHERE id = 1"
+        ),
+        table_columns={
+            "users": {"id"},
+            "archive": {"id"},
+        },
+    )
+
+    assert statement.metadata.table_updated == "users"
+    assert statement.metadata.tables_referenced_to_columns_referenced == {
+        "archive": {"id"},
+        "users": {"id"},
+    }
 
 
 def test_logged_statement_metadata_nested_cte_reads_outer_dml_scope():

@@ -33,8 +33,9 @@ def table_expression(expression: exp.Expression | None) -> exp.Table | None:
     if isinstance(expression, exp.Table):
         return expression
 
-    if isinstance(expression, exp.Schema) and isinstance(expression.this, exp.Table):
-        return expression.this
+    schema_target = expression.this if isinstance(expression, exp.Schema) else None
+    if isinstance(schema_target, exp.Table):
+        return schema_target
 
     return None
 

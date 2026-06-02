@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import ParseError
 
 from sqlite_conflict_resolution import (
     CompatibleSQL,
@@ -235,7 +236,7 @@ def _default_is_nondeterministic(default_sql: object) -> bool:
 
     try:
         tree = sqlglot.parse_one(str(default_sql), dialect="sqlite")
-    except sqlglot.errors.ParseError:
+    except ParseError:
         return False
 
     return any(
@@ -356,7 +357,7 @@ def _rewrite_default_values_insert(
 
     try:
         tree = sqlglot.parse_one(normalized, dialect="sqlite")
-    except sqlglot.errors.ParseError:
+    except ParseError:
         return None
 
     if not isinstance(tree, exp.Insert):
@@ -385,7 +386,7 @@ def prepare_logged_sql(sql: str, conn: sqlite3.Connection) -> LogEntry:
     compatible_sql: CompatibleSQL | None = None
     try:
         tree = sqlglot.parse_one(sql, dialect="sqlite")
-    except sqlglot.errors.ParseError:
+    except ParseError:
         default_values_entry = _rewrite_default_values_insert(sql, conn)
         if default_values_entry is not None:
             return default_values_entry
@@ -394,7 +395,7 @@ def prepare_logged_sql(sql: str, conn: sqlite3.Connection) -> LogEntry:
             return unsafe_log_entry(sql, PARSE_ERROR_REASON)
         try:
             tree = sqlglot.parse_one(compatible_sql.sql, dialect="sqlite")
-        except sqlglot.errors.ParseError:
+        except ParseError:
             return unsafe_log_entry(sql, PARSE_ERROR_REASON)
 
     if _unsafe_nondeterministic_functions(tree):

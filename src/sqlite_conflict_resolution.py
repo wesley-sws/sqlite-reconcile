@@ -1,3 +1,15 @@
+"""
+Temporary SQLite conflict-resolution compatibility helpers.
+
+This module is an AI-assisted shim for SQLite syntax that the sqlglot version
+used by the project does not parse or render cleanly yet, such as UPDATE OR ...,
+REPLACE INTO, and INSERT ... ON CONFLICT UPSERT clauses. The code deliberately
+does only shallow top-level rewriting so sqlglot can still handle the main SQL
+AST. Once these SQLite forms are represented reliably in sqlglot's AST, this
+module should be replaced by AST-based stripping/restoration instead of manual
+top-level scanning.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -74,17 +86,19 @@ def normalize_sql_for_sqlglot(sql: str) -> CompatibleSQL:
         normalized = update_normalized
         resolution = update_resolution
 
-    replace_normalized, replace_resolution = _normalize_top_level_replace_into(
-        normalized,
-    )
-    if replace_resolution is not None:
-        normalized = replace_normalized
-        resolution = replace_resolution
+    if resolution is None:
+        replace_normalized, replace_resolution = _normalize_top_level_replace_into(
+            normalized,
+        )
+        if replace_resolution is not None:
+            normalized = replace_normalized
+            resolution = replace_resolution
 
     without_upsert = strip_top_level_upsert(normalized)
-    stripped_upsert = without_upsert is not None and without_upsert != normalized
-    if stripped_upsert:
+    stripped_upsert = False
+    if without_upsert is not None and without_upsert != normalized:
         normalized = without_upsert
+        stripped_upsert = True
 
     return CompatibleSQL(
         sql=normalized,

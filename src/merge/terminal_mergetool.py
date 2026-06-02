@@ -2,164 +2,136 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import uuid
+from collections import deque
 from collections.abc import Sequence
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
+from .accepted_replay import apply_accepted_transaction
+from .conflict_detection import ConflictResolutionKey
+from .control_db import _load_working_base_copy, _open_merge_working_context
 from .execution_based_analysis import update_from_has_duplicate_target_rows
 from .log_merge import (
+    MergeNotApplicableError,
+    UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+    _RemainingCurrentConflictScan,
+    acknowledgeable_replay_warning,
+    load_merge_inputs,
+    validate_database,
+)
+from .models import (
     BranchName,
     ConflictCheckContext,
     ConflictPair,
     LoggedStatement,
     LoggedTransaction,
-    MergeNotApplicableError,
-    UPDATE_FROM_DUPLICATE_TARGET_WARNING,
-    acknowledgeable_replay_warning,
-    build_merge_plan_from_connection,
-    group_logged_transactions,
-    load_schema_metadata_from_db,
-    make_logged_statement,
-    require_valid_base,
-    replay_transaction_plan,
-    validate_database,
+    StatementConflict,
 )
-from .models import statement_label, transaction_label
-from .session import read_merge_session
+from .remaining_metadata import RemainingMetadataIndex
 from .terminal_ui import (
-    STANDALONE_RESOLUTION_SCOPE,
-    _prompt_pair_resolution,
+    _prompt_pair_transaction_resolution,
     _prompt_replay_warning,
-    _prompt_replacement,
-    _prompt_standalone_resolution,
+    _prompt_standalone_transaction_resolution,
     _prompt_update_from_warning,
     _transaction_with_statements,
 )
+from .utils import quote_identifier, rollback_savepoint
 
-DEBUG_MERGETOOL_TRACE = False
-
-
-def _session_logged_statements(
-    transactions: list[dict[str, object]],
-    branch: BranchName,
-    table_columns,
-) -> list[LoggedStatement]:
-    """Rebuild logged statements from the compact session JSON."""
-
-    statements: list[LoggedStatement] = []
-    for transaction in transactions:
-        statement_payloads = transaction.get("statements", [])
-        if not isinstance(statement_payloads, list):
-            continue
-
-        committed_at = str(transaction["committed_at"])
-        for payload in statement_payloads:
-            if not isinstance(payload, dict):
-                continue
-
-            to_replay_sql_text = str(payload["to_replay_sql_text"])
-            statements.append(
-                make_logged_statement(
-                    branch=branch,
-                    branch_index=int(payload["branch_index"]),
-                    log_id=int(payload["log_id"]),
-                    transaction_id=int(payload["transaction_id"]),
-                    committed_at=committed_at,
-                    sql_text=to_replay_sql_text,
-                    original_sql_text=str(payload["original_sql_text"]),
-                    is_replay_safe=bool(payload["is_replay_safe"]),
-                    replay_block_reason=(
-                        None
-                        if payload.get("replay_block_reason") is None
-                        else str(payload["replay_block_reason"])
-                    ),
-                    replay_warnings=tuple(
-                        str(warning)
-                        for warning in payload.get("replay_warnings", ())
-                    ),
-                    table_columns=table_columns,
-                ),
-            )
-
-    return statements
+MetadataIndexes = dict[BranchName, RemainingMetadataIndex]
+PairSideOutcome = Literal["unchanged", "edited", "deleted"]
+StandaloneReplayOutcome = Literal["current_removed", "current_changed"]
 
 
-def _apply_to_planning_db(
+@dataclass(frozen=True)
+class PairConflictOutcome:
+    """Describe what the user did to each transaction in a pair conflict."""
+
+    action: Literal["accepted", "resolved"]
+    ours: PairSideOutcome = "unchanged"
+    theirs: PairSideOutcome = "unchanged"
+
+    def side(self, branch: BranchName) -> PairSideOutcome:
+        """Return the outcome for one branch."""
+
+        return self.ours if branch == "ours" else self.theirs
+
+
+def _branch_transaction_replay_error(
     con: sqlite3.Connection,
-    transactions: Sequence[LoggedTransaction],
-) -> str | None:
-    """Apply transactions to the mutable planning database, returning an error."""
+    transaction: LoggedTransaction,
+) -> StatementConflict | None:
+    """Apply one branch-local transaction, returning why it cannot replay."""
 
+    savepoint = quote_identifier(f"sqlite_merge_branch_{uuid.uuid4().hex}")
+    con.execute(f"SAVEPOINT {savepoint}")
+    last_statement: LoggedStatement | None = None
     try:
-        for transaction in transactions:
-            if DEBUG_MERGETOOL_TRACE:
-                print(
-                    "[mergetool-debug] applying "
-                    f"{transaction_label(transaction)} "
-                    f"({transaction.branch} tx {transaction.branch_index + 1})"
-                )
-            for statement in transaction.statements:
-                if not statement.is_replay_safe:
-                    con.rollback()
-                    return (
+        for statement in transaction.statements:
+            last_statement = statement
+            if not statement.is_replay_safe:
+                rollback_savepoint(con.cursor(), savepoint)
+                return _branch_replay_conflict(
+                    "replay_error",
+                    (
                         statement.replay_block_reason
-                        or "statement is unsafe for automatic replay"
-                    )
-                con.execute(statement.sql_text)
-            errors = validate_database(con)
-            if errors:
-                con.rollback()
-                return "\n".join(errors)
-            if DEBUG_MERGETOOL_TRACE:
-                print(
-                    "[mergetool-debug] applied "
-                    f"{transaction_label(transaction)}"
+                        or "statement is unsafe for replay"
+                    ),
+                    transaction.branch,
+                    statement,
                 )
-    except sqlite3.Error as exc:
-        con.rollback()
-        return str(exc)
-
-    con.commit()
-    return None
-
-
-def _load_planning_db(base_path: Path) -> sqlite3.Connection:
-    """Return an open in-memory copy of base; the caller must close it."""
-
-    planning_conn = sqlite3.connect(":memory:")
-    try:
-        # Only this source connection is closed here. The returned planning
-        # connection stays open so callers can mutate it across a check loop.
-        with closing(sqlite3.connect(base_path)) as base_conn:
-            base_conn.backup(planning_conn)
-        planning_conn.row_factory = sqlite3.Row
-        planning_conn.execute("PRAGMA foreign_keys = ON")
-    except Exception:
-        planning_conn.close()
-        raise
-    return planning_conn
-
-
-def _branch_statement_replay_error(
-    con: sqlite3.Connection,
-    statement: LoggedStatement,
-) -> str | None:
-    """Apply one branch-local statement, returning why it cannot replay."""
-
-    if not statement.is_replay_safe:
-        return statement.replay_block_reason or "statement is unsafe for replay"
-
-    try:
-        con.execute(statement.sql_text)
+            con.execute(statement.sql_text)
         errors = validate_database(con)
         if errors:
-            con.rollback()
-            return "\n".join(errors)
+            rollback_savepoint(con.cursor(), savepoint)
+            return _branch_replay_conflict(
+                "integrity",
+                "\n".join(errors),
+                transaction.branch,
+            )
+        con.execute(f"RELEASE {savepoint}")
         con.commit()
         return None
     except sqlite3.Error as exc:
-        con.rollback()
-        return str(exc)
+        rollback_savepoint(con.cursor(), savepoint)
+        return _branch_replay_conflict(
+            _sqlite_replay_conflict_kind(exc),
+            str(exc),
+            transaction.branch,
+            last_statement,
+        )
+
+
+def _sqlite_replay_conflict_kind(
+    error: sqlite3.Error,
+) -> Literal["integrity", "replay_error"]:
+    """Return the merge conflict kind for a branch-local SQLite exception."""
+
+    if isinstance(error, sqlite3.IntegrityError):
+        return "integrity"
+    return "replay_error"
+
+
+def _branch_replay_conflict(
+    kind: Literal["integrity", "replay_error"],
+    message: str,
+    scope: BranchName,
+    statement: LoggedStatement | None = None,
+) -> StatementConflict:
+    """Return one branch-local replay conflict, scoped to a statement if known."""
+
+    return StatementConflict(
+        kind=kind,
+        message=message,
+        scope=scope,
+        details=(
+            ()
+            if statement is None
+            else (("statement_log_id", str(statement.log_id)),)
+        ),
+    )
 
 
 def _statement_replay_warning(statement: LoggedStatement) -> str | None:
@@ -175,76 +147,113 @@ def _statement_replay_warning(statement: LoggedStatement) -> str | None:
     return None
 
 
-def _resolve_branch_statement(
+def _resolve_branch_transaction_warnings(
     con: sqlite3.Connection,
     update_from_context: ConflictCheckContext,
-    branch_label: str,
-    statement: LoggedStatement,
+    transaction: LoggedTransaction,
     table_columns,
-) -> LoggedStatement | None:
-    """Resolve, run, and optionally retry one branch-local statement."""
+) -> LoggedTransaction | None:
+    """Resolve statement-level warnings before replaying one transaction."""
 
-    current = statement
+    statements = list(transaction.statements)
     while True:
-        replay_warning = _statement_replay_warning(current)
-        if replay_warning is not None:
-            replacement, changed = _prompt_replay_warning(
-                current,
-                table_columns,
-                replay_warning,
-            )
-            if replacement is None:
-                return None
-            current = replacement
-            if changed:
+        changed = False
+        for index, statement in enumerate(tuple(statements)):
+            replay_warning = _statement_replay_warning(statement)
+            if replay_warning is not None:
+                replacement, warning_changed = _prompt_replay_warning(
+                    statement,
+                    table_columns,
+                    con,
+                    replay_warning,
+                )
+                if replacement is None:
+                    statements.pop(index)
+                    changed = True
+                    break
+                if warning_changed:
+                    statements[index] = replacement
+                    changed = True
+                    break
+                statements[index] = replacement
                 continue
 
-        if current.is_replay_safe and update_from_has_duplicate_target_rows(
+            if statement.is_replay_safe and update_from_has_duplicate_target_rows(
+                update_from_context,
+                statement.metadata,
+            ):
+                replacement = _prompt_update_from_warning(
+                    statement,
+                    table_columns,
+                    con,
+                    UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+                )
+                if replacement is None:
+                    statements.pop(index)
+                    changed = True
+                    break
+                if replacement is not statement:
+                    statements[index] = replacement
+                    changed = True
+                    break
+                continue
+
+        if not statements:
+            return None
+        if changed:
+            continue
+        return _transaction_with_statements(transaction, statements)
+
+
+def _resolve_branch_transaction(
+    con: sqlite3.Connection,
+    update_from_context: ConflictCheckContext,
+    branch: BranchName,
+    transaction: LoggedTransaction,
+    table_columns,
+) -> LoggedTransaction | None:
+    """Resolve and replay one branch-local transaction."""
+
+    current = transaction
+    while True:
+        warned = _resolve_branch_transaction_warnings(
+            con,
             update_from_context,
-            current.metadata,
-        ):
-            replacement = _prompt_update_from_warning(
-                current,
-                table_columns,
-                UPDATE_FROM_DUPLICATE_TARGET_WARNING,
-            )
-            if replacement is None:
-                return None
-            if replacement is not current:
-                current = replacement
-                continue
-
-        error = _branch_statement_replay_error(con, current)
-        if error is None:
-            return current
-
-        print(
-            f"\nChecking {branch_label} branch stopped at "
-            f"{statement_label(current)}."
-        )
-        print(f"{statement_label(current)} cannot be replayed: {error}")
-        replacement = _prompt_replacement(
             current,
             table_columns,
         )
-        if replacement is None:
+        if warned is None:
             return None
-        current = replacement
+        current = warned
+
+        replay_conflict = _branch_transaction_replay_error(con, current)
+        if replay_conflict is None:
+            return current
+
+        replacement_statements = _prompt_standalone_transaction_resolution(
+            _standalone_head_conflict(replay_conflict, branch),
+            branch,
+            current,
+            table_columns,
+            con,
+        )
+        if not replacement_statements:
+            return None
+        current = _transaction_with_statements(current, replacement_statements)
 
 
 def _resolve_branch_replay_safety(
     base_path: Path,
     branch: BranchName,
-    statements: list[LoggedStatement],
+    transactions: list[LoggedTransaction],
     table_columns,
     primary_key_columns,
     key_column_sets,
-) -> list[LoggedStatement]:
+) -> list[LoggedTransaction]:
     """Resolve wrapper-unsafe or branch-local replay failures before pair checks."""
 
-    branch_label = "local" if branch == "ours" else "remote"
-    resolved: list[LoggedStatement] = []
-    with closing(_load_planning_db(base_path)) as branch_conn:
+    resolved: list[LoggedTransaction] = []
+    with closing(_load_working_base_copy(base_path)) as branch_conn:
         update_from_context = ConflictCheckContext(
             base_cursor=branch_conn.cursor(),
             base_db_path=":memory:",
@@ -252,12 +261,12 @@ def _resolve_branch_replay_safety(
             primary_key_columns=primary_key_columns,
             key_column_sets=key_column_sets,
         )
-        for statement in statements:
-            replayed = _resolve_branch_statement(
+        for transaction in transactions:
+            replayed = _resolve_branch_transaction(
                 branch_conn,
                 update_from_context,
-                branch_label,
-                statement,
+                branch,
+                transaction,
                 table_columns,
             )
             if replayed is not None:
@@ -266,195 +275,436 @@ def _resolve_branch_replay_safety(
     return resolved
 
 
-def _replace_remaining_standalone(
-    conflict: ConflictPair,
-    scope: BranchName,
-    replacement: Sequence[LoggedStatement] | None,
-    ours: list[LoggedTransaction],
-    theirs: list[LoggedTransaction],
-    frontier_ours_count: int,
-    frontier_theirs_count: int,
-) -> tuple[list[LoggedTransaction], list[LoggedTransaction]]:
-    """Remove accepted prefix and replace/delete one standalone transaction."""
+def _replace_or_delete_transaction(
+    context: ConflictCheckContext,
+    transactions: deque[LoggedTransaction],
+    metadata_index: RemainingMetadataIndex,
+    index: int,
+    replacement: LoggedTransaction | None,
+) -> None:
+    """Replace or delete one queued transaction in place."""
 
-    if scope == "ours":
-        next_ours = list(ours[conflict.ours_index:])
-        if replacement:
-            next_ours[0] = _transaction_with_statements(
-                next_ours[0],
-                replacement,
-            )
-        else:
-            next_ours = next_ours[1:]
-        return (
-            next_ours,
-            list(theirs[frontier_theirs_count:]),
-        )
-
-    next_theirs = list(theirs[conflict.theirs_index:])
-    if replacement:
-        next_theirs[0] = _transaction_with_statements(
-            next_theirs[0],
-            replacement,
-        )
+    metadata_index.remove_transaction(context, transactions[index])
+    if replacement is None:
+        del transactions[index]
     else:
-        next_theirs = next_theirs[1:]
-    return (
-        list(ours[frontier_ours_count:]),
-        next_theirs,
-    )
+        transactions[index] = replacement
+        metadata_index.add_transaction(context, replacement)
 
 
-def resolve_session(session_path: str | Path) -> int:
-    """Run a simple terminal resolver for one merge-session JSON file."""
+def _resolve_standalone_replay(
+    context: ConflictCheckContext,
+    scope: BranchName,
+    conflict: ConflictPair,
+    remaining_ours: deque[LoggedTransaction],
+    remaining_theirs: deque[LoggedTransaction],
+    metadata_indexes: MetadataIndexes,
+    table_columns,
+) -> StandaloneReplayOutcome:
+    """Edit/delete the current transaction that failed before pair comparison."""
 
-    session = read_merge_session(session_path)
-    if session.get("status") == "not_applicable":
-        print(session.get("message", "database is not applicable"))
-        return 1
-
-    paths = session["paths"]
-    base_path = Path(paths["base"])
-    merged_path = Path(paths["merged"])
-    try:
-        with closing(sqlite3.connect(base_path)) as base_conn:
-            require_valid_base(base_conn, base_path)
-    except MergeNotApplicableError as exc:
-        print(exc)
-        return 1
-
-    base_transaction_id = int(session["base_transaction_id"])
-    table_columns, primary_key_columns, key_column_sets = load_schema_metadata_from_db(
-        base_path,
-    )
-    ours = _session_logged_statements(
-        session.get("ours_transactions", []),
-        "ours",
+    target_queue = remaining_ours if scope == "ours" else remaining_theirs
+    target_transaction = target_queue[0]
+    replacement_statements = _prompt_standalone_transaction_resolution(
+        conflict,
+        scope,
+        target_transaction,
         table_columns,
+        context.base_cursor.connection,
     )
-    theirs = _session_logged_statements(
-        session.get("theirs_transactions", []),
-        "theirs",
-        table_columns,
+    replacement = (
+        None
+        if not replacement_statements
+        else _transaction_with_statements(
+            target_transaction,
+            replacement_statements,
+        )
     )
-    ours = _resolve_branch_replay_safety(
-        base_path,
-        "ours",
-        ours,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+    _replace_or_delete_transaction(
+        context,
+        target_queue,
+        metadata_indexes[scope],
+        0,
+        replacement,
     )
-    theirs = _resolve_branch_replay_safety(
-        base_path,
-        "theirs",
-        theirs,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
-    )
-    ours_transactions = group_logged_transactions(ours)
-    theirs_transactions = group_logged_transactions(theirs)
+    return "current_removed" if replacement is None else "current_changed"
 
-    resolved_plan: list[LoggedTransaction] = []
-    with closing(_load_planning_db(base_path)) as planning_conn:
-        while True:
-            plan = build_merge_plan_from_connection(
-                planning_conn,
-                ":memory:",
-                base_transaction_id,
-                ours_transactions,
-                theirs_transactions,
+
+def _resolve_remaining_pair_conflict(
+    context: ConflictCheckContext,
+    conflict: ConflictPair,
+    remaining_ours: deque[LoggedTransaction],
+    remaining_theirs: deque[LoggedTransaction],
+    metadata_indexes: MetadataIndexes,
+    table_columns,
+    *,
+    current_branch: BranchName,
+) -> PairConflictOutcome:
+    """Edit/delete a current-vs-remaining pair and describe what changed."""
+
+    ours_view = list(remaining_ours)
+    theirs_view = list(remaining_theirs)
+    resolution = _prompt_pair_transaction_resolution(
+        conflict,
+        ours_view,
+        theirs_view,
+        table_columns,
+        context.base_cursor.connection,
+        allow_accept=_is_reviewable_pair_conflict(conflict),
+    )
+    if resolution.action == "accept":
+        return PairConflictOutcome("accepted")
+
+    if resolution.changed_ours:
+        _replace_or_delete_transaction(
+            context,
+            remaining_ours,
+            metadata_indexes["ours"],
+            conflict.index_for_branch("ours"),
+            resolution.ours,
+        )
+    if resolution.changed_theirs:
+        _replace_or_delete_transaction(
+            context,
+            remaining_theirs,
+            metadata_indexes["theirs"],
+            conflict.index_for_branch("theirs"),
+            resolution.theirs,
+        )
+
+    return PairConflictOutcome(
+        "resolved",
+        ours=_pair_side_outcome(resolution.changed_ours, resolution.ours),
+        theirs=_pair_side_outcome(resolution.changed_theirs, resolution.theirs),
+    )
+
+
+def _pair_side_outcome(
+    changed: bool,
+    replacement: LoggedTransaction | None,
+) -> PairSideOutcome:
+    """Return whether one transaction was kept, edited, or deleted."""
+
+    if not changed:
+        return "unchanged"
+    if replacement is None:
+        return "deleted"
+    return "edited"
+
+
+def _is_reviewable_pair_conflict(conflict: ConflictPair) -> bool:
+    """Return whether the user can accept original SQL and keep checking."""
+
+    return bool(conflict.conflicts) and all(
+        statement_conflict.kind not in {"integrity", "replay_error"}
+        for statement_conflict in conflict.conflicts
+    )
+
+
+def _is_current_standalone_replay(
+    conflict: ConflictPair,
+    current_branch: BranchName,
+) -> bool:
+    """Return whether the scanner failed before comparing the opposite branch."""
+
+    return conflict.is_standalone and conflict.current_branch == current_branch
+
+
+def _standalone_head_conflict(
+    conflict: StatementConflict,
+    current_branch: BranchName,
+) -> ConflictPair:
+    """Build a queue-relative conflict for the current transaction head."""
+
+    return ConflictPair(
+        current_branch=current_branch,
+        other_index=None,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(conflict,),
+        is_standalone=True,
+    )
+
+
+def _unresolved_replay_safety_conflict(
+    transaction: LoggedTransaction,
+) -> StatementConflict | None:
+    """Return a standalone conflict for an unsafe statement in a transaction."""
+
+    for statement in transaction.statements:
+        if statement.is_replay_safe:
+            continue
+        return StatementConflict(
+            kind="replay_error",
+            message=(
+                statement.replay_block_reason
+                or "statement is unsafe for automatic replay"
+            ),
+            scope=transaction.branch,
+            details=(("statement_log_id", str(statement.log_id)),),
+        )
+    return None
+
+
+def _check_accept_current(
+    current_branch: BranchName,
+    remaining_ours: deque[LoggedTransaction],
+    remaining_theirs: deque[LoggedTransaction],
+    metadata_indexes: MetadataIndexes,
+    context: ConflictCheckContext,
+    table_columns,
+) -> bool:
+    """Resolve at most one fixed-order queue head for this branch."""
+
+    accepted_pair_keys: set[ConflictResolutionKey] = set()
+    current_queue = remaining_ours if current_branch == "ours" else remaining_theirs
+    other_queue = remaining_theirs if current_branch == "ours" else remaining_ours
+    other_branch: BranchName = "theirs" if current_branch == "ours" else "ours"
+    scan: _RemainingCurrentConflictScan | None = None
+    accepted_followup_conflict: ConflictPair | None = None
+
+    # Resolution helpers mutate the queues immediately; outcomes below only
+    # tell this turn whether to retry, continue the scan, or stop.
+    while current_queue:
+        current = current_queue[0]
+        safety_conflict = _unresolved_replay_safety_conflict(current)
+        if safety_conflict is not None:
+            if scan is not None:
+                scan.close()
+                scan = None
+            outcome = _resolve_standalone_replay(
+                context,
+                current_branch,
+                _standalone_head_conflict(safety_conflict, current_branch),
+                remaining_ours,
+                remaining_theirs,
+                metadata_indexes,
                 table_columns,
-                primary_key_columns,
-                key_column_sets,
-                search_frontier = False,
             )
+            if outcome == "current_removed":
+                return True
+            continue
 
-            prefix = plan.transaction_plan
-            error = _apply_to_planning_db(planning_conn, prefix)
-            if error is not None:
-                # The planner already checked this prefix on the same in-memory
-                # database shape; reaching this guard means a missed replay
-                # failure or an unexpected side effect from edited SQL.
-                print(f"Failed to apply accepted prefix: {error}")
-                return 1
-            resolved_plan.extend(prefix)
-
-            if plan.status == "clean":
-                break
-
-            conflict = plan.selected.next_conflict
-            if conflict is None:
-                ours_transactions, theirs_transactions = (
-                    list(ours_transactions[plan.selected.ours_count:]),
-                    list(theirs_transactions[plan.selected.theirs_count:]),
-                )
-                if not prefix and (ours_transactions or theirs_transactions):
-                    # Avoid spinning if a no-conflict frontier consumes no
-                    # transactions but there is still work left.
-                    print("Conflict search stopped without making progress.")
-                    return 1
-                if not ours_transactions and not theirs_transactions:
-                    break
-                continue
-
-            # For a "both" scoped standalone failure, resolve one side first;
-            # the next planning pass will surface the other side if needed.
-            standalone_scope = STANDALONE_RESOLUTION_SCOPE.get(plan.selected.scope)
-
-            if standalone_scope is not None:
-                replacement = _prompt_standalone_resolution(
+        if scan is None:
+            scan = _RemainingCurrentConflictScan(
+                current,
+                current_branch=current_branch,
+                context=context,
+                remaining_other_index=metadata_indexes[other_branch],
+                accepted_pair_keys=accepted_pair_keys,
+            )
+        if accepted_followup_conflict is not None:
+            conflict = accepted_followup_conflict
+            accepted_followup_conflict = None
+        else:
+            conflict = scan.next_conflict(other_queue)
+        if conflict is not None:
+            # scanner.start() may fail while replaying only the current head on
+            # control; that is a standalone prefix problem, not a pair conflict.
+            if _is_current_standalone_replay(conflict, current_branch):
+                outcome = _resolve_standalone_replay(
+                    context,
+                    current_branch,
                     conflict,
-                    standalone_scope,
-                    ours_transactions,
-                    theirs_transactions,
+                    remaining_ours,
+                    remaining_theirs,
+                    metadata_indexes,
                     table_columns,
                 )
-                ours_transactions, theirs_transactions = _replace_remaining_standalone(
-                    conflict,
-                    standalone_scope,
-                    replacement,
-                    ours_transactions,
-                    theirs_transactions,
-                    plan.selected.ours_count,
-                    plan.selected.theirs_count,
-                )
+                scan.close()
+                scan = None
+                if outcome == "current_removed":
+                    return True
+                if outcome == "current_changed":
+                    continue
             else:
-                while True:
-                    resolution = _prompt_pair_resolution(
+                pair_outcome = _resolve_remaining_pair_conflict(
+                    context,
+                    conflict,
+                    remaining_ours,
+                    remaining_theirs,
+                    metadata_indexes,
+                    table_columns,
+                    current_branch=current_branch,
+                )
+                if pair_outcome.action == "accepted":
+                    if conflict.resolution_key is not None:
+                        accepted_pair_keys.add(conflict.resolution_key)
+                    accepted_followup_conflict = scan.accept_current_conflict(
                         conflict,
-                        ours_transactions,
-                        theirs_transactions,
-                        table_columns,
+                        other_queue,
                     )
+                    continue
 
-                    error = _apply_to_planning_db(planning_conn, resolution)
-                    if error is None:
-                        resolved_plan.extend(resolution)
-                        ours_transactions = list(
-                            ours_transactions[conflict.ours_index + 1:]
-                        )
-                        theirs_transactions = list(
-                            theirs_transactions[conflict.theirs_index + 1:]
-                        )
-                        break
-                    print(f"Resolution failed: {error}")
+                current_outcome = pair_outcome.side(current_branch)
+                other_outcome = pair_outcome.side(other_branch)
+                if current_outcome == "deleted":
+                    scan.close()
+                    return True
+                if current_outcome == "edited":
+                    scan.close()
+                    scan = None
+                    continue
+                if other_outcome == "edited":
+                    scan.enable_checks_after_other_edit(
+                        metadata_indexes[other_branch],
+                    )
+                continue
+            continue
 
-        replay = replay_transaction_plan(base_path, merged_path, resolved_plan)
-        if not replay.ok:
-            error = replay.failure.error if replay.failure else "unknown replay failure"
-            print(f"Failed to write resolved database: {error}")
+        # If no pair checks were needed, current may not have been trial-run by
+        # the scanner. The final apply can still fail and needs user resolution.
+        scan.close()
+        scan = None
+        replay_error = apply_accepted_transaction(context, current)
+        if replay_error is not None:
+            outcome = _resolve_standalone_replay(
+                context,
+                current_branch,
+                _standalone_head_conflict(replay_error, current_branch),
+                remaining_ours,
+                remaining_theirs,
+                metadata_indexes,
+                table_columns,
+            )
+            if outcome == "current_removed":
+                return True
+            if outcome == "current_changed":
+                continue
+            continue
+
+        metadata_indexes[current_branch].remove_transaction(context, current)
+        current_queue.popleft()
+        return True
+    return True
+
+
+def _write_working_result(
+    context: ConflictCheckContext,
+    merged_path: Path,
+) -> None:
+    """Write the accepted working database to Git's merged path."""
+
+    source_conn = context.base_cursor.connection
+    source_conn.commit()
+    with closing(sqlite3.connect(merged_path)) as merged_conn:
+        source_conn.backup(merged_conn, name="main")
+
+
+def _resolve_merge_transactions(
+    *,
+    base_path: Path,
+    merged_path: Path,
+    ours_transactions: list[LoggedTransaction],
+    theirs_transactions: list[LoggedTransaction],
+    table_columns,
+    primary_key_columns,
+    key_column_sets,
+) -> int:
+    """Resolve loaded branch transactions and write the merged database."""
+
+    ours_transactions = _resolve_branch_replay_safety(
+        base_path,
+        "ours",
+        ours_transactions,
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+    theirs_transactions = _resolve_branch_replay_safety(
+        base_path,
+        "theirs",
+        theirs_transactions,
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+
+    remaining_ours: deque[LoggedTransaction] = deque(ours_transactions)
+    remaining_theirs: deque[LoggedTransaction] = deque(theirs_transactions)
+    with _open_merge_working_context(
+        base_path,
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    ) as context:
+        metadata_indexes: MetadataIndexes = {
+            "ours": RemainingMetadataIndex.from_transactions(
+                context,
+                remaining_ours,
+            ),
+            "theirs": RemainingMetadataIndex.from_transactions(
+                context,
+                remaining_theirs,
+            ),
+        }
+        while remaining_ours or remaining_theirs:
+            for branch in ("ours", "theirs"):
+                if not _check_accept_current(
+                    branch,
+                    remaining_ours,
+                    remaining_theirs,
+                    metadata_indexes,
+                    context,
+                    table_columns,
+                ):
+                    return 1
+        try:
+            _write_working_result(context, merged_path)
+        except (OSError, sqlite3.Error) as exc:
+            print(f"Failed to write resolved database: {exc}")
             return 1
+
     print(f"Resolved SQLite merge written to {merged_path}")
     return 0
 
 
+def resolve_direct_merge(
+    base_db_path: str | Path,
+    ours_db_path: str | Path,
+    theirs_db_path: str | Path,
+    merged_db_path: str | Path,
+) -> int:
+    """Run the terminal mergetool directly from Git's base/local/remote files."""
+
+    try:
+        (
+            ours_transactions,
+            theirs_transactions,
+            table_columns,
+            primary_key_columns,
+            key_column_sets,
+        ) = load_merge_inputs(base_db_path, ours_db_path, theirs_db_path)
+    except MergeNotApplicableError as exc:
+        print(exc)
+        return 1
+
+    return _resolve_merge_transactions(
+        base_path=Path(base_db_path),
+        merged_path=Path(merged_db_path),
+        ours_transactions=ours_transactions,
+        theirs_transactions=theirs_transactions,
+        table_columns=table_columns,
+        primary_key_columns=primary_key_columns,
+        key_column_sets=key_column_sets,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SQLite reconcile terminal mergetool")
-    parser.add_argument("session", help="Path to sqlite-reconcile session JSON")
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Git mergetool paths: BASE LOCAL REMOTE [MERGED]",
+    )
     args = parser.parse_args(argv)
-    return resolve_session(args.session)
+    if len(args.paths) in {3, 4}:
+        base, ours, theirs = args.paths[:3]
+        merged = args.paths[3] if len(args.paths) == 4 else ours
+        return resolve_direct_merge(base, ours, theirs, merged)
+
+    parser.error("expected BASE LOCAL REMOTE [MERGED]")
+    return 2
 
 
 if __name__ == "__main__":

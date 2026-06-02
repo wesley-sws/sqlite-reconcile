@@ -12,13 +12,13 @@ from .utils import TableColumns, TableKeyColumnSets, TablePrimaryKeyColumns
 
 BranchName = Literal["ours", "theirs"]
 ConflictScope = Literal["pair", "ours", "theirs", "both"]
+ForeignKeyEdges = tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...]
 ConflictKind = Literal[
     "write_write",
     "write_read",
     "implicit_insert_key",
     "integrity",
     "constraint_resolution",
-    "non_commutative",
     "replay_error",
 ]
 
@@ -70,11 +70,22 @@ class LoggedTransaction:
 
 @dataclass(frozen=True)
 class ConflictPair:
-    ours_index: int
-    theirs_index: int
+    current_branch: BranchName
+    other_index: int | None
     ours_sql: str
     theirs_sql: str
     conflicts: tuple["StatementConflict", ...] = ()
+    resolution_key: tuple[object, ...] | None = None
+    is_standalone: bool = False
+
+    def index_for_branch(self, branch: BranchName) -> int:
+        """Return the queue index for one side of this current-vs-other pair."""
+
+        if branch == self.current_branch:
+            return 0
+        if self.other_index is None:
+            raise ValueError("standalone conflict has no opposite-branch index")
+        return self.other_index
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,10 @@ class ConflictCheckContext:
     table_columns: TableColumns
     primary_key_columns: TablePrimaryKeyColumns = field(default_factory=dict)
     key_column_sets: TableKeyColumnSets = field(default_factory=dict)
+    integer_primary_key_columns: dict[str, str | None] = field(default_factory=dict)
+    foreign_key_edges_cache: dict[str, ForeignKeyEdges] = field(default_factory=dict)
+    control_schema: str | None = None
+    control_sql_rewriter: Callable[[str], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -171,62 +186,6 @@ class ConflictCheckResult:
         return self
 
 
-ConflictDetector = Callable[
-    [ConflictCheckContext, LoggedTransaction, LoggedTransaction],
-    ConflictCheckResult,
-]
-
-
-@dataclass(frozen=True)
-class FrontierCandidate:
-    name: str
-    ours_count: int
-    theirs_count: int
-    next_conflict: ConflictPair | None
-    scope: ConflictScope = "pair"
-
-    @property
-    def score(self) -> int:
-        return self.ours_count + self.theirs_count
-
-
-@dataclass(frozen=True)
-class ReplayFailure:
-    statement: dict[str, object] | None
-    error: str
-
-
-@dataclass(frozen=True)
-class ReplayResult:
-    ok: bool
-    output_path: str
-    applied_count: int
-    failure: ReplayFailure | None = None
-    integrity_errors: list[str] | None = None
-
-
-@dataclass(frozen=True)
-class MergePlan:
-    status: Literal["clean", "conflict"]
-    base_transaction_id: int
-    ours: list[LoggedTransaction]
-    theirs: list[LoggedTransaction]
-    selected: FrontierCandidate
-    transaction_plan: list[LoggedTransaction]
-    first_conflict: ConflictPair | None = None
-    candidates: list[FrontierCandidate] | None = None
-
-    @property
-    def statement_plan(self) -> list[LoggedStatement]:
-        """Return the plan flattened to statements for replay helpers/UI code."""
-
-        return [
-            statement
-            for transaction in self.transaction_plan
-            for statement in transaction.statements
-        ]
-
-
 class MergeNotApplicableError(Exception):
     """Raised when a database cannot be used for log-based merge."""
 
@@ -266,17 +225,8 @@ def statement_label(statement: LoggedStatement) -> str:
     return f"{prefix}{statement.branch_index + 1}"
 
 
-def statement_group_label(statements: Sequence[LoggedStatement]) -> str:
-    """Return a compact label for one statement or a transaction range."""
-
-    if not statements:
-        return "?"
-    if len(statements) == 1:
-        return statement_label(statements[0])
-    return f"{statement_label(statements[0])}-{statement_label(statements[-1])}"
-
-
 def transaction_label(transaction: LoggedTransaction) -> str:
     """Return a compact label for a logged transaction."""
 
-    return statement_group_label(transaction.statements)
+    prefix = "L" if transaction.branch == "ours" else "R"
+    return f"{prefix}{transaction.branch_index + 1}"

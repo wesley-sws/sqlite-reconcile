@@ -3,42 +3,46 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 from .log_merge import (
-    BranchName,
-    ConflictPair,
-    LoggedStatement,
-    LoggedTransaction,
     acknowledge_replay_warning,
     make_logged_statement,
 )
 from .models import (
-    ConflictScope,
-    StatementConflict,
-    statement_group_label,
+    BranchName,
+    ConflictPair,
+    LoggedStatement,
+    LoggedTransaction,
     statement_label,
     transaction_label,
 )
+from sqlite_replay_preparation import prepare_logged_sql
 from .sql_metadata import transaction_metadata
 
-STANDALONE_RESOLUTION_SCOPE: dict[ConflictScope, BranchName] = {
-    "ours": "ours",
-    "theirs": "theirs",
-    "both": "ours",
-}
+
+@dataclass(frozen=True)
+class PairTransactionResolution:
+    """User decision from resolving two conflicting transactions."""
+
+    action: Literal["accept", "replace"]
+    ours: LoggedTransaction | None
+    theirs: LoggedTransaction | None
+    changed_ours: bool = False
+    changed_theirs: bool = False
 
 
 def _group_title(label: str, statements: Sequence[LoggedStatement]) -> str:
     """Return a clear terminal heading for one side of a conflict."""
 
     branch = "Local" if statements and statements[0].branch == "ours" else "Remote"
-    unit = "transaction" if len(statements) > 1 else "statement"
-    return f"{branch} {unit} {label}"
+    return f"{branch} transaction {label}"
 
 
 def _print_indented_sql(sql_text: str, indent: str = "  ") -> None:
@@ -52,11 +56,8 @@ def _print_statement_group(label: str, statements: Sequence[LoggedStatement]) ->
     """Print all statements in a conflict group."""
 
     print(f"{_group_title(label, statements)}:")
-    if len(statements) == 1:
-        _print_indented_sql(statements[0].original_sql_text)
-        return
-    for statement in statements:
-        print(f"  {statement_label(statement)}:")
+    for index, statement in enumerate(statements):
+        print(f"  {_transaction_statement_label(label, statement, index)}:")
         _print_indented_sql(statement.original_sql_text, indent="    ")
 
 
@@ -67,28 +68,18 @@ def _conflict_messages(conflict: ConflictPair) -> str:
     )
 
 
-def _standalone_conflicts(conflict: ConflictPair) -> tuple[StatementConflict, ...]:
-    """Return scoped replay failures from one conflict pair."""
-
-    return tuple(
-        statement_conflict
-        for statement_conflict in conflict.conflicts
-        if statement_conflict.scope in {"ours", "theirs", "both"}
-    )
-
-
 def _standalone_conflict_message(conflict: ConflictPair, scope: BranchName) -> str:
     """Return replay messages for the standalone branch being resolved."""
 
     scoped_conflicts = [
         statement_conflict
-        for statement_conflict in _standalone_conflicts(conflict)
+        for statement_conflict in conflict.conflicts
         if statement_conflict.scope == scope
     ]
     if not scoped_conflicts:
         scoped_conflicts = [
             statement_conflict
-            for statement_conflict in _standalone_conflicts(conflict)
+            for statement_conflict in conflict.conflicts
             if statement_conflict.scope == "both"
         ]
     return "\n".join(
@@ -104,48 +95,28 @@ def _edit_label_hint(
 
     if not lookup:
         return "none"
-
-    hints: list[str] = []
-    for branch, prefix in (("ours", "L"), ("theirs", "R")):
-        original_indexes = sorted(
-            statement.branch_index
-            for _, _, statement in lookup.values()
-            if statement.branch == branch and statement.branch_index >= 0
-        )
-        if original_indexes:
-            first = f"{prefix}{original_indexes[0] + 1}"
-            last = f"{prefix}{original_indexes[-1] + 1}"
-            hints.append(first if first == last else f"{first}-{last}")
-
-        new_indexes = sorted(
-            abs(statement.branch_index)
-            for _, _, statement in lookup.values()
-            if statement.branch == branch and statement.branch_index < 0
-        )
-        if new_indexes:
-            new_prefix = f"{prefix}N"
-            first = f"{new_prefix}{new_indexes[0]}"
-            last = f"{new_prefix}{new_indexes[-1]}"
-            hints.append(first if first == last else f"{first}-{last}")
-    return ", ".join(hints)
+    return ", ".join(lookup)
 
 
 def _replace_statement_sql(
     statement: LoggedStatement,
     sql_text: str,
+    replay_conn: sqlite3.Connection,
     table_columns,
 ) -> LoggedStatement:
     """Reparse edited SQL while preserving the original branch/log identity."""
 
+    prepared = prepare_logged_sql(sql_text, replay_conn)
     return make_logged_statement(
         branch=statement.branch,
         branch_index=statement.branch_index,
         log_id=statement.log_id,
         transaction_id=statement.transaction_id,
         committed_at=statement.committed_at,
-        sql_text=sql_text,
-        original_sql_text=sql_text,
-        is_replay_safe=True,
+        sql_text=prepared.to_replay_sql_text,
+        original_sql_text=prepared.original_sql_text,
+        is_replay_safe=prepared.is_replay_safe,
+        replay_block_reason=prepared.replay_block_reason,
         table_columns=table_columns,
     )
 
@@ -154,6 +125,7 @@ def _new_statement_sql(
     transaction: LoggedTransaction,
     statements: Sequence[LoggedStatement],
     sql_text: str,
+    replay_conn: sqlite3.Connection,
     table_columns,
 ) -> LoggedStatement:
     """Create a user-inserted statement inside an existing transaction."""
@@ -167,60 +139,74 @@ def _new_statement_sql(
         default=0,
     ) - 1
     log_id = min((statement.log_id for statement in statements), default=0)
+    prepared = prepare_logged_sql(sql_text, replay_conn)
     return make_logged_statement(
         branch=transaction.branch,
         branch_index=branch_index,
         log_id=min(log_id, 0) - 1,
         transaction_id=transaction.transaction_id,
         committed_at=transaction.committed_at,
-        sql_text=sql_text,
-        original_sql_text=sql_text,
-        is_replay_safe=True,
+        sql_text=prepared.to_replay_sql_text,
+        original_sql_text=prepared.original_sql_text,
+        is_replay_safe=prepared.is_replay_safe,
+        replay_block_reason=prepared.replay_block_reason,
         table_columns=table_columns,
     )
-
 
 
 def _prompt_update_from_warning(
     statement: LoggedStatement,
     table_columns,
+    replay_conn: sqlite3.Connection,
     warning: str,
 ) -> LoggedStatement | None:
     """Prompt after an UPDATE FROM warning; Enter keeps and runs the statement."""
 
-    label = statement_label(statement)
-    current = statement
-    print()
-    print(f"Warning for {label}: {warning}. SQLite may choose any matching row.")
-    print(f"{label}: {current.original_sql_text}")
-    while True:
-        replacement = input(
-            f"{label} action [Enter to run shown SQL, :edit for editor, "
-            "DELETE or ; to skip]: "
-        ).strip()
-        if not replacement:
-            return current
-        if replacement.upper() == "DELETE" or replacement == ";":
-            return None
-        if replacement == ":edit":
-            replacement = _edit_sql_in_editor(label, current.sql_text) or ""
-        if replacement:
-            current = _replace_statement_sql(current, replacement, table_columns)
-            print(f"{label}: {current.original_sql_text}")
+    replacement, _ = _prompt_statement_warning(
+        statement,
+        table_columns,
+        replay_conn,
+        warning,
+        "SQLite may choose any matching row",
+        acknowledge_on_accept=False,
+    )
+    return replacement
 
 
 def _prompt_replay_warning(
     statement: LoggedStatement,
     table_columns,
+    replay_conn: sqlite3.Connection,
     warning: str,
 ) -> tuple[LoggedStatement | None, bool]:
     """Prompt after a replay warning; Enter keeps and runs the statement."""
+
+    return _prompt_statement_warning(
+        statement,
+        table_columns,
+        replay_conn,
+        warning,
+        "Replaying may produce different values",
+        acknowledge_on_accept=True,
+    )
+
+
+def _prompt_statement_warning(
+    statement: LoggedStatement,
+    table_columns,
+    replay_conn: sqlite3.Connection,
+    warning: str,
+    description: str,
+    *,
+    acknowledge_on_accept: bool,
+) -> tuple[LoggedStatement | None, bool]:
+    """Prompt for warning acknowledgement or edited replacement SQL."""
 
     label = statement_label(statement)
     current = statement
     changed = False
     print()
-    print(f"Warning for {label}: {warning}. Replaying may produce different values.")
+    print(f"Warning for {label}: {warning}. {description}.")
     print(f"{label}: {current.original_sql_text}")
     while True:
         replacement = input(
@@ -228,16 +214,22 @@ def _prompt_replay_warning(
             "DELETE or ; to skip]: "
         ).strip()
         if not replacement:
-            return acknowledge_replay_warning(current), changed
+            if acknowledge_on_accept:
+                return acknowledge_replay_warning(current), changed
+            return current, changed
         if replacement.upper() == "DELETE" or replacement == ";":
             return None, True
         if replacement == ":edit":
             replacement = _edit_sql_in_editor(label, current.sql_text) or ""
         if replacement:
-            current = _replace_statement_sql(current, replacement, table_columns)
+            current = _replace_statement_sql(
+                current,
+                replacement,
+                replay_conn,
+                table_columns,
+            )
             changed = True
             print(f"{label}: {current.original_sql_text}")
-
 
 
 def _transaction_with_statements(
@@ -255,33 +247,8 @@ def _transaction_with_statements(
     )
 
 
-
-def _parse_order(
-    raw: str,
-    labels: dict[str, LoggedTransaction],
-) -> list[LoggedTransaction] | None:
-    """Parse semicolon-separated transaction labels like A; B;."""
-
-    text = raw.strip()
-    if not text:
-        return [transaction for transaction in labels.values() if transaction.statements]
-    tokens = [token.strip().upper() for token in text.split(";") if token.strip()]
-    if not tokens:
-        return []
-
-    selected: list[LoggedTransaction] = []
-    for token in tokens:
-        transaction = labels.get(token)
-        if transaction is None:
-            print(f"Unknown label {token}. Valid labels: {', '.join(labels)}")
-            return None
-        if transaction.statements:
-            selected.append(transaction)
-    return selected
-
-
 def _parse_edit_command(raw: str) -> str | None:
-    """Return label from edit commands like ':edit L1' or 'edit L1;'."""
+    """Return label from edit commands like ':edit L1.1' or 'edit L1.1;'."""
 
     text = raw.strip().rstrip(";").strip()
     upper_text = text.upper()
@@ -294,7 +261,7 @@ def _parse_edit_command(raw: str) -> str | None:
 
 
 def _parse_delete_command(raw: str) -> str | None:
-    """Return label from delete commands like 'delete L1;'."""
+    """Return label from delete commands like 'delete L1.1;'."""
 
     text = raw.strip().rstrip(";").strip()
     upper_text = text.upper()
@@ -306,7 +273,7 @@ def _parse_delete_command(raw: str) -> str | None:
 
 
 def _parse_insert_command(raw: str) -> tuple[str, str] | None:
-    """Return insert position and anchor label from 'insert before/after L1;'."""
+    """Return insert position and anchor label from 'insert before/after L1.1;'."""
 
     text = raw.strip().rstrip(";").strip()
     parts = text.split()
@@ -348,46 +315,6 @@ def _configured_editor() -> str:
     )
 
 
-def _one_line_sql(sql_text: str) -> str:
-    """Return SQL compacted for an editable single-line terminal prompt."""
-
-    return " ".join(line.strip() for line in sql_text.splitlines() if line.strip())
-
-
-def _input_with_prefill(prompt: str, initial_text: str) -> str:
-    """Read one line with readline prefilled text when the terminal supports it."""
-
-    try:
-        import readline
-    except ImportError:
-        return input(prompt)
-
-    def prefill() -> None:
-        readline.insert_text(initial_text)
-        readline.redisplay()
-
-    readline.set_startup_hook(prefill)
-    try:
-        return input(prompt)
-    finally:
-        readline.set_startup_hook(None)
-
-
-def _edit_sql_inline(label: str, sql_text: str) -> str | None:
-    """Read replacement SQL from an editable prefilled terminal prompt."""
-
-    initial_sql = _one_line_sql(sql_text)
-    print(f"Editing {label}. Edit the prefilled SQL, or press Enter to keep it.")
-    try:
-        edited = _input_with_prefill(f"{label} SQL> ", initial_sql).strip()
-    except EOFError:
-        return None
-
-    if not edited or edited == initial_sql:
-        return None
-    return edited
-
-
 def _edit_sql_in_editor(label: str, sql_text: str) -> str | None:
     """Open prefilled SQL in an external editor and return the edited text."""
 
@@ -417,50 +344,6 @@ def _edit_sql_in_editor(label: str, sql_text: str) -> str | None:
     return edited
 
 
-def _prompt_replacement(
-    statement: LoggedStatement,
-    table_columns,
-    *,
-    show_statement: bool = True,
-) -> LoggedStatement | None:
-    """Prompt for optional SQL replacement; return None when skipped."""
-
-    label = statement_label(statement)
-    current = statement
-    changed = False
-    if show_statement:
-        print(f"{label}: {current.original_sql_text}")
-
-    while True:
-        enter_action = "apply shown SQL" if changed else "delete/skip"
-        prompt = (
-            f"{label} action [Enter to {enter_action}, :edit for editor, "
-            "DELETE or ; to skip]: "
-        )
-        replacement = input(prompt).strip()
-
-        if not replacement:
-            if not changed:
-                return None
-            return current
-        if replacement.upper() == "DELETE" or replacement == ";":
-            return None
-        if replacement == ":edit":
-            replacement = _edit_sql_in_editor(label, current.sql_text) or ""
-        if replacement:
-            current = _replace_statement_sql(current, replacement, table_columns)
-            changed = True
-            print(f"{label}: {current.original_sql_text}")
-
-
-def _statement_labels(
-    transactions_by_label: dict[str, LoggedTransaction],
-) -> list[str]:
-    """Return editable statement labels from transaction values."""
-
-    return list(_statement_lookup(transactions_by_label))
-
-
 def _statement_lookup(
     transactions_by_label: dict[str, LoggedTransaction],
 ) -> dict[str, tuple[str, LoggedTransaction, LoggedStatement]]:
@@ -468,13 +351,30 @@ def _statement_lookup(
 
     lookup: dict[str, tuple[str, LoggedTransaction, LoggedStatement]] = {}
     for transaction_label_text, transaction in transactions_by_label.items():
-        for statement in transaction.statements:
-            lookup[statement_label(statement)] = (
+        for index, statement in enumerate(transaction.statements):
+            statement_label_text = _transaction_statement_label(
+                transaction_label_text,
+                statement,
+                index,
+            )
+            lookup[statement_label_text] = (
                 transaction_label_text,
                 transaction,
                 statement,
             )
     return lookup
+
+
+def _transaction_statement_label(
+    transaction_label_text: str,
+    statement: LoggedStatement,
+    statement_index: int,
+) -> str:
+    """Return a label for one statement inside a shown transaction."""
+
+    if statement.branch_index < 0:
+        return f"{transaction_label_text}.N{abs(statement.branch_index)}"
+    return f"{transaction_label_text}.{statement_index + 1}"
 
 
 def _replace_transaction_statement(
@@ -541,6 +441,7 @@ def _handle_transaction_edit_command(
     raw: str,
     transactions_by_label: dict[str, LoggedTransaction],
     table_columns,
+    replay_conn: sqlite3.Connection,
 ) -> str:
     """Apply edit/delete/insert commands to editable transactions."""
 
@@ -586,6 +487,7 @@ def _handle_transaction_edit_command(
             transaction,
             transaction.statements,
             edited_sql,
+            replay_conn,
             table_columns,
         )
         updated = _insert_transaction_statement(
@@ -620,6 +522,7 @@ def _handle_transaction_edit_command(
             replacement = _replace_statement_sql(
                 statement,
                 edited_sql,
+                replay_conn,
                 table_columns,
             )
         updated = _replace_transaction_statement(transaction, statement, replacement)
@@ -632,81 +535,115 @@ def _handle_transaction_edit_command(
     return "not_command"
 
 
-def _prompt_pair_resolution(
+def _prompt_pair_transaction_resolution(
     conflict: ConflictPair,
     ours: list[LoggedTransaction],
     theirs: list[LoggedTransaction],
     table_columns,
-) -> list[LoggedTransaction]:
-    """Prompt for pair conflict resolution."""
+    replay_conn: sqlite3.Connection,
+    *,
+    allow_accept: bool = False,
+) -> PairTransactionResolution:
+    """Prompt for resolving two transactions, then let the merge loop revalidate."""
 
-    ours_statements = list(ours[conflict.ours_index].statements)
-    theirs_statements = list(theirs[conflict.theirs_index].statements)
-    ours_label = statement_group_label(ours_statements)
-    theirs_label = statement_group_label(theirs_statements)
-    ours_order_label = "A"
-    theirs_order_label = "B"
-    print()
-    print(
-        f"{_group_title(ours_label, ours_statements)} and "
-        f"{_group_title(theirs_label, theirs_statements)} conflict:"
-    )
-    print(_conflict_messages(conflict))
-    _print_statement_group(ours_label, ours_statements)
-    _print_statement_group(theirs_label, theirs_statements)
-    print(
-        f"{ours_order_label} = {ours_label} "
-        f"({_group_title(ours_label, ours_statements)})"
-    )
-    print(
-        f"{theirs_order_label} = {theirs_label} "
-        f"({_group_title(theirs_label, theirs_statements)})"
-    )
+    ours_transaction = ours[conflict.index_for_branch("ours")]
+    theirs_transaction = theirs[conflict.index_for_branch("theirs")]
+    ours_label = transaction_label(ours_transaction)
+    theirs_label = transaction_label(theirs_transaction)
     resolved_labels = {
-        ours_order_label: _transaction_with_statements(
-            ours[conflict.ours_index],
-            ours_statements,
+        ours_label: _transaction_with_statements(
+            ours_transaction,
+            ours_transaction.statements,
         ),
-        theirs_order_label: _transaction_with_statements(
-            theirs[conflict.theirs_index],
-            theirs_statements,
+        theirs_label: _transaction_with_statements(
+            theirs_transaction,
+            theirs_transaction.statements,
         ),
     }
-    valid_edit_labels = _statement_labels(resolved_labels)
+    changed = False
+
+    print()
     print(
-        f"Enter replay order such as '{ours_order_label}; {theirs_order_label};', "
-        f"'{theirs_order_label};', or ';' for neither."
+        f"{_group_title(ours_label, ours_transaction.statements)} and "
+        f"{_group_title(theirs_label, theirs_transaction.statements)} conflict:"
     )
-    _print_transaction_edit_help(valid_edit_labels)
+    print(_conflict_messages(conflict))
+    _print_statement_group(ours_label, ours_transaction.statements)
+    _print_statement_group(theirs_label, theirs_transaction.statements)
+    print(f"A = local transaction {ours_label}")
+    print(f"B = remote transaction {theirs_label}")
+
     while True:
-        raw = input("Resolution [Enter for shown order]: ").strip()
+        valid_labels = list(_statement_lookup(resolved_labels))
+        if not valid_labels:
+            return PairTransactionResolution(
+                action="replace",
+                ours=None,
+                theirs=None,
+                changed_ours=True,
+                changed_theirs=True,
+            )
+
+        if changed:
+            print("Press Enter to revalidate the shown transactions.")
+        elif allow_accept:
+            print("Press Enter to accept this reviewable conflict and keep checking.")
+        else:
+            print("Edit or delete at least one shown statement before retrying.")
+        _print_transaction_edit_help(valid_labels)
+        raw = input("Resolution: ").strip()
+
+        if not raw:
+            if allow_accept and not changed:
+                return PairTransactionResolution(
+                    action="accept",
+                    ours=ours_transaction,
+                    theirs=theirs_transaction,
+                )
+            if changed:
+                ours_updated = resolved_labels[ours_label]
+                theirs_updated = resolved_labels[theirs_label]
+                return PairTransactionResolution(
+                    action="replace",
+                    ours=ours_updated if ours_updated.statements else None,
+                    theirs=theirs_updated if theirs_updated.statements else None,
+                    changed_ours=ours_updated != ours_transaction,
+                    changed_theirs=theirs_updated != theirs_transaction,
+                )
+            print("No change made yet.")
+            continue
+        if raw.upper() == "DELETE" or raw == ";":
+            return PairTransactionResolution(
+                action="replace",
+                ours=None,
+                theirs=None,
+                changed_ours=True,
+                changed_theirs=True,
+            )
+
         edit_result = _handle_transaction_edit_command(
             raw,
             resolved_labels,
             table_columns,
+            replay_conn,
         )
-        if edit_result != "not_command":
+        if edit_result == "changed":
+            changed = True
             continue
+        if edit_result == "handled":
+            continue
+        print(f"Unknown action. Use 'edit {valid_labels[0]};', DELETE, or ;.")
 
-        order = _parse_order(raw, resolved_labels)
-        if order is not None:
-            return order
 
-
-def _prompt_standalone_resolution(
+def _prompt_standalone_transaction_resolution(
     conflict: ConflictPair,
     scope: BranchName,
-    ours: list[LoggedTransaction],
-    theirs: list[LoggedTransaction],
+    transaction: LoggedTransaction,
     table_columns,
+    replay_conn: sqlite3.Connection,
 ) -> list[LoggedStatement] | None:
-    """Prompt for standalone transaction failure resolution."""
+    """Prompt for resolving one transaction that failed on its own."""
 
-    transaction = (
-        ours[conflict.ours_index]
-        if scope == "ours"
-        else theirs[conflict.theirs_index]
-    )
     label = transaction_label(transaction)
     resolved_transaction = {
         label: _transaction_with_statements(transaction, transaction.statements),
@@ -720,7 +657,7 @@ def _prompt_standalone_resolution(
 
     while True:
         current_transaction = resolved_transaction[label]
-        valid_labels = _statement_labels(resolved_transaction)
+        valid_labels = list(_statement_lookup(resolved_transaction))
         if not valid_labels:
             print(f"{label}: all statements deleted; this transaction will be skipped.")
             return []
@@ -728,12 +665,15 @@ def _prompt_standalone_resolution(
         if changed:
             print("Press Enter to retry the shown transaction, or ';' to skip it.")
         else:
-            print("Press Enter or ';' to skip this transaction.")
+            print("Edit or delete at least one shown statement before retrying.")
         _print_transaction_edit_help(valid_labels)
         raw = input("Resolution: ").strip()
 
         if not raw:
-            return list(current_transaction.statements) if changed else None
+            if changed:
+                return list(current_transaction.statements)
+            print("No change made yet.")
+            continue
         if raw.upper() == "DELETE" or raw == ";":
             return None
 
@@ -741,6 +681,7 @@ def _prompt_standalone_resolution(
             raw,
             resolved_transaction,
             table_columns,
+            replay_conn,
         )
         if edit_result == "changed":
             changed = True

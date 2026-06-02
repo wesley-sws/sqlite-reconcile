@@ -5,7 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from merge import conflict_detection, log_merge, static_analysis
+from merge import log_merge, static_analysis
+from merge.models import BranchName
 
 
 def make_context(table_columns, schema=()):
@@ -19,7 +20,12 @@ def make_context(table_columns, schema=()):
     )
 
 
-def make_statement(sql_text, table_columns, branch="ours", index=0):
+def make_statement(
+    sql_text,
+    table_columns,
+    branch: BranchName = "ours",
+    index=0,
+):
     return log_merge.make_logged_statement(
         branch=branch,
         branch_index=index,
@@ -35,11 +41,12 @@ def conflict_kinds(result):
     return [conflict.kind for conflict in result.conflicts]
 
 
-def static_match(context, ours, theirs):
+def static_match(context, ours, theirs, *, current_branch=None):
     return static_analysis.static_analysis_matching(
         context,
         log_merge.group_logged_transactions([ours])[0].metadata,
         log_merge.group_logged_transactions([theirs])[0].metadata,
+        current_branch=current_branch,
     )
 
 
@@ -65,31 +72,22 @@ def test_static_analysis_flags_update_same_column_write_write():
     assert "products.discount" in result.conflicts[0].message
 
 
-def test_conflict_detection_reports_integrity_before_static_conflicts():
-    table_columns = {
-        "products": {"id", "name"},
-    }
-    context = make_context(
-        table_columns,
-        schema=[
-            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)",
-        ],
-    )
-    ours = make_statement(
-        "INSERT INTO products(id, name) VALUES (1, 'A')",
-        table_columns,
-        branch="ours",
-    )
-    theirs = make_statement(
-        "INSERT INTO products(id, name) VALUES (1, 'B')",
-        table_columns,
-        branch="theirs",
-    )
+def test_foreign_key_edges_skip_mismatched_parent_pk_shorthand():
+    with sqlite3.connect(":memory:") as con:
+        con.execute("CREATE TABLE parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+        con.execute("CREATE TABLE child (x INTEGER REFERENCES parent)")
+        table_columns, primary_key_columns, key_column_sets = (
+            log_merge.load_schema_metadata(con.cursor())
+        )
+        context = log_merge.ConflictCheckContext(
+            base_cursor=con.cursor(),
+            base_db_path=":memory:",
+            table_columns=table_columns,
+            primary_key_columns=primary_key_columns,
+            key_column_sets=key_column_sets,
+        )
 
-    result = conflict_detection.statements_conflict(context, ours, theirs)
-
-    assert conflict_kinds(result) == ["integrity"]
-    assert "UNIQUE constraint failed" in result.conflicts[0].message
+        assert static_analysis.foreign_key_edges(context) == ()
 
 
 def test_static_analysis_allows_update_different_columns():
@@ -113,7 +111,7 @@ def test_static_analysis_allows_update_different_columns():
     assert not result.has_conflict
 
 
-def test_static_analysis_flags_write_read_in_both_directions():
+def test_static_analysis_flags_write_read():
     table_columns = {
         "products": {"id", "discount"},
         "product_statistics": {"id", "average_discount"},
@@ -135,6 +133,33 @@ def test_static_analysis_flags_write_read_in_both_directions():
 
     assert conflict_kinds(result) == ["write_read"]
     assert "ours writes products.discount" in result.conflicts[0].message
+
+
+def test_static_analysis_can_limit_write_read_to_one_direction():
+    table_columns = {
+        "products": {"id", "discount", "name"},
+    }
+    context = make_context(table_columns)
+    ours = make_statement(
+        "UPDATE products SET discount = (SELECT name FROM products WHERE id = 1)",
+        table_columns,
+        branch="ours",
+    )
+    theirs = make_statement(
+        "UPDATE products SET name = (SELECT discount FROM products WHERE id = 1)",
+        table_columns,
+        branch="theirs",
+    )
+
+    both = static_match(context, ours, theirs)
+    ours_current = static_match(context, ours, theirs, current_branch="ours")
+    theirs_current = static_match(context, ours, theirs, current_branch="theirs")
+
+    assert conflict_kinds(both) == ["write_read", "write_read"]
+    assert conflict_kinds(ours_current) == ["write_read"]
+    assert "ours writes products.discount" in ours_current.conflicts[-1].message
+    assert conflict_kinds(theirs_current) == ["write_read"]
+    assert "theirs writes products.name" in theirs_current.conflicts[-1].message
 
 
 def test_static_analysis_treats_insert_as_writing_all_columns_for_write_read():
@@ -180,7 +205,7 @@ def test_static_analysis_delete_delete_can_still_report_write_read():
     assert conflict_kinds(result) == ["write_read", "write_read"]
 
 
-def test_static_analysis_implicit_key_insert_conflicts_with_other_insert():
+def test_static_analysis_implicit_key_insert_allows_explicit_other_insert():
     table_columns = {
         "products": {"id", "sku", "name"},
     }
@@ -206,11 +231,10 @@ def test_static_analysis_implicit_key_insert_conflicts_with_other_insert():
 
     result = static_match(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_key"]
-    assert "ours INSERT omits explicit key values" in result.conflicts[0].message
+    assert not result.has_conflict
 
 
-def test_static_analysis_unique_insert_still_conflicts_when_pk_is_omitted():
+def test_static_analysis_implicit_key_insert_conflicts_with_other_implicit_insert():
     table_columns = {
         "products": {"id", "sku", "name"},
     }
@@ -229,7 +253,7 @@ def test_static_analysis_unique_insert_still_conflicts_when_pk_is_omitted():
         branch="ours",
     )
     theirs = make_statement(
-        "INSERT INTO products(id, name) VALUES (1, 'Gadget')",
+        "INSERT INTO products(name) VALUES ('Gadget')",
         table_columns,
         branch="theirs",
     )
@@ -237,7 +261,7 @@ def test_static_analysis_unique_insert_still_conflicts_when_pk_is_omitted():
     result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["implicit_insert_key"]
-    assert "ours INSERT omits explicit key values" in result.conflicts[0].message
+    assert "ours INSERT omits products.id" in result.conflicts[0].message
 
 
 def test_static_analysis_all_key_sets_explicit_does_not_trigger_implicit_key():
@@ -350,8 +374,7 @@ def test_static_analysis_implicit_key_insert_conflicts_with_key_read():
 
     result = static_match(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_key", "write_read"]
-    assert "references or writes id" in result.conflicts[0].message
+    assert conflict_kinds(result) == ["write_read"]
 
 
 def test_static_analysis_implicit_key_dml_uses_omitted_key_columns_only():
@@ -384,7 +407,7 @@ def test_static_analysis_implicit_key_dml_uses_omitted_key_columns_only():
     assert not result.has_conflict
 
 
-def test_static_analysis_implicit_key_dml_conflicts_on_omitted_key_column():
+def test_static_analysis_unique_key_omission_does_not_trigger_implicit_rowid():
     table_columns = {
         "memberships": {"team_id", "user_id", "note"},
     }
@@ -411,8 +434,7 @@ def test_static_analysis_implicit_key_dml_conflicts_on_omitted_key_column():
 
     result = static_match(context, ours, theirs)
 
-    assert conflict_kinds(result) == ["implicit_insert_key"]
-    assert "user_id" in result.conflicts[0].message
+    assert not result.has_conflict
 
 
 def test_static_analysis_ignores_insert_omitting_current_timestamp_default():

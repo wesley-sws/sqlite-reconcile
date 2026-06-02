@@ -5,8 +5,8 @@ How it works:
 - Buffers write statements between ``BEGIN`` and ``COMMIT``.
 - Writes one transaction row to ``_sqlite_merge_transactions`` and one log row
     per statement in ``_sqlite_merge_log``.
-- Log rows store the original SQL for display and the replay SQL used by the
-    merge driver. Unsafe nondeterministic statements are marked as blocked from
+- Log rows store the original SQL for display and the replay SQL used during
+    merge. Unsafe nondeterministic statements are marked as blocked from
     automatic replay.
 - A statement executed outside an explicit ``BEGIN``/``COMMIT`` block
     is treated as an implicit single-statement transaction.
@@ -32,15 +32,14 @@ from pathlib import Path
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import ParseError
 
 _WRAPPER_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _WRAPPER_DIR.parent
-if str(_WRAPPER_DIR) not in sys.path:
-    sys.path.insert(0, str(_WRAPPER_DIR))
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from wrapper_replay_preparation import (  # noqa: E402
+from sqlite_replay_preparation import (  # noqa: E402
     LogEntry,
     PARAMETERIZED_REWRITE_REASON,
     prepare_logged_sql,
@@ -93,7 +92,7 @@ def _should_log(sql: str) -> bool:
 
     try:
         parsed = sqlglot.parse_one(sql, dialect="sqlite")
-    except sqlglot.errors.ParseError:
+    except ParseError:
         # Prefer logging an unsafe unusual CTE statement over silently missing
         # a write because its leading token is WITH.
         return True
@@ -327,6 +326,8 @@ class SQLiteWrapper:
                 f"INSERT INTO {TX_TABLE} DEFAULT VALUES"
             )
             tx_id = cursor.lastrowid
+            if tx_id is None:
+                raise RuntimeError("SQLite did not return a transaction row id")
 
             # Insert all statements referencing this transaction
             self._conn.executemany(

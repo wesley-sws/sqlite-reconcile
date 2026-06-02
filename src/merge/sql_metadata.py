@@ -11,9 +11,11 @@ import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import sqlglot
 from sqlglot import expressions as exp
+from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from sqlite_conflict_resolution import (
@@ -21,14 +23,17 @@ from sqlite_conflict_resolution import (
     normalize_sql_for_sqlglot,
 )
 
+from .sql_ast import has_ancestor_before_root, with_ctes
 from .utils import ALL_COLUMNS, TableColumns, table_expression, table_name
 
 IgnoredRelations = dict[str, set[str]]
+StatementKind = Literal["insert", "update", "delete", "other"]
 
 DEFAULT_VALUES_INSERT_PATTERN = re.compile(
     r"\bDEFAULT\s+VALUES\b",
     flags=re.IGNORECASE,
 )
+REVIEWABLE_CONFLICT_RESOLUTION_ALGORITHMS = {"IGNORE", "REPLACE"}
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,9 @@ class StatementMetadata:
     """Parsed SQL plus the statement-level read/write tables and columns."""
 
     parsed_sql_text: exp.Expression
+    statement_kind: StatementKind
     conflict_resolution: SQLiteConflictResolution | None
+    has_reviewable_constraint_resolution: bool
     table_updated: str | None
     columns_updated: set[str]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
@@ -65,6 +72,9 @@ class TransactionMetadata:
     """Statement metadata plus aggregate transaction-level read/write sets."""
 
     statements: tuple[StatementMetadata, ...]
+    has_insert: bool
+    has_update: bool
+    has_delete: bool
     tables_updated_to_columns_updated: dict[str, set[str]]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
 
@@ -80,11 +90,25 @@ def transaction_metadata(
     for statement in statement_tuple:
         if statement.table_updated is not None:
             updated[statement.table_updated].update(statement.columns_updated)
-        for table, columns in statement.tables_referenced_to_columns_referenced.items():
+        for table, columns in (
+            statement.tables_referenced_to_columns_referenced.items()
+        ):
             referenced[table].update(columns)
 
     return TransactionMetadata(
         statements=statement_tuple,
+        has_insert=any(
+            statement.statement_kind == "insert"
+            for statement in statement_tuple
+        ),
+        has_update=any(
+            statement.statement_kind == "update"
+            for statement in statement_tuple
+        ),
+        has_delete=any(
+            statement.statement_kind == "delete"
+            for statement in statement_tuple
+        ),
         tables_updated_to_columns_updated=dict(updated),
         tables_referenced_to_columns_referenced=dict(referenced),
     )
@@ -100,7 +124,12 @@ def parse_statement_metadata(
     parsed_sql_text = _parse_one(compatible.sql)
     return StatementMetadata(
         parsed_sql_text=parsed_sql_text,
+        statement_kind=_statement_kind(parsed_sql_text),
         conflict_resolution=compatible.conflict_resolution,
+        has_reviewable_constraint_resolution=(
+            compatible.stripped_upsert
+            or _is_reviewable_conflict_resolution(compatible.conflict_resolution)
+        ),
         table_updated=_target_table_name(parsed_sql_text),
         columns_updated=_updated_columns(parsed_sql_text),
         tables_referenced_to_columns_referenced=_referenced_tables_to_columns(
@@ -118,11 +147,37 @@ def unsupported_statement_metadata(sql_text: str) -> StatementMetadata:
             this="UNSUPPORTED_SQL",
             expression=exp.Literal.string(sql_text),
         ),
+        statement_kind="other",
         conflict_resolution=None,
+        has_reviewable_constraint_resolution=False,
         table_updated=None,
         columns_updated=set(),
         tables_referenced_to_columns_referenced={},
     )
+
+
+def _is_reviewable_conflict_resolution(
+    conflict_resolution: SQLiteConflictResolution | None,
+) -> bool:
+    """Return whether syntax can hide a constraint violation during replay."""
+
+    return (
+        conflict_resolution is not None
+        and conflict_resolution.algorithm.upper()
+        in REVIEWABLE_CONFLICT_RESOLUTION_ALGORITHMS
+    )
+
+
+def _statement_kind(parsed_sql_text: exp.Expression) -> StatementKind:
+    """Return the DML kind used by higher-level merge filters."""
+
+    if isinstance(parsed_sql_text, exp.Insert):
+        return "insert"
+    if isinstance(parsed_sql_text, exp.Update):
+        return "update"
+    if isinstance(parsed_sql_text, exp.Delete):
+        return "delete"
+    return "other"
 
 
 def _parse_one(sql_text: str) -> exp.Expression:
@@ -130,7 +185,7 @@ def _parse_one(sql_text: str) -> exp.Expression:
 
     try:
         return sqlglot.parse_one(sql_text, dialect="sqlite")
-    except sqlglot.errors.ParseError:
+    except ParseError:
         normalized = _normalize_default_values_insert(sql_text)
         if normalized == sql_text:
             raise
@@ -193,7 +248,7 @@ def _referenced_tables_to_columns(
     )
     cte_definition_frame = ResolutionFrame(_new_source_map())
 
-    for cte in _with_ctes(parsed_sql_text):
+    for cte in with_ctes(parsed_sql_text):
         _collect_select_scope_references(
             references,
             cte.this,
@@ -481,7 +536,12 @@ def _dml_outer_sources(
     if isinstance(parsed_sql_text, (exp.Update, exp.Delete)):
         target_table = table_expression(parsed_sql_text.this)
         if target_table is not None:
-            _add_table_source(sources, target_table, ignored_relations)
+            _add_table_source(
+                sources,
+                target_table,
+                ignored_relations,
+                allow_cte_shadowing=False,
+            )
 
     if isinstance(parsed_sql_text, exp.Update):
         for table in _from_table_sources(parsed_sql_text.args.get("from")):
@@ -499,7 +559,7 @@ def _from_table_sources(from_expression: exp.Expression | None) -> list[exp.Tabl
     return [
         table
         for table in from_expression.find_all(exp.Table)
-        if not _has_ancestor_before_root(table, exp.Select, from_expression)
+        if not has_ancestor_before_root(table, exp.Select, from_expression)
     ]
 
 
@@ -507,6 +567,8 @@ def _add_table_source(
     sources: SourceMap,
     table: exp.Table,
     ignored_relations: IgnoredRelations,
+    *,
+    allow_cte_shadowing: bool = True,
 ) -> None:
     """Add a real table source, or ignore a source known to be a CTE."""
 
@@ -515,7 +577,7 @@ def _add_table_source(
         return
 
     alias = table.alias_or_name
-    if not table.db and table_name in ignored_relations:
+    if allow_cte_shadowing and not table.db and table_name in ignored_relations:
         ignored_columns = ignored_relations[table_name]
         sources.ignored_aliases.add(alias)
         sources.ignored_aliases.add(table_name)
@@ -551,22 +613,12 @@ def _explicit_output_aliases(expression: exp.Expression) -> set[str]:
     }
 
 
-def _with_ctes(expression: exp.Expression) -> list[exp.CTE]:
-    """Return CTE definitions attached to expression, if any."""
-
-    with_expression = expression.args.get("with")
-    if with_expression is None:
-        return []
-
-    return list(with_expression.expressions or [])
-
-
 def _cte_output_columns(expression: exp.Expression) -> IgnoredRelations:
     """Return top-level CTE names mapped to their output column names."""
 
     return {
         cte.alias: set(cte.alias_column_names) or _expression_output_columns(cte.this)
-        for cte in _with_ctes(expression)
+        for cte in with_ctes(expression)
         if cte.alias
     }
 
@@ -584,7 +636,7 @@ def _scope_output_columns(scope: Scope) -> set[str]:
 def _expression_output_columns(expression: exp.Expression) -> set[str]:
     """Return output names for SELECT-like expressions, or '*' if unknown."""
 
-    columns = set(expression.named_selects)
+    columns = {str(column) for column in getattr(expression, "named_selects", ())}
     return columns or {ALL_COLUMNS}
 
 
@@ -626,7 +678,7 @@ def _outermost_select_roots(expression: exp.Expression) -> list[exp.Expression]:
     return [
         select
         for select in expression.find_all(exp.Select)
-        if not _has_ancestor_before_root(select, exp.Select, expression)
+        if not has_ancestor_before_root(select, exp.Select, expression)
     ]
 
 
@@ -638,7 +690,7 @@ def _direct_columns(expression: exp.Expression) -> list[exp.Column]:
     return [
         column
         for column in columns
-        if not _has_ancestor_before_root(column, exp.Select, expression)
+        if not has_ancestor_before_root(column, exp.Select, expression)
     ]
 
 
@@ -647,22 +699,6 @@ def _has_direct_bare_star(expression: exp.Expression) -> bool:
 
     return any(
         not isinstance(star.parent, exp.Column)
-        and not _has_ancestor_before_root(star, exp.Select, expression)
+        and not has_ancestor_before_root(star, exp.Select, expression)
         for star in expression.find_all(exp.Star)
     )
-
-
-def _has_ancestor_before_root(
-    node: exp.Expression,
-    ancestor_type: type[exp.Expression],
-    root: exp.Expression,
-) -> bool:
-    """Return whether node has an ancestor of type before reaching root."""
-
-    parent = node.parent
-    while parent is not None and parent is not root:
-        if isinstance(parent, ancestor_type):
-            return True
-        parent = parent.parent
-
-    return False

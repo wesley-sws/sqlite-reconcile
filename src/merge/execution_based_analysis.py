@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-import shutil
 import sqlite3
-import subprocess
-import tempfile
 import uuid
-from collections import Counter
-from contextlib import closing
-from pathlib import Path
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -15,28 +9,21 @@ from typing import Literal
 from sqlglot import expressions as exp
 from sqlite_conflict_resolution import strict_conflict_resolution_rewrite
 
-from .log_merge import (
+from .models import (
     ConflictCheckContext,
     ConflictScope,
     ConflictKind,
-    ConflictCheckResult,
     LoggedTransaction,
     LoggedStatement,
     StatementConflict,
-)
-from .models import (
     statement_label,
     transaction_label,
 )
-from .static_analysis import write_read_candidate_indexes, write_write_candidate_pairs
 from .sql_metadata import StatementMetadata
 from .utils import (
-    is_delete_statement,
-    is_insert_statement,
     is_update_statement,
     primary_key_columns as schema_primary_key_columns,
     quote_identifier,
-    rollback_savepoint,
     table_expression,
 )
 
@@ -73,198 +60,23 @@ class SQLiteReplayFailure:
     statement: LoggedStatement | None = None
 
 
-def commutativity_check(
-    context: ConflictCheckContext,
-    first: LoggedStatement,
-    second: LoggedStatement,
-) -> ConflictCheckResult:
-    """Replay A->B and B->A on base copies, then compare with sqldiff."""
+def _strict_conflict_resolution_statement(
+    statement: LoggedStatement,
+) -> LoggedStatement | None:
+    """Return a statement copy with reviewable conflict syntax stripped."""
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        first_then_second = Path(tmp_dir) / "first_then_second.db"
-        second_then_first = Path(tmp_dir) / "second_then_first.db"
-        shutil.copy2(context.base_db_path, first_then_second)
-        shutil.copy2(context.base_db_path, second_then_first)
+    rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
+    if rewrite is None:
+        return None
 
-        error = _replay_statements(first_then_second, (first, second))
-        if error is not None:
-            return ConflictCheckResult((
-                StatementConflict(kind="replay_error", message=error),
-            ))
-
-        error = _replay_statements(second_then_first, (second, first))
-        if error is not None:
-            return ConflictCheckResult((
-                StatementConflict(kind="replay_error", message=error),
-            ))
-
-        diff = _sqldiff(first_then_second, second_then_first)
-        if diff is None:
-            return ConflictCheckResult((
-                StatementConflict(kind="replay_error", message="sqldiff not found"),
-            ))
-        if diff:
-            return ConflictCheckResult((
-                StatementConflict(kind="non_commutative", message="commutativity check"),
-            ))
-
-    return ConflictCheckResult()
-
-
-def execution_based_matching(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-    static_result: ConflictCheckResult,
-    *,
-    check_integrity: bool = True,
-) -> ConflictCheckResult:
-    """Recheck static conflicts with targeted SQLite execution where possible."""
-
-    if check_integrity:
-        conflicts = sqlite_replay_conflicts(context, ours_transaction, theirs_transaction)
-        if conflicts:
-            return ConflictCheckResult(conflicts)
-
-    result = static_result
-    result = _check_write_read(
-        context,
-        ours_transaction,
-        theirs_transaction,
-        result,
-    )
-    result = _check_write_write(
-        context,
-        ours_transaction,
-        theirs_transaction,
-        result,
-    )
-    return result
-
-
-def sqlite_replay_conflicts(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-) -> tuple[StatementConflict, ...]:
-    """Return integrity or replay conflicts from trying both pair orders."""
-
-    failures = _pair_replay_failures(context, ours_transaction, theirs_transaction)
-    if not failures:
-        return _constraint_resolution_conflicts(
-            context,
-            ours_transaction,
-            theirs_transaction,
-        )
-
-    branch_failures = [
-        failure
-        for failure in failures
-        if failure.scope in {"ours", "theirs"}
-    ]
-    if branch_failures:
-        return tuple(
-            _standalone_replay_conflict(failure)
-            for failure in branch_failures
-        )
-
-    failure = failures[0]
-    return (
-        StatementConflict(
-            kind=failure.kind,
-            message=f"{failure.order_label}: {failure.message}",
+    return replace(
+        statement,
+        to_replay_sql_text=rewrite.sql,
+        replay_warnings=(
+            *statement.replay_warnings,
+            f"strict replay removed {rewrite.label}",
         ),
     )
-
-
-def _constraint_resolution_conflicts(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-) -> tuple[StatementConflict, ...]:
-    """
-    Detect successful statements that only succeed due to conflict resolution.
-
-    The original SQL has already replayed successfully. Replaying a strict
-    version without OR IGNORE / OR REPLACE / UPSERT tells us whether SQLite's
-    conflict-resolution path was required under the current prefix.
-    """
-
-    conflicts: list[StatementConflict] = []
-    context.base_cursor.execute("PRAGMA foreign_keys = ON")
-    for transaction, other_transaction in (
-        (ours_transaction, theirs_transaction),
-        (theirs_transaction, ours_transaction),
-    ):
-        strict_transaction = _strict_conflict_resolution_transaction(transaction)
-        if strict_transaction is None:
-            continue
-
-        standalone_failure = _savepoint_replay_failure(
-            context.base_cursor,
-            strict_transaction.statements,
-            (),
-            f"strict {transaction_label(transaction)}",
-        )
-        if standalone_failure is not None:
-            conflicts.append(
-                _constraint_resolution_conflict(
-                    transaction,
-                    standalone_failure,
-                    scope=transaction.branch,
-                    after_transaction=None,
-                )
-            )
-            continue
-
-        pair_failure = _savepoint_replay_failure(
-            context.base_cursor,
-            other_transaction.statements,
-            strict_transaction.statements,
-            f"{transaction_label(other_transaction)} then strict "
-            f"{transaction_label(transaction)}",
-        )
-        if pair_failure is not None:
-            conflicts.append(
-                _constraint_resolution_conflict(
-                    transaction,
-                    pair_failure,
-                    scope="pair",
-                    after_transaction=other_transaction,
-                )
-            )
-
-    return tuple(conflicts)
-
-
-def _strict_conflict_resolution_transaction(
-    transaction: LoggedTransaction,
-) -> LoggedTransaction | None:
-    """Return a copy with reviewable conflict-resolution syntax stripped."""
-
-    changed = False
-    statements: list[LoggedStatement] = []
-    for statement in transaction.statements:
-        rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
-        if rewrite is None:
-            statements.append(statement)
-            continue
-
-        changed = True
-        statements.append(
-            replace(
-                statement,
-                to_replay_sql_text=rewrite.sql,
-                replay_warnings=(
-                    *statement.replay_warnings,
-                    f"strict replay removed {rewrite.label}",
-                ),
-            )
-        )
-
-    if not changed:
-        return None
-    return replace(transaction, statements=tuple(statements))
 
 
 def _constraint_resolution_conflict(
@@ -300,233 +112,6 @@ def _constraint_resolution_conflict(
     )
 
 
-def _check_write_write(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-    result: ConflictCheckResult,
-) -> ConflictCheckResult:
-    """Use affected primary-key rows to clear supported write/write conflicts."""
-
-    if not result.has_kind("write_write"):
-        return result
-
-    if len(ours_transaction.statements) == 1 and len(theirs_transaction.statements) == 1:
-        row_overlap = statement_write_write_row_overlap(
-            context,
-            ours_transaction.statements[0].metadata,
-            theirs_transaction.statements[0].metadata,
-        )
-        if row_overlap is None:
-            return result
-        if not row_overlap:
-            return result.without_kind("write_write")
-
-        return result.replace_kind(
-            "write_write",
-            (
-                StatementConflict(
-                    kind="write_write",
-                    message=(
-                        f"{statement_label(ours_transaction.statements[0])} and "
-                        f"{statement_label(theirs_transaction.statements[0])} "
-                        "update/delete overlapping rows"
-                    ),
-                ),
-            ),
-        )
-
-    return _check_transaction_write_write(
-        context,
-        ours_transaction,
-        theirs_transaction,
-        result,
-    )
-
-
-def statement_write_write_row_overlap(
-    context: ConflictCheckContext,
-    ours_metadata: StatementMetadata,
-    theirs_metadata: StatementMetadata,
-) -> bool | None:
-    """Return whether supported single statements affect overlapping PK rows."""
-
-    ours_select = _affected_primary_key_select(context, ours_metadata)
-    theirs_select = _affected_primary_key_select(context, theirs_metadata)
-    if ours_select is None or theirs_select is None:
-        return None
-
-    query = (
-        "SELECT 1 FROM ("
-        f"SELECT * FROM ({ours_select}) "
-        "INTERSECT "
-        f"SELECT * FROM ({theirs_select})"
-        ") LIMIT 1"
-    )
-    return context.base_cursor.execute(query).fetchone() is not None
-
-
-def statement_write_read_dependency_outcome(
-    context: ConflictCheckContext,
-    writer_statement: LoggedStatement,
-    reader_metadata: StatementMetadata,
-) -> WriteReadProbeResult:
-    """Return whether the writer affects reader output in a savepoint."""
-
-    writer_metadata = writer_statement.metadata
-    if not _can_simulate_writer(writer_metadata):
-        return WriteReadProbeResult(
-            "not_refined",
-            "writer statement cannot be simulated safely",
-        )
-
-    probe_result = _read_probe_result(context, reader_metadata)
-    if probe_result.status == "no_read_dependency":
-        return WriteReadProbeResult("unaffected")
-    if probe_result.status == "not_refined" or probe_result.sql is None:
-        return WriteReadProbeResult("not_refined", probe_result.reason)
-
-    base_probe = probe_result.sql
-    cursor = context.base_cursor
-    before_table = _temp_probe_result_table_name()
-    savepoint = quote_identifier(f"sqlite_merge_write_read_{uuid.uuid4().hex}")
-    savepoint_started = False
-    try:
-        _create_probe_result_table(cursor, before_table, base_probe)
-        cursor.execute(f"SAVEPOINT {savepoint}")
-        savepoint_started = True
-
-        cursor.execute(writer_statement.sql_text)
-
-        if _is_update_from_statement(
-            reader_metadata,
-        ) and _probe_has_duplicate_target_rows(context, reader_metadata, base_probe):
-            return WriteReadProbeResult(
-                "not_refined",
-                "reader UPDATE FROM has multiple source rows after writer replay",
-            )
-
-        query = _stored_probe_difference_query(before_table, base_probe)
-        if cursor.execute(query).fetchone() is not None:
-            return WriteReadProbeResult("affected", affected_reader_indexes=(0,))
-        return WriteReadProbeResult("unaffected")
-    except sqlite3.Error:
-        return WriteReadProbeResult(
-            "not_refined",
-            "write-read probe failed during SQLite execution",
-        )
-    finally:
-        if savepoint_started:
-            rollback_savepoint(cursor, savepoint)
-        cursor.execute(f"DROP TABLE IF EXISTS {quote_identifier(before_table)}")
-
-
-def _check_write_read(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-    result: ConflictCheckResult,
-) -> ConflictCheckResult:
-    """Use read probes to clear supported write/read conflicts."""
-
-    directions = _write_read_directions(result.of_kind("write_read"))
-    if not directions:
-        return result
-
-    if len(ours_transaction.statements) != 1 or len(theirs_transaction.statements) != 1:
-        return _check_transaction_write_read(
-            context,
-            ours_transaction,
-            theirs_transaction,
-            result,
-            directions,
-        )
-
-    transactions_by_label = {
-        "ours": ours_transaction,
-        "theirs": theirs_transaction,
-    }
-    checks: list[tuple[LoggedTransaction, LoggedTransaction, WriteReadProbeResult]] = []
-    for writer_label, reader_label in directions:
-        writer_transaction = transactions_by_label[writer_label]
-        reader_transaction = transactions_by_label[reader_label]
-        checks.append((
-            writer_transaction,
-            reader_transaction,
-            statement_write_read_dependency_outcome(
-                context,
-                writer_transaction.statements[0],
-                reader_transaction.statements[0].metadata,
-            ),
-        ))
-    if any(check.status == "not_refined" for _, _, check in checks):
-        return result
-
-    affected_conflicts = [
-        StatementConflict(
-            kind="write_read",
-            message=_write_read_conflict_message(
-                writer_transaction,
-                reader_transaction,
-                check,
-            ),
-        )
-        for writer_transaction, reader_transaction, check in checks
-        if check.status == "affected"
-    ]
-    if not affected_conflicts:
-        return result.without_kind("write_read")
-
-    return result.replace_kind("write_read", affected_conflicts)
-
-
-def _check_transaction_write_read(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-    result: ConflictCheckResult,
-    directions: Sequence[tuple[str, str]],
-) -> ConflictCheckResult:
-    """Use transaction-prefix read probes to clear write/read conflicts."""
-
-    transactions_by_label = {
-        "ours": ours_transaction,
-        "theirs": theirs_transaction,
-    }
-    checks: list[tuple[LoggedTransaction, LoggedTransaction, WriteReadProbeResult]] = []
-    for writer_label, reader_label in directions:
-        writer_transaction = transactions_by_label[writer_label]
-        reader_transaction = transactions_by_label[reader_label]
-        checks.append((
-            writer_transaction,
-            reader_transaction,
-            transaction_write_read_dependency_outcome(
-                context,
-                writer_transaction=writer_transaction,
-                reader_transaction=reader_transaction,
-            ),
-        ))
-    if not checks or any(check.status == "not_refined" for _, _, check in checks):
-        return result
-
-    affected_conflicts = [
-        StatementConflict(
-            kind="write_read",
-            message=_write_read_conflict_message(
-                writer_transaction,
-                reader_transaction,
-                check,
-            ),
-        )
-        for writer_transaction, reader_transaction, check in checks
-        if check.status == "affected"
-    ]
-    if not affected_conflicts:
-        return result.without_kind("write_read")
-
-    return result.replace_kind("write_read", affected_conflicts)
-
-
 def _write_read_conflict_message(
     writer_transaction: LoggedTransaction,
     reader_transaction: LoggedTransaction,
@@ -553,213 +138,6 @@ def _statement_list_label(statements: Sequence[LoggedStatement]) -> str:
     """Return comma-separated labels for non-contiguous statement lists."""
 
     return ", ".join(statement_label(statement) for statement in statements)
-
-
-def transaction_write_read_dependency_outcome(
-    context: ConflictCheckContext,
-    *,
-    writer_transaction: LoggedTransaction,
-    reader_transaction: LoggedTransaction,
-) -> WriteReadProbeResult:
-    """Return whether the writer transaction affects reader probes."""
-
-    if any(
-        not _can_simulate_writer(statement.metadata)
-        for statement in writer_transaction.statements
-    ):
-        return WriteReadProbeResult(
-            "not_refined",
-            "writer transaction cannot be simulated safely",
-        )
-
-    indexes = set(
-        write_read_candidate_indexes(
-            writer_transaction.metadata,
-            reader_transaction.metadata,
-        )
-    )
-    if not indexes:
-        return WriteReadProbeResult("unaffected")
-
-    cursor = context.base_cursor
-    before_results: dict[int, Counter[tuple[object, ...]]] = {}
-    baseline_savepoint = quote_identifier(
-        f"sqlite_merge_tx_read_base_{uuid.uuid4().hex}"
-    )
-    cursor.execute(f"SAVEPOINT {baseline_savepoint}")
-    try:
-        for index, statement in enumerate(reader_transaction.statements):
-            if index in indexes:
-                probe = _read_probe_result(context, statement.metadata)
-                if probe.status == "no_read_dependency":
-                    indexes.discard(index)
-                elif probe.status == "not_refined" or probe.sql is None:
-                    return WriteReadProbeResult("not_refined", probe.reason)
-                else:
-                    before_results[index] = _fetch_probe_rows(cursor, probe.sql)
-            cursor.execute(statement.sql_text)
-    except sqlite3.Error:
-        return WriteReadProbeResult(
-            "not_refined",
-            "baseline transaction read probe failed during SQLite execution",
-        )
-    finally:
-        rollback_savepoint(cursor, baseline_savepoint)
-
-    if not before_results:
-        return WriteReadProbeResult("unaffected")
-
-    after_savepoint = quote_identifier(
-        f"sqlite_merge_tx_read_after_{uuid.uuid4().hex}"
-    )
-    cursor.execute(f"SAVEPOINT {after_savepoint}")
-    try:
-        for statement in writer_transaction.statements:
-            cursor.execute(statement.sql_text)
-
-        affected_reader_indexes: list[int] = []
-        for index, statement in enumerate(reader_transaction.statements):
-            if index in before_results:
-                probe = _read_probe_result(context, statement.metadata)
-                if probe.status != "ok" or probe.sql is None:
-                    return WriteReadProbeResult("not_refined", probe.reason)
-                if _is_update_from_statement(
-                    statement.metadata,
-                ) and _probe_has_duplicate_target_rows(
-                    context,
-                    statement.metadata,
-                    probe.sql,
-                ):
-                    return WriteReadProbeResult(
-                        "not_refined",
-                        "reader UPDATE FROM has multiple source rows after writer replay",
-                    )
-                if _fetch_probe_rows(cursor, probe.sql) != before_results[index]:
-                    affected_reader_indexes.append(index)
-            cursor.execute(statement.sql_text)
-
-        if affected_reader_indexes:
-            return WriteReadProbeResult(
-                "affected",
-                affected_reader_indexes=tuple(affected_reader_indexes),
-            )
-    except sqlite3.Error:
-        return WriteReadProbeResult(
-            "not_refined",
-            "transaction write-read probe failed during SQLite execution",
-        )
-    finally:
-        rollback_savepoint(cursor, after_savepoint)
-
-    return WriteReadProbeResult("unaffected")
-
-
-def _write_read_directions(
-    conflicts: Sequence[StatementConflict],
-) -> tuple[tuple[str, str], ...] | None:
-    """Return write/read branch directions from static conflict details."""
-
-    directions: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for conflict in conflicts:
-        if len(conflict.details) < 2:
-            return None
-
-        direction = (conflict.details[0][1], conflict.details[1][1])
-
-        if direction not in seen:
-            seen.add(direction)
-            directions.append(direction)
-    return tuple(directions)
-
-
-def _check_transaction_write_write(
-    context: ConflictCheckContext,
-    ours_transaction: LoggedTransaction,
-    theirs_transaction: LoggedTransaction,
-    result: ConflictCheckResult,
-) -> ConflictCheckResult:
-    """Use transaction-local affected PKs to clear write/write conflicts."""
-
-    candidate_pairs = write_write_candidate_pairs(
-        ours_transaction.metadata,
-        theirs_transaction.metadata,
-    )
-    if not candidate_pairs:
-        return result.without_kind("write_write")
-
-    ours_indexes = {ours_index for ours_index, _ in candidate_pairs}
-    theirs_indexes = {theirs_index for _, theirs_index in candidate_pairs}
-    ours_footprints = _transaction_write_footprints(
-        context,
-        ours_transaction,
-        ours_indexes,
-    )
-    theirs_footprints = _transaction_write_footprints(
-        context,
-        theirs_transaction,
-        theirs_indexes,
-    )
-    if ours_footprints is None or theirs_footprints is None:
-        return result
-
-    for ours_index, theirs_index in candidate_pairs:
-        ours_rows = ours_footprints.get(ours_index)
-        theirs_rows = theirs_footprints.get(theirs_index)
-        if ours_rows is None or theirs_rows is None:
-            return result
-        if ours_rows & theirs_rows:
-            return result.replace_kind(
-                "write_write",
-                (
-                    StatementConflict(
-                        kind="write_write",
-                        message=(
-                            f"{statement_label(ours_transaction.statements[ours_index])} "
-                            "and "
-                            f"{statement_label(theirs_transaction.statements[theirs_index])} "
-                            "update/delete overlapping rows"
-                        ),
-                    ),
-                ),
-            )
-
-    return result.without_kind("write_write")
-
-
-def _transaction_write_footprints(
-    context: ConflictCheckContext,
-    transaction: LoggedTransaction,
-    candidate_indexes: set[int],
-) -> dict[int, set[tuple[object, ...]]] | None:
-    """Collect affected primary keys under a transaction's own prefix."""
-
-    footprints: dict[int, set[tuple[object, ...]]] = {}
-    cursor = context.base_cursor
-    savepoint = quote_identifier(f"sqlite_merge_tx_write_{uuid.uuid4().hex}")
-    cursor.execute(f"SAVEPOINT {savepoint}")
-    try:
-        for index, statement in enumerate(transaction.statements):
-            if index in candidate_indexes:
-                probe = _affected_primary_key_select(context, statement.metadata)
-                if probe is None:
-                    return None
-                footprints[index] = set(_fetch_probe_rows(cursor, probe))
-            cursor.execute(statement.sql_text)
-    except sqlite3.Error:
-        return None
-    finally:
-        rollback_savepoint(cursor, savepoint)
-    return footprints
-
-
-def _fetch_probe_rows(
-    cursor: sqlite3.Cursor,
-    probe: str,
-) -> Counter[tuple[object, ...]]:
-    """Fetch probe output into a multiset for Python-side comparison."""
-
-    return Counter(tuple(row) for row in cursor.execute(probe))
 
 
 def _affected_primary_key_select(
@@ -1111,19 +489,6 @@ def _from_expression_sql(from_expression: exp.Expression) -> str:
     return from_expression.sql(dialect="sqlite").removeprefix("FROM ").strip()
 
 
-def _can_simulate_writer(metadata: StatementMetadata) -> bool:
-    """
-    Return whether writer can be replayed inside a rollback-only savepoint.
-    Unsupported writers are kept as static conflicts instead.
-    """
-
-    return (
-        is_insert_statement(metadata)
-        or is_update_statement(metadata)
-        or is_delete_statement(metadata)
-    )
-
-
 def _temp_probe_result_table_name() -> str:
     """Return a unique temporary table name for stored probe rows."""
 
@@ -1142,32 +507,6 @@ def _create_probe_result_table(
         f"{quote_identifier(result_table)} AS "
         f"SELECT * FROM ({probe})"
     )
-
-
-def _pair_replay_failures(
-    context: ConflictCheckContext,
-    first: LoggedTransaction,
-    second: LoggedTransaction,
-) -> tuple[SQLiteReplayFailure, ...]:
-    """Return SQLite failures found from trying both pair orders."""
-
-    cursor = context.base_cursor
-    cursor.execute("PRAGMA foreign_keys = ON")
-    failures: list[SQLiteReplayFailure] = []
-    for label, first_group, second_group in (
-        ("ours then theirs", first.statements, second.statements),
-        ("theirs then ours", second.statements, first.statements),
-    ):
-        failure = _savepoint_replay_failure(
-            cursor,
-            first_group,
-            second_group,
-            label,
-        )
-        if failure is not None:
-            failures.append(failure)
-
-    return tuple(failures)
 
 
 def _standalone_replay_conflict(
@@ -1190,45 +529,6 @@ def _standalone_replay_conflict(
     )
 
 
-def _savepoint_replay_failure(
-    cursor: sqlite3.Cursor,
-    first_statements: Sequence[LoggedStatement],
-    second_statements: Sequence[LoggedStatement],
-    order_label: str,
-) -> SQLiteReplayFailure | None:
-    """Try one pair order inside a savepoint, then discard all effects."""
-
-    savepoint = quote_identifier(f"sqlite_merge_replay_{uuid.uuid4().hex}")
-    cursor.execute(f"SAVEPOINT {savepoint}")
-    try:
-        for group_index, statements in enumerate((first_statements, second_statements)):
-            for statement in statements:
-                scope: ConflictScope = statement.branch if group_index == 0 else "pair"
-                try:
-                    cursor.execute(statement.sql_text)
-                except sqlite3.Error as exc:
-                    return SQLiteReplayFailure(
-                        kind=_sqlite_error_conflict_kind(exc),
-                        scope=scope,
-                        message=str(exc),
-                        order_label=order_label,
-                        statement=statement,
-                    )
-
-                deferred_error = _foreign_key_check_error(cursor)
-                if deferred_error is not None:
-                    return SQLiteReplayFailure(
-                        kind="integrity",
-                        scope=scope,
-                        message=deferred_error,
-                        order_label=order_label,
-                        statement=statement,
-                    )
-        return None
-    finally:
-        rollback_savepoint(cursor, savepoint)
-
-
 def _sqlite_error_conflict_kind(error: sqlite3.Error) -> ConflictKind:
     """Map SQLite exceptions to merge conflict kinds."""
 
@@ -1237,56 +537,19 @@ def _sqlite_error_conflict_kind(error: sqlite3.Error) -> ConflictKind:
     return "replay_error"
 
 
-def _foreign_key_check_error(cursor: sqlite3.Cursor) -> str | None:
+def _foreign_key_check_error(
+    cursor: sqlite3.Cursor,
+    *,
+    schema: str | None = None,
+) -> str | None:
     """Return a deferred foreign-key error detected after replaying statements."""
 
-    row = cursor.execute("PRAGMA foreign_key_check").fetchone()
+    pragma = (
+        "PRAGMA foreign_key_check"
+        if schema is None
+        else f"PRAGMA {quote_identifier(schema)}.foreign_key_check"
+    )
+    row = cursor.execute(pragma).fetchone()
     if row is None:
         return None
-    return f"foreign key check failed: {tuple(row)}"
-
-
-def _replay_statements(
-    db_path: Path,
-    statements: Sequence[LoggedStatement],
-) -> str | None:
-    """Apply statements to db_path and return an error string on failure."""
-
-    try:
-        with closing(sqlite3.connect(db_path)) as con:
-            con.execute("PRAGMA foreign_keys = ON")
-            for statement in statements:
-                con.execute(statement.sql_text)
-            con.commit()
-    except sqlite3.Error as exc:
-        return str(exc)
-    return None
-
-
-def _sqldiff(first_path: Path, second_path: Path) -> str | None:
-    """Return sqldiff output, or None when sqldiff is unavailable."""
-
-    sqldiff_path = _sqldiff_path()
-    if sqldiff_path is None:
-        return None
-
-    completed = subprocess.run(
-        [str(sqldiff_path), str(first_path), str(second_path)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout + completed.stderr
-
-
-def _sqldiff_path() -> Path | None:
-    """Locate sqldiff from PATH or the repository-local fallback."""
-
-    path = shutil.which("sqldiff")
-    if path is not None:
-        return Path(path)
-
-    local_path = Path(__file__).resolve().parents[2] / "tools" / "bin" / "sqldiff"
-    if local_path.exists():
-        return local_path
-    return None
+    return f"foreign_key_check failed: {tuple(row)}"

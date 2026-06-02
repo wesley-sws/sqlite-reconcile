@@ -2,7 +2,7 @@
 
 set -e  # Exit on error
 
-# Setup script for sqlite-reconcile merge driver
+# Setup script for sqlite-reconcile terminal mergetool
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
@@ -249,15 +249,15 @@ source "$REPO_ROOT/venv/bin/activate"
 echo "Installing dependencies..."
 pip install -q -r "$REPO_ROOT/requirements.txt"
 
-# Make the merge driver executable
+# Make the terminal mergetool executable
 chmod +x "$REPO_ROOT/src/sqlite-reconcile"
 
-# Configure git merge driver for this repository (for testing/development)
-git config merge.sqlite-reconcile.name "SQLite merge driver" # --global for driver to work across all repos
-git config merge.sqlite-reconcile.driver "PATH=\"$REPO_ROOT/tools/bin:\$PATH\" \"$REPO_ROOT/venv/bin/python\" \"$REPO_ROOT/src/sqlite-reconcile\" %O %A %B %L %P"
+# Configure git mergetool for this repository (for testing/development)
+git config mergetool.sqlite-reconcile.cmd "PATH=\"$REPO_ROOT/tools/bin:\$PATH\" \"$REPO_ROOT/venv/bin/python\" \"$REPO_ROOT/src/sqlite-reconcile\" \"\$BASE\" \"\$LOCAL\" \"\$REMOTE\" \"\$MERGED\""
+git config mergetool.sqlite-reconcile.trustExitCode true
 
 echo "✓ Setup complete!"
 echo "  Virtual environment: $REPO_ROOT/venv"
-echo "  Driver: $REPO_ROOT/src/sqlite-reconcile"
+echo "  Mergetool: $REPO_ROOT/src/sqlite-reconcile"
 echo "  File patterns: *.db, *.sqlite"
 echo "  Note: Run 'source ~/.zshrc' (or open a new terminal) for global 'sqldiff' in the current shell session."
