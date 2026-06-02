@@ -11,16 +11,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from .log_merge import (
-    acknowledge_replay_warning,
-    make_logged_statement,
-)
+from .log_merge import make_logged_statement
 from .models import (
     BranchName,
     ConflictPair,
     LoggedStatement,
     LoggedTransaction,
-    statement_label,
     transaction_label,
 )
 from sqlite_replay_preparation import prepare_logged_sql
@@ -152,84 +148,6 @@ def _new_statement_sql(
         replay_block_reason=prepared.replay_block_reason,
         table_columns=table_columns,
     )
-
-
-def _prompt_update_from_warning(
-    statement: LoggedStatement,
-    table_columns,
-    replay_conn: sqlite3.Connection,
-    warning: str,
-) -> LoggedStatement | None:
-    """Prompt after an UPDATE FROM warning; Enter keeps and runs the statement."""
-
-    replacement, _ = _prompt_statement_warning(
-        statement,
-        table_columns,
-        replay_conn,
-        warning,
-        "SQLite may choose any matching row",
-        acknowledge_on_accept=False,
-    )
-    return replacement
-
-
-def _prompt_replay_warning(
-    statement: LoggedStatement,
-    table_columns,
-    replay_conn: sqlite3.Connection,
-    warning: str,
-) -> tuple[LoggedStatement | None, bool]:
-    """Prompt after a replay warning; Enter keeps and runs the statement."""
-
-    return _prompt_statement_warning(
-        statement,
-        table_columns,
-        replay_conn,
-        warning,
-        "Replaying may produce different values",
-        acknowledge_on_accept=True,
-    )
-
-
-def _prompt_statement_warning(
-    statement: LoggedStatement,
-    table_columns,
-    replay_conn: sqlite3.Connection,
-    warning: str,
-    description: str,
-    *,
-    acknowledge_on_accept: bool,
-) -> tuple[LoggedStatement | None, bool]:
-    """Prompt for warning acknowledgement or edited replacement SQL."""
-
-    label = statement_label(statement)
-    current = statement
-    changed = False
-    print()
-    print(f"Warning for {label}: {warning}. {description}.")
-    print(f"{label}: {current.original_sql_text}")
-    while True:
-        replacement = input(
-            f"{label} action [Enter to run shown SQL, :edit for editor, "
-            "DELETE or ; to skip]: "
-        ).strip()
-        if not replacement:
-            if acknowledge_on_accept:
-                return acknowledge_replay_warning(current), changed
-            return current, changed
-        if replacement.upper() == "DELETE" or replacement == ";":
-            return None, True
-        if replacement == ":edit":
-            replacement = _edit_sql_in_editor(label, current.sql_text) or ""
-        if replacement:
-            current = _replace_statement_sql(
-                current,
-                replacement,
-                replay_conn,
-                table_columns,
-            )
-            changed = True
-            print(f"{label}: {current.original_sql_text}")
 
 
 def _transaction_with_statements(
@@ -537,8 +455,8 @@ def _handle_transaction_edit_command(
 
 def _prompt_pair_transaction_resolution(
     conflict: ConflictPair,
-    ours: list[LoggedTransaction],
-    theirs: list[LoggedTransaction],
+    ours: Sequence[LoggedTransaction],
+    theirs: Sequence[LoggedTransaction],
     table_columns,
     replay_conn: sqlite3.Connection,
     *,
@@ -574,8 +492,8 @@ def _prompt_pair_transaction_resolution(
     print(f"B = remote transaction {theirs_label}")
 
     while True:
-        valid_labels = list(_statement_lookup(resolved_labels))
-        if not valid_labels:
+        editable_labels = list(_statement_lookup(resolved_labels))
+        if not editable_labels:
             return PairTransactionResolution(
                 action="replace",
                 ours=None,
@@ -590,7 +508,7 @@ def _prompt_pair_transaction_resolution(
             print("Press Enter to accept this reviewable conflict and keep checking.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
-        _print_transaction_edit_help(valid_labels)
+        _print_transaction_edit_help(editable_labels)
         raw = input("Resolution: ").strip()
 
         if not raw:
@@ -632,7 +550,7 @@ def _prompt_pair_transaction_resolution(
             continue
         if edit_result == "handled":
             continue
-        print(f"Unknown action. Use 'edit {valid_labels[0]};', DELETE, or ;.")
+        print(f"Unknown action. Use 'edit {editable_labels[0]};', DELETE, or ;.")
 
 
 def _prompt_standalone_transaction_resolution(
@@ -641,6 +559,9 @@ def _prompt_standalone_transaction_resolution(
     transaction: LoggedTransaction,
     table_columns,
     replay_conn: sqlite3.Connection,
+    *,
+    allow_accept: bool = False,
+    heading: str | None = None,
 ) -> list[LoggedStatement] | None:
     """Prompt for resolving one transaction that failed on its own."""
 
@@ -651,26 +572,28 @@ def _prompt_standalone_transaction_resolution(
     changed = False
     message = _standalone_conflict_message(conflict, scope)
     print()
-    print(f"A standalone replay problem came up while applying {label}:")
+    print(heading or f"A standalone replay problem came up while applying {label}:")
     print(message)
     _print_statement_group(label, transaction.statements)
 
     while True:
         current_transaction = resolved_transaction[label]
-        valid_labels = list(_statement_lookup(resolved_transaction))
-        if not valid_labels:
+        editable_labels = list(_statement_lookup(resolved_transaction))
+        if not editable_labels:
             print(f"{label}: all statements deleted; this transaction will be skipped.")
             return []
 
         if changed:
             print("Press Enter to retry the shown transaction, or ';' to skip it.")
+        elif allow_accept:
+            print("Press Enter to run the shown transaction, or edit/delete it.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
-        _print_transaction_edit_help(valid_labels)
+        _print_transaction_edit_help(editable_labels)
         raw = input("Resolution: ").strip()
 
         if not raw:
-            if changed:
+            if changed or allow_accept:
                 return list(current_transaction.statements)
             print("No change made yet.")
             continue
@@ -688,4 +611,4 @@ def _prompt_standalone_transaction_resolution(
             continue
         if edit_result == "handled":
             continue
-        print(f"Unknown action. Use 'edit {valid_labels[0]};', DELETE, or ;.")
+        print(f"Unknown action. Use 'edit {editable_labels[0]};', DELETE, or ;.")

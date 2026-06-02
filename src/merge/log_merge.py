@@ -65,6 +65,7 @@ def make_logged_statement(
     is_replay_safe: bool = True,
     replay_block_reason: str | None = None,
     replay_warnings: Sequence[str] = (),
+    accepted_replay_warnings: Sequence[str] | frozenset[str] = (),
 ) -> LoggedStatement:
     try:
         metadata = parse_statement_metadata(sql_text, table_columns=table_columns)
@@ -88,11 +89,12 @@ def make_logged_statement(
         replay_block_reason=replay_block_reason,
         metadata=metadata,
         replay_warnings=tuple(replay_warnings),
+        accepted_replay_warnings=frozenset(accepted_replay_warnings),
     )
 
 
-def acknowledgeable_replay_warning(statement: LoggedStatement) -> str | None:
-    """Return a warning for unsafe logged SQL that can still be run manually."""
+def replay_warning_reason(statement: LoggedStatement) -> str | None:
+    """Return the reviewable warning reason for unsafe logged SQL."""
 
     if statement.is_replay_safe or statement.replay_block_reason is None:
         return None
@@ -103,21 +105,39 @@ def acknowledgeable_replay_warning(statement: LoggedStatement) -> str | None:
     return None
 
 
-def acknowledge_replay_warning(statement: LoggedStatement) -> LoggedStatement:
-    """Mark an acknowledgeable replay warning as accepted for this merge run."""
+def pending_replay_warning(statement: LoggedStatement) -> str | None:
+    """Return an unaccepted warning for unsafe logged SQL."""
 
-    warning = acknowledgeable_replay_warning(statement)
-    if warning is None:
+    warning = replay_warning_reason(statement)
+    if warning is None or warning in statement.accepted_replay_warnings:
+        return None
+    return warning
+
+
+def unresolved_replay_block_reason(statement: LoggedStatement) -> str | None:
+    """Return why a statement still cannot replay automatically."""
+
+    if statement.is_replay_safe:
+        return None
+
+    warning = replay_warning_reason(statement)
+    if warning is not None and warning in statement.accepted_replay_warnings:
+        return None
+
+    return statement.replay_block_reason or "statement is unsafe for replay"
+
+
+def accept_replay_warning(
+    statement: LoggedStatement,
+    warning: str,
+) -> LoggedStatement:
+    """Record that the user accepted one replay warning for this merge run."""
+
+    if warning in statement.accepted_replay_warnings:
         return statement
-
-    warnings = statement.replay_warnings
-    if warning not in warnings:
-        warnings = (*warnings, warning)
     return replace(
         statement,
-        is_replay_safe=True,
-        replay_block_reason=None,
-        replay_warnings=warnings,
+        accepted_replay_warnings=statement.accepted_replay_warnings | {warning},
     )
 
 

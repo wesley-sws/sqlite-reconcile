@@ -85,7 +85,7 @@ def test_configured_editor_falls_back_to_terminal_editor(monkeypatch):
     assert terminal_ui._configured_editor() == "vi"
 
 
-def test_prompt_replay_warning_uses_prefilled_external_editor(monkeypatch):
+def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
     table_columns = {"audit_events": {"id", "token"}}
     statement = log_merge.make_logged_statement(
         branch="ours",
@@ -98,7 +98,22 @@ def test_prompt_replay_warning_uses_prefilled_external_editor(monkeypatch):
         is_replay_safe=False,
         replay_block_reason="nondeterministic expression cannot be safely materialized",
     )
-    responses = iter([":edit", ""])
+    conflict = ConflictPair(
+        current_branch="ours",
+        other_index=None,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            StatementConflict(
+                kind="replay_error",
+                message="warning: nondeterministic expression cannot be safely materialized",
+                scope="ours",
+                details=(("statement_log_id", "1"),),
+            ),
+        ),
+        is_standalone=True,
+    )
+    responses = iter(["edit L1.1;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -107,21 +122,22 @@ def test_prompt_replay_warning_uses_prefilled_external_editor(monkeypatch):
     )
 
     with closing(replay_conn()) as con:
-        replacement, should_restart = terminal_ui._prompt_replay_warning(
-            statement,
+        replacement = terminal_ui._prompt_standalone_transaction_resolution(
+            conflict,
+            "ours",
+            txs([statement])[0],
             table_columns,
             con,
-            "nondeterministic expression cannot be safely materialized",
+            allow_accept=True,
         )
 
     assert replacement is not None
-    assert replacement.sql_text == (
+    assert replacement[0].sql_text == (
         "UPDATE audit_events SET token = 'fixed' WHERE id BETWEEN 4 AND 8"
     )
-    assert should_restart
 
 
-def test_prompt_replay_warning_can_delete_after_edit(monkeypatch):
+def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
     table_columns = {"audit_events": {"id", "token"}}
     statement = log_merge.make_logged_statement(
         branch="ours",
@@ -134,7 +150,22 @@ def test_prompt_replay_warning_can_delete_after_edit(monkeypatch):
         is_replay_safe=False,
         replay_block_reason="nondeterministic expression cannot be safely materialized",
     )
-    responses = iter([":edit", "DELETE"])
+    conflict = ConflictPair(
+        current_branch="ours",
+        other_index=None,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            StatementConflict(
+                kind="replay_error",
+                message="warning: nondeterministic expression cannot be safely materialized",
+                scope="ours",
+                details=(("statement_log_id", "1"),),
+            ),
+        ),
+        is_standalone=True,
+    )
+    responses = iter(["edit L1.1;", "DELETE"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -143,15 +174,16 @@ def test_prompt_replay_warning_can_delete_after_edit(monkeypatch):
     )
 
     with closing(replay_conn()) as con:
-        replacement, should_restart = terminal_ui._prompt_replay_warning(
-            statement,
+        replacement = terminal_ui._prompt_standalone_transaction_resolution(
+            conflict,
+            "ours",
+            txs([statement])[0],
             table_columns,
             con,
-            "nondeterministic expression cannot be safely materialized",
+            allow_accept=True,
         )
 
     assert replacement is None
-    assert should_restart
 
 
 def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatch):
@@ -810,13 +842,148 @@ def test_branch_replay_safety_warns_for_update_from_duplicates(
         key_column_sets,
     )
 
-    assert flatten_transactions(resolved) == [statement]
+    resolved_statements = flatten_transactions(resolved)
+    assert len(resolved_statements) == 1
+    assert resolved_statements[0].accepted_replay_warnings == frozenset({
+        log_merge.UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+    })
     assert responses == []
 
 
-def test_branch_replay_safety_can_acknowledge_nondeterministic_warning(
+def test_branch_replay_safety_update_from_warning_uses_transaction_prefix(
     tmp_path,
     monkeypatch,
+    capsys,
+):
+    base = tmp_path / "base.db"
+    with closing(sqlite3.connect(base)) as con:
+        con.execute(
+            "CREATE TABLE products ("
+            "id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)"
+        )
+        con.execute("CREATE TABLE categories (id INTEGER, rate INTEGER)")
+        con.execute("INSERT INTO products VALUES (1, 1, 0)")
+        con.execute("INSERT INTO categories VALUES (1, 5)")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(base)
+    )
+    setup = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT INTO categories VALUES (1, 7)",
+        table_columns=table_columns,
+    )
+    update = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=1,
+        log_id=2,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "UPDATE products "
+            "SET discount = categories.rate "
+            "FROM categories "
+            "WHERE products.category_id = categories.id"
+        ),
+        table_columns=table_columns,
+    )
+    responses = [""]
+    monkeypatch.setattr("builtins.input", lambda _: responses.pop(0))
+
+    resolved = terminal_mergetool._resolve_branch_replay_safety(
+        base,
+        "ours",
+        txs([setup, update]),
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+
+    resolved_statements = flatten_transactions(resolved)
+    assert resolved_statements[0].replay_warnings == ()
+    assert resolved_statements[1].accepted_replay_warnings == frozenset({
+        log_merge.UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+    })
+    output = capsys.readouterr().out
+    assert "INSERT INTO categories VALUES (1, 7)" in output
+    assert "UPDATE products SET discount = categories.rate" in output
+    assert responses == []
+
+
+def test_branch_replay_safety_records_warning_when_other_statement_changes(
+    tmp_path,
+    monkeypatch,
+):
+    base = tmp_path / "base.db"
+    with closing(sqlite3.connect(base)) as con:
+        con.execute(
+            "CREATE TABLE products ("
+            "id INTEGER PRIMARY KEY, category_id INTEGER, discount INTEGER)"
+        )
+        con.execute("CREATE TABLE categories (id INTEGER, rate INTEGER)")
+        con.execute("INSERT INTO products VALUES (1, 1, 0)")
+        con.execute("INSERT INTO categories VALUES (1, 5)")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(base)
+    )
+    setup = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        log_id=1,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT INTO categories VALUES (1, 7)",
+        table_columns=table_columns,
+    )
+    update = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=1,
+        log_id=2,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "UPDATE products "
+            "SET discount = categories.rate "
+            "FROM categories "
+            "WHERE products.category_id = categories.id"
+        ),
+        table_columns=table_columns,
+    )
+    responses = iter(["edit L1.1;", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
+    monkeypatch.setattr(
+        terminal_ui,
+        "_edit_sql_in_editor",
+        lambda label, sql: "INSERT INTO categories VALUES (1, 9)",
+    )
+
+    resolved = terminal_mergetool._resolve_branch_replay_safety(
+        base,
+        "ours",
+        txs([setup, update]),
+        table_columns,
+        primary_key_columns,
+        key_column_sets,
+    )
+
+    resolved_statements = flatten_transactions(resolved)
+    assert resolved_statements[0].sql_text == "INSERT INTO categories VALUES (1, 9)"
+    assert resolved_statements[1].accepted_replay_warnings == frozenset({
+        log_merge.UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+    })
+
+
+def test_branch_replay_safety_can_accept_nondeterministic_warning(
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     base = tmp_path / "base.db"
     with closing(sqlite3.connect(base)) as con:
@@ -838,24 +1005,39 @@ def test_branch_replay_safety_can_acknowledge_nondeterministic_warning(
         is_replay_safe=False,
         replay_block_reason="nondeterministic expression cannot be safely materialized",
     )
+    followup = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=1,
+        log_id=2,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="UPDATE users SET name = 'checked' WHERE id = 1",
+        table_columns=table_columns,
+    )
     responses = [""]
     monkeypatch.setattr("builtins.input", lambda _: responses.pop(0))
 
     resolved = terminal_mergetool._resolve_branch_replay_safety(
         base,
         "ours",
-        txs([statement]),
+        txs([statement, followup]),
         table_columns,
         primary_key_columns,
         key_column_sets,
     )
 
     resolved_statements = flatten_transactions(resolved)
-    assert len(resolved_statements) == 1
-    assert resolved_statements[0].is_replay_safe
-    assert resolved_statements[0].replay_warnings == (
-        "nondeterministic expression cannot be safely materialized",
+    assert len(resolved_statements) == 2
+    assert not resolved_statements[0].is_replay_safe
+    assert resolved_statements[0].replay_block_reason == (
+        "nondeterministic expression cannot be safely materialized"
     )
+    assert resolved_statements[0].accepted_replay_warnings == frozenset({
+        "nondeterministic expression cannot be safely materialized",
+    })
+    output = capsys.readouterr().out
+    assert "UPDATE users SET name = random() WHERE id = 1" in output
+    assert "UPDATE users SET name = 'checked' WHERE id = 1" in output
     assert responses == []
 
 
@@ -894,7 +1076,14 @@ def test_branch_replay_safety_prompts_stored_nondeterministic_warning(
         key_column_sets,
     )
 
-    assert flatten_transactions(resolved) == [statement]
+    resolved_statements = flatten_transactions(resolved)
+    assert len(resolved_statements) == 1
+    assert resolved_statements[0].replay_warnings == (
+        "nondeterministic expression cannot be safely materialized",
+    )
+    assert resolved_statements[0].accepted_replay_warnings == frozenset({
+        "nondeterministic expression cannot be safely materialized",
+    })
     assert responses == []
 
 

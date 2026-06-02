@@ -36,6 +36,7 @@ class LoggedStatement:
     replay_block_reason: str | None
     metadata: StatementMetadata
     replay_warnings: tuple[str, ...] = ()
+    accepted_replay_warnings: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def sql_text(self) -> str:

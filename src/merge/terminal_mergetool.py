@@ -18,8 +18,10 @@ from .log_merge import (
     MergeNotApplicableError,
     UPDATE_FROM_DUPLICATE_TARGET_WARNING,
     _RemainingCurrentConflictScan,
-    acknowledgeable_replay_warning,
+    accept_replay_warning,
     load_merge_inputs,
+    pending_replay_warning,
+    unresolved_replay_block_reason,
     validate_database,
 )
 from .models import (
@@ -29,13 +31,12 @@ from .models import (
     LoggedStatement,
     LoggedTransaction,
     StatementConflict,
+    transaction_label,
 )
 from .remaining_metadata import RemainingMetadataIndex
 from .terminal_ui import (
     _prompt_pair_transaction_resolution,
-    _prompt_replay_warning,
     _prompt_standalone_transaction_resolution,
-    _prompt_update_from_warning,
     _transaction_with_statements,
 )
 from .utils import quote_identifier, rollback_savepoint
@@ -59,10 +60,25 @@ class PairConflictOutcome:
         return self.ours if branch == "ours" else self.theirs
 
 
-def _branch_transaction_replay_error(
+@dataclass(frozen=True)
+class BranchReplayIssue:
+    """Reason one branch-local transaction cannot simply replay yet."""
+
+    conflict: StatementConflict
+    warning: tuple[LoggedStatement, str] | None = None
+
+    @property
+    def allow_accept(self) -> bool:
+        """Return whether Enter should accept the original transaction."""
+
+        return self.warning is not None
+
+
+def _branch_transaction_replay_issue(
     con: sqlite3.Connection,
+    update_from_context: ConflictCheckContext,
     transaction: LoggedTransaction,
-) -> StatementConflict | None:
+) -> BranchReplayIssue | None:
     """Apply one branch-local transaction, returning why it cannot replay."""
 
     savepoint = quote_identifier(f"sqlite_merge_branch_{uuid.uuid4().hex}")
@@ -71,36 +87,63 @@ def _branch_transaction_replay_error(
     try:
         for statement in transaction.statements:
             last_statement = statement
-            if not statement.is_replay_safe:
+            replay_warning = _statement_replay_warning(statement)
+            if replay_warning is not None:
                 rollback_savepoint(con.cursor(), savepoint)
-                return _branch_replay_conflict(
-                    "replay_error",
-                    (
-                        statement.replay_block_reason
-                        or "statement is unsafe for replay"
-                    ),
+                return _branch_replay_warning_issue(
                     transaction.branch,
                     statement,
+                    replay_warning,
+                )
+
+            replay_block_reason = unresolved_replay_block_reason(statement)
+            if replay_block_reason is not None:
+                rollback_savepoint(con.cursor(), savepoint)
+                return BranchReplayIssue(
+                    _branch_replay_conflict(
+                        "replay_error",
+                        replay_block_reason,
+                        transaction.branch,
+                        statement,
+                    ),
+                )
+            if (
+                UPDATE_FROM_DUPLICATE_TARGET_WARNING
+                not in statement.accepted_replay_warnings
+                and update_from_has_duplicate_target_rows(
+                    update_from_context,
+                    statement.metadata,
+                )
+            ):
+                rollback_savepoint(con.cursor(), savepoint)
+                return _branch_replay_warning_issue(
+                    transaction.branch,
+                    statement,
+                    UPDATE_FROM_DUPLICATE_TARGET_WARNING,
                 )
             con.execute(statement.sql_text)
         errors = validate_database(con)
         if errors:
             rollback_savepoint(con.cursor(), savepoint)
-            return _branch_replay_conflict(
-                "integrity",
-                "\n".join(errors),
-                transaction.branch,
+            return BranchReplayIssue(
+                _branch_replay_conflict(
+                    "integrity",
+                    "\n".join(errors),
+                    transaction.branch,
+                ),
             )
         con.execute(f"RELEASE {savepoint}")
         con.commit()
         return None
     except sqlite3.Error as exc:
         rollback_savepoint(con.cursor(), savepoint)
-        return _branch_replay_conflict(
-            _sqlite_replay_conflict_kind(exc),
-            str(exc),
-            transaction.branch,
-            last_statement,
+        return BranchReplayIssue(
+            _branch_replay_conflict(
+                _sqlite_replay_conflict_kind(exc),
+                str(exc),
+                transaction.branch,
+                last_statement,
+            ),
         )
 
 
@@ -134,75 +177,51 @@ def _branch_replay_conflict(
     )
 
 
-def _statement_replay_warning(statement: LoggedStatement) -> str | None:
-    """Return a stored/unsafe replay warning that needs user acknowledgement."""
+def _branch_replay_warning_issue(
+    scope: BranchName,
+    statement: LoggedStatement,
+    warning: str,
+) -> BranchReplayIssue:
+    """Return a reviewable branch replay warning."""
 
-    warning = acknowledgeable_replay_warning(statement)
+    return BranchReplayIssue(
+        _branch_replay_conflict(
+            "replay_error",
+            f"warning: {warning}",
+            scope,
+            statement,
+        ),
+        warning=(statement, warning),
+    )
+
+
+def _statement_replay_warning(statement: LoggedStatement) -> str | None:
+    """Return a stored/unsafe replay warning that still needs user acceptance."""
+
+    warning = pending_replay_warning(statement)
     if warning is not None:
         return warning
 
     for warning in statement.replay_warnings:
-        if warning != UPDATE_FROM_DUPLICATE_TARGET_WARNING:
+        if (
+            warning != UPDATE_FROM_DUPLICATE_TARGET_WARNING
+            and warning not in statement.accepted_replay_warnings
+        ):
             return warning
     return None
 
 
-def _resolve_branch_transaction_warnings(
-    con: sqlite3.Connection,
-    update_from_context: ConflictCheckContext,
-    transaction: LoggedTransaction,
-    table_columns,
-) -> LoggedTransaction | None:
-    """Resolve statement-level warnings before replaying one transaction."""
+def _accept_warning_if_statement_still_present(
+    statements: list[LoggedStatement],
+    warning_statement: LoggedStatement,
+    warning: str,
+) -> None:
+    """Record an accepted warning if the same statement survived the prompt."""
 
-    statements = list(transaction.statements)
-    while True:
-        changed = False
-        for index, statement in enumerate(tuple(statements)):
-            replay_warning = _statement_replay_warning(statement)
-            if replay_warning is not None:
-                replacement, warning_changed = _prompt_replay_warning(
-                    statement,
-                    table_columns,
-                    con,
-                    replay_warning,
-                )
-                if replacement is None:
-                    statements.pop(index)
-                    changed = True
-                    break
-                if warning_changed:
-                    statements[index] = replacement
-                    changed = True
-                    break
-                statements[index] = replacement
-                continue
-
-            if statement.is_replay_safe and update_from_has_duplicate_target_rows(
-                update_from_context,
-                statement.metadata,
-            ):
-                replacement = _prompt_update_from_warning(
-                    statement,
-                    table_columns,
-                    con,
-                    UPDATE_FROM_DUPLICATE_TARGET_WARNING,
-                )
-                if replacement is None:
-                    statements.pop(index)
-                    changed = True
-                    break
-                if replacement is not statement:
-                    statements[index] = replacement
-                    changed = True
-                    break
-                continue
-
-        if not statements:
-            return None
-        if changed:
-            continue
-        return _transaction_with_statements(transaction, statements)
+    for index, statement in enumerate(statements):
+        if statement is warning_statement:
+            statements[index] = accept_replay_warning(statement, warning)
+            return
 
 
 def _resolve_branch_transaction(
@@ -216,29 +235,36 @@ def _resolve_branch_transaction(
 
     current = transaction
     while True:
-        warned = _resolve_branch_transaction_warnings(
+        replay_issue = _branch_transaction_replay_issue(
             con,
             update_from_context,
             current,
-            table_columns,
         )
-        if warned is None:
-            return None
-        current = warned
-
-        replay_conflict = _branch_transaction_replay_error(con, current)
-        if replay_conflict is None:
+        if replay_issue is None:
             return current
 
         replacement_statements = _prompt_standalone_transaction_resolution(
-            _standalone_head_conflict(replay_conflict, branch),
+            _standalone_head_conflict(replay_issue.conflict, branch),
             branch,
             current,
             table_columns,
             con,
+            allow_accept=replay_issue.allow_accept,
+            heading=(
+                f"A replay warning came up while checking {transaction_label(current)}:"
+                if replay_issue.allow_accept
+                else None
+            ),
         )
         if not replacement_statements:
             return None
+        if replay_issue.warning is not None:
+            warning_statement, warning = replay_issue.warning
+            _accept_warning_if_statement_still_present(
+                replacement_statements,
+                warning_statement,
+                warning,
+            )
         current = _transaction_with_statements(current, replacement_statements)
 
 
@@ -250,7 +276,12 @@ def _resolve_branch_replay_safety(
     primary_key_columns,
     key_column_sets,
 ) -> list[LoggedTransaction]:
-    """Resolve wrapper-unsafe or branch-local replay failures before pair checks."""
+    """Resolve wrapper-unsafe or branch-local replay failures before pair checks.
+
+    Each branch is checked from a fresh base copy. Reusing the same connection
+    across branches would make the second branch replay after the first branch's
+    accepted prefix, which is not a branch-local safety check anymore.
+    """
 
     resolved: list[LoggedTransaction] = []
     with closing(_load_working_base_copy(base_path)) as branch_conn:
@@ -342,12 +373,10 @@ def _resolve_remaining_pair_conflict(
 ) -> PairConflictOutcome:
     """Edit/delete a current-vs-remaining pair and describe what changed."""
 
-    ours_view = list(remaining_ours)
-    theirs_view = list(remaining_theirs)
     resolution = _prompt_pair_transaction_resolution(
         conflict,
-        ours_view,
-        theirs_view,
+        remaining_ours,
+        remaining_theirs,
         table_columns,
         context.base_cursor.connection,
         allow_accept=_is_reviewable_pair_conflict(conflict),
@@ -432,14 +461,12 @@ def _unresolved_replay_safety_conflict(
     """Return a standalone conflict for an unsafe statement in a transaction."""
 
     for statement in transaction.statements:
-        if statement.is_replay_safe:
+        replay_block_reason = unresolved_replay_block_reason(statement)
+        if replay_block_reason is None:
             continue
         return StatementConflict(
             kind="replay_error",
-            message=(
-                statement.replay_block_reason
-                or "statement is unsafe for automatic replay"
-            ),
+            message=replay_block_reason,
             scope=transaction.branch,
             details=(("statement_log_id", str(statement.log_id)),),
         )
