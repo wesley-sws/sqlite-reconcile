@@ -209,7 +209,6 @@ def test_make_logged_statement_marks_unparseable_sql_unsafe():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="NOT VALID SQL @@@",
@@ -318,7 +317,6 @@ def test_remaining_conflict_checks_current_against_later_remote(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -329,7 +327,6 @@ def test_remaining_conflict_checks_current_against_later_remote(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO audit (id, message) VALUES (1, 'remote')",
@@ -338,7 +335,6 @@ def test_remaining_conflict_checks_current_against_later_remote(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote' WHERE id = 1",
@@ -385,7 +381,6 @@ def test_remaining_conflict_uses_rolling_control_state_for_later_write_read(tmp_
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -396,7 +391,6 @@ def test_remaining_conflict_uses_rolling_control_state_for_later_write_read(tmp_
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO audit (id, message) VALUES (1, 'prefix')",
@@ -405,7 +399,6 @@ def test_remaining_conflict_uses_rolling_control_state_for_later_write_read(tmp_
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text=(
@@ -456,7 +449,6 @@ def test_remaining_conflict_uses_current_write_probe_before_suffix(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE items SET flag = 1 WHERE status = 'open'",
@@ -467,7 +459,6 @@ def test_remaining_conflict_uses_current_write_probe_before_suffix(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO items (id, status, flag) VALUES (2, 'open', 0)",
@@ -476,7 +467,6 @@ def test_remaining_conflict_uses_current_write_probe_before_suffix(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE items SET flag = 2 WHERE id = 2",
@@ -522,7 +512,6 @@ def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_p
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE items SET flag = 1 WHERE id = 1",
@@ -531,7 +520,6 @@ def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_p
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE items SET status = 'local' WHERE flag = 1",
@@ -542,7 +530,6 @@ def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_p
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=3,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE items SET status = 'remote' WHERE id = 1",
@@ -570,7 +557,7 @@ def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_p
 
     assert conflict is not None
     assert conflict.conflicts[0].kind == "write_write"
-    assert "L2 and R1" in conflict.conflicts[0].message
+    assert "L1.2 and R1.1" in conflict.conflicts[0].message
 
 
 def test_remaining_conflict_skips_individual_checks_when_aggregate_metadata_is_clean(
@@ -591,7 +578,6 @@ def test_remaining_conflict_skips_individual_checks_when_aggregate_metadata_is_c
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -602,7 +588,6 @@ def test_remaining_conflict_skips_individual_checks_when_aggregate_metadata_is_c
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO audit (id, message) VALUES (1, 'remote')",
@@ -654,7 +639,6 @@ def test_remaining_metadata_index_decrements_removed_transaction(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote' WHERE id = 1",
@@ -663,7 +647,6 @@ def test_remaining_metadata_index_decrements_removed_transaction(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'other' WHERE id = 1",
@@ -753,7 +736,6 @@ def test_remaining_metadata_index_does_not_cache_schema_constraints(tmp_path):
             log_merge.make_logged_statement(
                 branch="theirs",
                 branch_index=0,
-                log_id=1,
                 transaction_id=1,
                 committed_at="2026-01-01T00:00:00",
                 sql_text="INSERT INTO users (id, email) VALUES (1, 'a@example.com')",
@@ -782,7 +764,6 @@ def test_remaining_individual_check_kinds_reports_write_read_only(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -793,7 +774,6 @@ def test_remaining_individual_check_kinds_reports_write_read_only(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text=(
@@ -832,7 +812,6 @@ def test_remaining_individual_check_kinds_reports_write_write_only(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -843,7 +822,6 @@ def test_remaining_individual_check_kinds_reports_write_write_only(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote' WHERE id = 2",
@@ -881,7 +859,6 @@ def test_remaining_individual_check_kinds_reports_integrity_only(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'shared')",
@@ -892,7 +869,6 @@ def test_remaining_individual_check_kinds_reports_integrity_only(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (2, 'shared')",
@@ -933,7 +909,6 @@ def test_remaining_individual_check_kinds_does_not_scan_for_current_or_ignore_on
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT OR IGNORE INTO users (id, name) VALUES (1, 'local')",
@@ -944,7 +919,6 @@ def test_remaining_individual_check_kinds_does_not_scan_for_current_or_ignore_on
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE stats SET value = 'remote' WHERE id = 1",
@@ -987,7 +961,6 @@ def test_remaining_conflict_reports_constraint_resolution_during_integrity_scan(
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'shared')",
@@ -998,7 +971,6 @@ def test_remaining_conflict_reports_constraint_resolution_during_integrity_scan(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT OR IGNORE INTO coupons (id, code) VALUES (2, 'shared')",
@@ -1045,7 +1017,6 @@ def test_apply_accepted_transaction_advances_live_context(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'local')",
@@ -1095,7 +1066,6 @@ def test_remaining_conflict_reports_later_remote_integrity_conflict(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'shared')",
@@ -1106,7 +1076,6 @@ def test_remaining_conflict_reports_later_remote_integrity_conflict(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (2, 'remote-only')",
@@ -1115,7 +1084,6 @@ def test_remaining_conflict_reports_later_remote_integrity_conflict(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (3, 'shared')",
@@ -1157,7 +1125,6 @@ def test_apply_accepted_transaction_preserves_transaction_log_boundaries(tmp_pat
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'Bob')",
@@ -1165,7 +1132,6 @@ def test_apply_accepted_transaction_preserves_transaction_log_boundaries(tmp_pat
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (2, 'Cara')",
@@ -1206,7 +1172,6 @@ def test_apply_accepted_transaction_keeps_same_id_branch_transactions_separate(t
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'Local')",
@@ -1214,7 +1179,6 @@ def test_apply_accepted_transaction_keeps_same_id_branch_transactions_separate(t
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=1,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (2, 'Remote')",
@@ -1254,7 +1218,6 @@ def test_apply_accepted_transaction_rolls_back_failed_transaction_group(tmp_path
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'Bob')",
@@ -1262,7 +1225,6 @@ def test_apply_accepted_transaction_rolls_back_failed_transaction_group(tmp_path
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-02T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'Duplicate')",
@@ -1312,7 +1274,6 @@ def test_apply_accepted_transaction_reports_deferred_foreign_key_failure(tmp_pat
     valid_statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-02T00:00:00",
         sql_text=valid_sql_text,
@@ -1321,7 +1282,6 @@ def test_apply_accepted_transaction_reports_deferred_foreign_key_failure(tmp_pat
     invalid_statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=1,
-        log_id=2,
         transaction_id=2,
         committed_at="2026-01-03T00:00:00",
         sql_text=invalid_sql_text,
@@ -1379,7 +1339,6 @@ def test_current_unsafe_replay_statement_is_resolved_before_pair_scan(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-02T00:00:00",
         sql_text="UPDATE users SET name = random()",

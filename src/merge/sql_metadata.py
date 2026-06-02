@@ -19,6 +19,7 @@ from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from sqlite_conflict_resolution import (
+    CompatibleSQL,
     SQLiteConflictResolution,
     normalize_sql_for_sqlglot,
 )
@@ -59,6 +60,7 @@ class StatementMetadata:
     """Parsed SQL plus the statement-level read/write tables and columns."""
 
     parsed_sql_text: exp.Expression
+    compatible_sql: CompatibleSQL
     statement_kind: StatementKind
     conflict_resolution: SQLiteConflictResolution | None
     has_reviewable_constraint_resolution: bool
@@ -124,6 +126,7 @@ def parse_statement_metadata(
     parsed_sql_text = _parse_one(compatible.sql)
     return StatementMetadata(
         parsed_sql_text=parsed_sql_text,
+        compatible_sql=compatible,
         statement_kind=_statement_kind(parsed_sql_text),
         conflict_resolution=compatible.conflict_resolution,
         has_reviewable_constraint_resolution=(
@@ -147,6 +150,7 @@ def unsupported_statement_metadata(sql_text: str) -> StatementMetadata:
             this="UNSUPPORTED_SQL",
             expression=exp.Literal.string(sql_text),
         ),
+        compatible_sql=CompatibleSQL(sql=sql_text),
         statement_kind="other",
         conflict_resolution=None,
         has_reviewable_constraint_resolution=False,

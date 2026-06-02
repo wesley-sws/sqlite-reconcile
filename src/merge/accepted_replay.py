@@ -74,7 +74,7 @@ def _statement_conflict_details(
 ) -> tuple[tuple[str, str], ...]:
     """Return conflict metadata that lets the UI find the failing statement."""
 
-    return (("statement_log_id", str(statement.log_id)),)
+    return (("statement_branch_index", str(statement.branch_index)),)
 
 
 def _advance_transaction_on_main_and_control(
@@ -289,7 +289,7 @@ def _execute_statement_on_control(
 ) -> SQLiteReplayFailure | None:
     """Replay one statement against the attached control database."""
 
-    control_sql = _control_sql_for_text(context, statement.sql_text)
+    control_sql = _control_sql_for(context, statement)
     if control_sql is None:
         return SQLiteReplayFailure(
             kind="replay_error",
@@ -348,15 +348,15 @@ def _execute_sql_for_replay(
     return None
 
 
-def _control_sql_for_text(
+def _control_sql_for(
     context: ConflictCheckContext,
-    sql_text: str,
+    sql: str | LoggedStatement,
 ) -> str | None:
     """Return SQL rewritten to use the attached control database."""
 
     if context.control_sql_rewriter is None:
         return None
-    return context.control_sql_rewriter(sql_text)
+    return context.control_sql_rewriter(sql)
 
 
 def _clean_control_conflict(

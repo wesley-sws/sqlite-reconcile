@@ -54,7 +54,7 @@ def _print_statement_group(label: str, statements: Sequence[LoggedStatement]) ->
     print(f"{_group_title(label, statements)}:")
     for index, statement in enumerate(statements):
         print(f"  {_transaction_statement_label(label, statement, index)}:")
-        _print_indented_sql(statement.original_sql_text, indent="    ")
+        _print_indented_sql(statement.sql_text, indent="    ")
 
 
 def _conflict_messages(conflict: ConflictPair) -> str:
@@ -100,13 +100,12 @@ def _replace_statement_sql(
     replay_conn: sqlite3.Connection,
     table_columns,
 ) -> LoggedStatement:
-    """Reparse edited SQL while preserving the original branch/log identity."""
+    """Reparse edited SQL while preserving the statement's merge identity."""
 
     prepared = prepare_logged_sql(sql_text, replay_conn)
     return make_logged_statement(
         branch=statement.branch,
         branch_index=statement.branch_index,
-        log_id=statement.log_id,
         transaction_id=statement.transaction_id,
         committed_at=statement.committed_at,
         sql_text=prepared.to_replay_sql_text,
@@ -127,19 +126,13 @@ def _new_statement_sql(
     """Create a user-inserted statement inside an existing transaction."""
 
     branch_index = min(
-        (
-            statement.branch_index
-            for statement in statements
-            if statement.branch_index < 0
-        ),
-        default=0,
+        min((statement.branch_index for statement in statements), default=0),
+        0,
     ) - 1
-    log_id = min((statement.log_id for statement in statements), default=0)
     prepared = prepare_logged_sql(sql_text, replay_conn)
     return make_logged_statement(
         branch=transaction.branch,
         branch_index=branch_index,
-        log_id=min(log_id, 0) - 1,
         transaction_id=transaction.transaction_id,
         committed_at=transaction.committed_at,
         sql_text=prepared.to_replay_sql_text,
@@ -431,7 +424,7 @@ def _handle_transaction_edit_command(
             print(f"Unknown label {edit_label}. Valid labels: {label_hint}")
             return "handled"
         transaction_label_text, transaction, statement = found
-        edited_sql = _edit_sql_in_editor(edit_label, statement.original_sql_text)
+        edited_sql = _edit_sql_in_editor(edit_label, statement.sql_text)
         if edited_sql is None:
             print(f"Keeping {edit_label} unchanged.")
             return "handled"

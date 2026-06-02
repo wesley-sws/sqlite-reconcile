@@ -56,7 +56,6 @@ UPDATE_FROM_DUPLICATE_TARGET_WARNING = (
 def make_logged_statement(
     branch: BranchName,
     branch_index: int,
-    log_id: int,
     transaction_id: int,
     committed_at: str,
     sql_text: str,
@@ -80,7 +79,6 @@ def make_logged_statement(
     return LoggedStatement(
         branch=branch,
         branch_index=branch_index,
-        log_id=log_id,
         transaction_id=transaction_id,
         committed_at=committed_at,
         original_sql_text=original_sql_text or sql_text,
@@ -188,8 +186,7 @@ def load_logged_statements(
     _require_log_tables(cursor, db_path, branch)
     rows = cursor.execute(
         f"""
-        SELECT l.id AS log_id,
-               l.transaction_id,
+        SELECT l.transaction_id,
                t.committed_at,
                l.original_sql_text,
                l.to_replay_sql_text,
@@ -207,7 +204,6 @@ def load_logged_statements(
         make_logged_statement(
             branch=branch,
             branch_index=index,
-            log_id=int(row["log_id"]),
             transaction_id=int(row["transaction_id"]),
             committed_at=str(row["committed_at"]),
             sql_text=str(row["to_replay_sql_text"]),
@@ -354,18 +350,18 @@ def _current_conflict_pair(
     result: ConflictCheckResult | None = None,
     resolution_key: ConflictResolutionKey | None = None,
 ) -> ConflictPair:
-    """Build report-friendly conflict data using original SQL for display."""
+    """Build report-friendly conflict data using replay SQL for display."""
 
     other = None if other_index is None else remaining_other[other_index]
     ours_sql = (
-        current.original_sql_text
+        current.sql_text
         if current_branch == "ours"
-        else "" if other is None else other.original_sql_text
+        else "" if other is None else other.sql_text
     )
     theirs_sql = (
-        current.original_sql_text
+        current.sql_text
         if current_branch == "theirs"
-        else "" if other is None else other.original_sql_text
+        else "" if other is None else other.sql_text
     )
     return ConflictPair(
         current_branch=current_branch,

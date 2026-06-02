@@ -26,11 +26,17 @@ def conflict_resolution_key(
     return (
         "ours",
         ours_transaction.transaction_id,
-        tuple(statement.log_id for statement in ours_transaction.statements),
+        tuple(
+            statement.branch_index
+            for statement in ours_transaction.statements
+        ),
         tuple(statement.sql_text for statement in ours_transaction.statements),
         "theirs",
         theirs_transaction.transaction_id,
-        tuple(statement.log_id for statement in theirs_transaction.statements),
+        tuple(
+            statement.branch_index
+            for statement in theirs_transaction.statements
+        ),
         tuple(statement.sql_text for statement in theirs_transaction.statements),
         tuple(
             (conflict.kind, conflict.scope, conflict.message)

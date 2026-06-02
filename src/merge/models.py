@@ -27,7 +27,6 @@ ConflictKind = Literal[
 class LoggedStatement:
     branch: BranchName
     branch_index: int
-    log_id: int
     transaction_id: int
     committed_at: str
     original_sql_text: str
@@ -99,7 +98,7 @@ class ConflictCheckContext:
     integer_primary_key_columns: dict[str, str | None] = field(default_factory=dict)
     foreign_key_edges_cache: dict[str, ForeignKeyEdges] = field(default_factory=dict)
     control_schema: str | None = None
-    control_sql_rewriter: Callable[[str], str | None] | None = None
+    control_sql_rewriter: Callable[[str | LoggedStatement], str | None] | None = None
 
 
 @dataclass(frozen=True)

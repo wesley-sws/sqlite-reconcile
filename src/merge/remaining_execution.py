@@ -7,7 +7,7 @@ from typing import Literal
 
 from .accepted_replay import (
     _advance_transaction_on_main_and_control,
-    _control_sql_for_text,
+    _control_sql_for,
     _execute_statement_on_control,
     _execute_statement_on_main,
     _execute_transaction_on_control,
@@ -33,7 +33,6 @@ from .models import (
     LoggedStatement,
     LoggedTransaction,
     StatementConflict,
-    statement_label,
     transaction_label,
 )
 from .static_analysis import write_read_candidate_indexes, write_write_candidate_pairs
@@ -237,15 +236,22 @@ class OrderedRemainingExecutionScanner:
             return result
 
         first_statement, second_statement = overlap
+        first_label = _transaction_scoped_statement_label(
+            ours_transaction,
+            first_statement,
+        )
+        second_label = _transaction_scoped_statement_label(
+            theirs_transaction,
+            second_statement,
+        )
         return result.replace_kind(
             "write_write",
             (
                 StatementConflict(
                     kind="write_write",
                     message=(
-                        f"{statement_label(first_statement)} and "
-                        f"{statement_label(second_statement)} "
-                        "update/delete overlapping rows"
+                        f"{first_label} and {second_label} update/delete "
+                        "overlapping rows"
                     ),
                 ),
             ),
@@ -364,7 +370,7 @@ def _statement_write_probe_sql(
         return None
 
     if use_control:
-        return _control_sql_for_text(context, probe)
+        return _control_sql_for(context, probe)
     return probe
 
 
@@ -378,6 +384,20 @@ def _current_write_probe_indexes(
         for tables_by_statement in probe_tables.values()
         for statement_index in tables_by_statement
     }
+
+
+def _transaction_scoped_statement_label(
+    transaction: LoggedTransaction,
+    statement: LoggedStatement,
+) -> str:
+    """Return the statement label shown by the transaction conflict editor."""
+
+    transaction_prefix = transaction_label(transaction)
+    try:
+        statement_index = transaction.statements.index(statement) + 1
+    except ValueError:
+        return transaction_prefix
+    return f"{transaction_prefix}.{statement_index}"
 
 
 def _find_write_write_overlap(
@@ -568,7 +588,7 @@ def _rolling_write_read_dependency(
                 elif probe.status == "not_refined" or probe.sql is None:
                     return WriteReadProbeResult("not_refined", probe.reason)
                 else:
-                    control_probe = _control_sql_for_text(context, probe.sql)
+                    control_probe = _control_sql_for(context, probe.sql)
                     if control_probe is None:
                         return WriteReadProbeResult(
                             "not_refined",

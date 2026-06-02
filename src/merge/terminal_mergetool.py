@@ -172,7 +172,7 @@ def _branch_replay_conflict(
         details=(
             ()
             if statement is None
-            else (("statement_log_id", str(statement.log_id)),)
+            else (("statement_branch_index", str(statement.branch_index)),)
         ),
     )
 
@@ -468,7 +468,7 @@ def _unresolved_replay_safety_conflict(
             kind="replay_error",
             message=replay_block_reason,
             scope=transaction.branch,
-            details=(("statement_log_id", str(statement.log_id)),),
+            details=(("statement_branch_index", str(statement.branch_index)),),
         )
     return None
 

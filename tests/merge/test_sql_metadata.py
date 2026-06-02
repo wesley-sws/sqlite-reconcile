@@ -12,7 +12,6 @@ def test_logged_statement_metadata_for_update_reads_and_writes():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -36,7 +35,6 @@ def test_logged_statement_metadata_for_insert_select_reads_source_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -115,7 +113,6 @@ def test_logged_statement_metadata_parses_sqlite_conflict_resolution_syntax():
         statement = log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text=sql_text,
@@ -144,7 +141,6 @@ def test_logged_statement_metadata_for_insert_select_join_reads_join_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -171,7 +167,6 @@ def test_logged_statement_metadata_for_compound_select_reads_all_branches():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -195,7 +190,6 @@ def test_logged_statement_metadata_for_delete_reads_predicate_columns():
     statement = log_merge.make_logged_statement(
         branch="theirs",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -216,7 +210,6 @@ def test_logged_statement_metadata_for_update_from_join_reads_join_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -244,7 +237,6 @@ def test_logged_statement_metadata_reads_select_group_by_and_having_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -267,7 +259,6 @@ def test_logged_statement_metadata_ignores_having_output_alias_after_reads():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -290,7 +281,6 @@ def test_logged_statement_metadata_having_alias_does_not_fall_back_to_outer_scop
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -315,7 +305,6 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_star():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO user_archive SELECT * FROM users",
@@ -331,7 +320,6 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_insert_qualified_
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -361,7 +349,6 @@ def test_logged_statement_metadata_uses_all_columns_marker_for_insert_bare_star_
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -387,7 +374,6 @@ def test_logged_statement_metadata_treats_count_star_as_all_columns_conservative
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="SELECT COUNT(*) FROM users",
@@ -405,7 +391,6 @@ def test_logged_statement_metadata_resolves_unqualified_columns_with_schema_map(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -430,7 +415,6 @@ def test_logged_statement_metadata_ignores_ambiguous_unqualified_columns():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -454,7 +438,6 @@ def test_logged_statement_metadata_falls_back_to_outer_scope_for_correlated_colu
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -479,7 +462,6 @@ def test_logged_statement_metadata_inner_scope_shadows_outer_scope():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -503,7 +485,6 @@ def test_logged_statement_metadata_scans_cte_body_and_resolves_known_dml_columns
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -529,7 +510,6 @@ def test_logged_statement_metadata_skips_cte_pseudo_table_references():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -557,7 +537,6 @@ def test_logged_statement_metadata_scans_cte_body_without_output_lineage():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -585,7 +564,6 @@ def test_logged_statement_metadata_scans_aliased_cte_expressions():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -615,7 +593,6 @@ def test_logged_statement_metadata_scans_cte_body_with_join_dependencies():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -648,7 +625,6 @@ def test_logged_statement_metadata_handles_chained_ctes_as_derived_sources():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -675,7 +651,6 @@ def test_logged_statement_metadata_handles_recursive_cte_without_fake_cte_table(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -702,7 +677,6 @@ def test_logged_statement_metadata_top_level_cte_does_not_use_dml_outer_scope():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -728,7 +702,6 @@ def test_logged_statement_metadata_top_level_cte_does_not_use_update_from_alias(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -751,7 +724,6 @@ def test_logged_statement_metadata_cte_name_does_not_shadow_update_target():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -777,7 +749,6 @@ def test_logged_statement_metadata_cte_name_does_not_shadow_delete_target():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -802,7 +773,6 @@ def test_logged_statement_metadata_nested_cte_reads_outer_dml_scope():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -831,7 +801,6 @@ def test_logged_statement_metadata_derived_table_reads_outer_dml_scope():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -860,7 +829,6 @@ def test_logged_statement_metadata_derived_child_can_see_derived_outer_frame():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -896,7 +864,6 @@ def test_logged_statement_metadata_select_cte_cannot_see_later_select_sources():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -915,7 +882,6 @@ def test_logged_statement_metadata_select_derived_cannot_see_sibling_sources():
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(

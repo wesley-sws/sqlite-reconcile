@@ -29,7 +29,6 @@ def make_statement(
     return log_merge.make_logged_statement(
         branch=branch,
         branch_index=index,
-        log_id=index + 1,
         transaction_id=index + 1,
         committed_at="2026-01-01T00:00:00",
         sql_text=sql_text,

@@ -238,3 +238,4 @@ def test_restore_update_conflict_resolution_ignores_insert_resolution():
         )
         == "INSERT OR REPLACE INTO users(id) VALUES (1)"
     )
+

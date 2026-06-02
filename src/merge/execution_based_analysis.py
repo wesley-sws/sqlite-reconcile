@@ -19,7 +19,7 @@ from .models import (
     statement_label,
     transaction_label,
 )
-from .sql_metadata import StatementMetadata
+from .sql_metadata import StatementMetadata, parse_statement_metadata
 from .utils import (
     is_update_statement,
     primary_key_columns as schema_primary_key_columns,
@@ -72,6 +72,7 @@ def _strict_conflict_resolution_statement(
     return replace(
         statement,
         to_replay_sql_text=rewrite.sql,
+        metadata=parse_statement_metadata(rewrite.sql),
         replay_warnings=(
             *statement.replay_warnings,
             f"strict replay removed {rewrite.label}",
@@ -516,7 +517,9 @@ def _standalone_replay_conflict(
 
     details = ()
     if failure.statement is not None:
-        details = (("statement_log_id", str(failure.statement.log_id)),)
+        details = (
+            ("statement_branch_index", str(failure.statement.branch_index)),
+        )
 
     return StatementConflict(
         kind=failure.kind,

@@ -90,7 +90,6 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=4,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE audit_events SET token = random() WHERE id BETWEEN 4 AND 8",
@@ -108,7 +107,7 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
                 kind="replay_error",
                 message="warning: nondeterministic expression cannot be safely materialized",
                 scope="ours",
-                details=(("statement_log_id", "1"),),
+                details=(("statement_branch_index", "4"),),
             ),
         ),
         is_standalone=True,
@@ -142,7 +141,6 @@ def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=4,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE audit_events SET token = random() WHERE id BETWEEN 4 AND 8",
@@ -160,7 +158,7 @@ def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
                 kind="replay_error",
                 message="warning: nondeterministic expression cannot be safely materialized",
                 scope="ours",
-                details=(("statement_log_id", "1"),),
+                details=(("statement_branch_index", "4"),),
             ),
         ),
         is_standalone=True,
@@ -190,7 +188,6 @@ def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatc
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE audit_events SET token = 'fixed' WHERE id = 1",
@@ -213,7 +210,7 @@ def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatc
                 kind="replay_error",
                 message="statement failed",
                 scope="ours",
-                details=(("statement_log_id", "1"),),
+                details=(("statement_branch_index", "0"),),
             ),
         ),
         is_standalone=True,
@@ -239,7 +236,6 @@ def test_prompt_standalone_transaction_resolution_prints_statement_once(monkeypa
     statement = log_merge.make_logged_statement(
         branch="theirs",
         branch_index=3,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO coupons (id, code, discount) VALUES (902, 'SPRING-DEMO', 25)",
@@ -279,7 +275,6 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
     first = log_merge.make_logged_statement(
         branch="theirs",
         branch_index=3,
-        log_id=11,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO coupons (id, code) VALUES (1, 'OK')",
@@ -287,7 +282,6 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
     failing = log_merge.make_logged_statement(
         branch="theirs",
         branch_index=4,
-        log_id=12,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO coupons (id, code) VALUES (2, 'DUP')",
@@ -302,7 +296,7 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
                 kind="integrity",
                 message="UNIQUE constraint failed: coupons.code",
                 scope="theirs",
-                details=(("statement_log_id", "12"),),
+                details=(("statement_branch_index", "4"),),
             ),
         ),
         is_standalone=True,
@@ -337,7 +331,6 @@ def test_transaction_scoped_statement_labels_for_ui(capsys):
             log_merge.make_logged_statement(
                 branch="ours",
                 branch_index=4,
-                log_id=11,
                 transaction_id=1,
                 committed_at="2026-01-01T00:00:00",
                 sql_text="UPDATE coupons SET code = 'A' WHERE id = 1",
@@ -345,7 +338,6 @@ def test_transaction_scoped_statement_labels_for_ui(capsys):
             log_merge.make_logged_statement(
                 branch="ours",
                 branch_index=5,
-                log_id=12,
                 transaction_id=1,
                 committed_at="2026-01-01T00:00:00",
                 sql_text="UPDATE coupons SET code = 'B' WHERE id = 2",
@@ -373,7 +365,6 @@ def test_user_inserted_statement_gets_transaction_scoped_new_label(capsys):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=11,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE coupons SET code = 'A' WHERE id = 1",
@@ -410,7 +401,6 @@ def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'OLD')",
@@ -418,7 +408,6 @@ def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE coupons SET code = 'NEXT' WHERE id = 1",
@@ -428,7 +417,6 @@ def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (2, 'REMOTE')",
@@ -437,7 +425,6 @@ def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
     replacement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO coupons (id, code) VALUES (1, 'FIXED')",
@@ -493,7 +480,6 @@ def test_pair_resolution_deleting_current_removes_only_current_transaction(monke
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'LOCAL')",
@@ -503,7 +489,6 @@ def test_pair_resolution_deleting_current_removes_only_current_transaction(monke
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (2, 'REMOTE')",
@@ -511,7 +496,6 @@ def test_pair_resolution_deleting_current_removes_only_current_transaction(monke
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (3, 'REMOTE')",
@@ -577,7 +561,6 @@ def test_pair_resolution_deleting_later_other_keeps_current_for_recheck(monkeypa
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (1, 'LOCAL')",
@@ -587,7 +570,6 @@ def test_pair_resolution_deleting_later_other_keeps_current_for_recheck(monkeypa
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (2, 'REMOTE')",
@@ -595,7 +577,6 @@ def test_pair_resolution_deleting_later_other_keeps_current_for_recheck(monkeypa
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO coupons (id, code) VALUES (3, 'REMOTE')",
@@ -661,7 +642,6 @@ def test_pair_resolution_accepts_reviewable_conflict_without_queue_changes(monke
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE coupons SET code = 'LOCAL' WHERE id = 1",
@@ -671,7 +651,6 @@ def test_pair_resolution_accepts_reviewable_conflict_without_queue_changes(monke
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE coupons SET code = 'REMOTE' WHERE id = 1",
@@ -755,7 +734,6 @@ def test_branch_replay_safety_edits_whole_transaction_after_error(
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO parents(id) VALUES (1)",
@@ -766,7 +744,6 @@ def test_branch_replay_safety_edits_whole_transaction_after_error(
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO children(id, parent_id) VALUES (1, 1)",
@@ -819,7 +796,6 @@ def test_branch_replay_safety_warns_for_update_from_duplicates(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -872,7 +848,6 @@ def test_branch_replay_safety_update_from_warning_uses_transaction_prefix(
     setup = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO categories VALUES (1, 7)",
@@ -881,7 +856,6 @@ def test_branch_replay_safety_update_from_warning_uses_transaction_prefix(
     update = log_merge.make_logged_statement(
         branch="ours",
         branch_index=1,
-        log_id=2,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -936,7 +910,6 @@ def test_branch_replay_safety_records_warning_when_other_statement_changes(
     setup = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="INSERT INTO categories VALUES (1, 7)",
@@ -945,7 +918,6 @@ def test_branch_replay_safety_records_warning_when_other_statement_changes(
     update = log_merge.make_logged_statement(
         branch="ours",
         branch_index=1,
-        log_id=2,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -997,7 +969,6 @@ def test_branch_replay_safety_can_accept_nondeterministic_warning(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE users SET name = random() WHERE id = 1",
@@ -1008,7 +979,6 @@ def test_branch_replay_safety_can_accept_nondeterministic_warning(
     followup = log_merge.make_logged_statement(
         branch="ours",
         branch_index=1,
-        log_id=2,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE users SET name = 'checked' WHERE id = 1",
@@ -1057,7 +1027,6 @@ def test_branch_replay_safety_prompts_stored_nondeterministic_warning(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text="UPDATE users SET name = random() WHERE id = 1",
@@ -1108,7 +1077,6 @@ def test_branch_replay_safety_ignores_stale_update_from_warning(
     statement = log_merge.make_logged_statement(
         branch="ours",
         branch_index=0,
-        log_id=1,
         transaction_id=1,
         committed_at="2026-01-01T00:00:00",
         sql_text=(
@@ -1429,6 +1397,78 @@ def test_control_rewrite_update_target_not_shadowed_by_same_named_cte():
     )
 
 
+def test_control_rewrite_restores_update_or_clause_from_statement_metadata():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="UPDATE OR IGNORE users SET name = 'x' WHERE id = 1",
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+    rewritten = control_db._rewrite_sql_for_control_db(
+        statement,
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+
+    assert rewritten == (
+        "UPDATE OR IGNORE control.users AS users SET name = 'x' WHERE id = 1"
+    )
+
+
+def test_control_rewrite_rewrites_replace_into_from_statement_metadata():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="REPLACE INTO users(id, name) VALUES (1, 'x')",
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+    rewritten = control_db._rewrite_sql_for_control_db(
+        statement,
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+
+    assert rewritten == (
+        "INSERT OR REPLACE INTO control.users AS users (id, name) VALUES (1, 'x')"
+    )
+
+
+def test_control_rewrite_uses_strict_insert_for_upsert_statement_metadata():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "INSERT INTO users(id, score) VALUES (1, 5) "
+            "ON CONFLICT(id) DO UPDATE SET score=excluded.score"
+        ),
+        table_columns={
+            "users": {"id", "score"},
+        },
+    )
+    rewritten = control_db._rewrite_sql_for_control_db(
+        statement,
+        table_columns={
+            "users": {"id", "score"},
+        },
+    )
+
+    assert rewritten == (
+        "INSERT INTO control.users AS users (id, score) VALUES (1, 5)"
+    )
+
+
 def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
     base = tmp_path / "base.db"
     with closing(sqlite3.connect(base)) as con:
@@ -1443,7 +1483,6 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (1, 'local one')",
@@ -1452,7 +1491,6 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=1,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (3, 'local two')",
@@ -1463,7 +1501,6 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (2, 'remote one')",
@@ -1562,7 +1599,6 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -1573,7 +1609,6 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (2, 'remote one')",
@@ -1582,7 +1617,6 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote conflict' WHERE id = 1",
@@ -1591,7 +1625,6 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=2,
-            log_id=4,
             transaction_id=4,
             committed_at="2026-01-01T00:00:00",
             sql_text="INSERT INTO users (id, name) VALUES (3, 'remote two')",
@@ -1685,7 +1718,6 @@ def test_check_accept_current_fast_forwards_after_accepting_reviewable_pair(
         log_merge.make_logged_statement(
             branch="ours",
             branch_index=0,
-            log_id=1,
             transaction_id=1,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'local' WHERE id = 1",
@@ -1696,7 +1728,6 @@ def test_check_accept_current_fast_forwards_after_accepting_reviewable_pair(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=0,
-            log_id=2,
             transaction_id=2,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote' WHERE id = 1",
@@ -1705,7 +1736,6 @@ def test_check_accept_current_fast_forwards_after_accepting_reviewable_pair(
         log_merge.make_logged_statement(
             branch="theirs",
             branch_index=1,
-            log_id=3,
             transaction_id=3,
             committed_at="2026-01-01T00:00:00",
             sql_text="UPDATE users SET name = 'remote two' WHERE id = 2",

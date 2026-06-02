@@ -10,7 +10,9 @@ import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.errors import ParseError
 
-from .models import ConflictCheckContext
+from sqlite_conflict_resolution import restore_update_conflict_resolution
+
+from .models import ConflictCheckContext, LoggedStatement
 from .sql_ast import (
     child_expressions,
     cte_aliases,
@@ -88,16 +90,78 @@ def _open_merge_working_connection(base_path: Path) -> Iterator[sqlite3.Connecti
 
 
 def _rewrite_sql_for_control_db(
-    sql_text: str,
+    sql: str | LoggedStatement,
     schema: str = CONTROL_DB_SCHEMA,
     table_columns: TableColumns | None = None,
 ) -> str | None:
     """Return SQL with persistent table references qualified by control schema."""
 
+    if isinstance(sql, LoggedStatement):
+        return _rewrite_logged_statement_for_control_db(
+            sql,
+            schema=schema,
+            table_columns=table_columns,
+        )
+
+    return _rewrite_parseable_sql_for_control_db(
+        sql,
+        schema=schema,
+        table_columns=table_columns,
+    )
+
+
+def _rewrite_logged_statement_for_control_db(
+    statement: LoggedStatement,
+    *,
+    schema: str,
+    table_columns: TableColumns | None,
+) -> str | None:
+    """Return statement replay SQL rewritten for the attached control schema."""
+
+    compatible = statement.metadata.compatible_sql
+    # UPSERT is intentionally replayed on control as the strict INSERT form
+    # stored in metadata. If that fails, the UPSERT path would have mattered and
+    # the merge reports a conflict instead of trying to model DO UPDATE effects.
+    rewritten = _rewrite_expression_for_control_db(
+        statement.metadata.parsed_sql_text.copy(),
+        schema=schema,
+        table_columns=table_columns,
+    )
+    if rewritten is None:
+        return None
+    return restore_update_conflict_resolution(
+        rewritten,
+        compatible.conflict_resolution,
+    )
+
+
+def _rewrite_parseable_sql_for_control_db(
+    sql_text: str,
+    *,
+    schema: str,
+    table_columns: TableColumns | None,
+) -> str | None:
+    """Rewrite SQL once it is in a form sqlglot can parse directly."""
+
     try:
         expression = sqlglot.parse_one(sql_text, read="sqlite")
     except ParseError:
         return None
+
+    return _rewrite_expression_for_control_db(
+        expression,
+        schema=schema,
+        table_columns=table_columns,
+    )
+
+
+def _rewrite_expression_for_control_db(
+    expression: exp.Expression,
+    *,
+    schema: str,
+    table_columns: TableColumns | None,
+) -> str | None:
+    """Rewrite a parsed SQL AST for the attached control schema."""
 
     if not isinstance(expression, (exp.Select, exp.Insert, exp.Update, exp.Delete)):
         return None
