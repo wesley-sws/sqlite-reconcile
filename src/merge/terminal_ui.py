@@ -22,6 +22,8 @@ from .models import (
 from sqlite_replay_preparation import prepare_logged_sql
 from .sql_metadata import transaction_metadata
 
+_printed_replay_sql_note = False
+
 
 @dataclass(frozen=True)
 class PairTransactionResolution:
@@ -51,10 +53,28 @@ def _print_indented_sql(sql_text: str, indent: str = "  ") -> None:
 def _print_statement_group(label: str, statements: Sequence[LoggedStatement]) -> None:
     """Print all statements in a conflict group."""
 
+    _print_replay_sql_note_if_needed(statements)
     print(f"{_group_title(label, statements)}:")
     for index, statement in enumerate(statements):
         print(f"  {_transaction_statement_label(label, statement, index)}:")
         _print_indented_sql(statement.sql_text, indent="    ")
+
+
+def _print_replay_sql_note_if_needed(statements: Sequence[LoggedStatement]) -> None:
+    """Print a one-time note when replay SQL differs from originally logged SQL."""
+
+    global _printed_replay_sql_note
+    if _printed_replay_sql_note:
+        return
+    if not any(
+        statement.sql_text != statement.original_sql_text for statement in statements
+    ):
+        return
+    print(
+        "Note: shown SQL is the deterministic replay form, "
+        "not necessarily the original text."
+    )
+    _printed_replay_sql_note = True
 
 
 def _conflict_messages(conflict: ConflictPair) -> str:

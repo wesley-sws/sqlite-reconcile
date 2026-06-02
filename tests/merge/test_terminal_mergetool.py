@@ -396,6 +396,26 @@ def test_user_inserted_statement_gets_transaction_scoped_new_label(capsys):
     assert "R1.N1:" in output
 
 
+def test_statement_group_prints_replay_sql_note_once(capsys):
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="UPDATE events SET seen_at = '2026-01-01 12:00:00' WHERE id = 1",
+        original_sql_text="UPDATE events SET seen_at = datetime('now') WHERE id = 1",
+    )
+
+    terminal_ui._printed_replay_sql_note = False
+    terminal_ui._print_statement_group("L1", (statement,))
+    terminal_ui._print_statement_group("L1", (statement,))
+    output = capsys.readouterr().out
+
+    assert output.count("shown SQL is the deterministic replay form") == 1
+    assert "datetime('now')" not in output
+    assert "'2026-01-01 12:00:00'" in output
+
+
 def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
     ours = [
         log_merge.make_logged_statement(

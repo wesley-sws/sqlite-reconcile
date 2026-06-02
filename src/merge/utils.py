@@ -4,7 +4,8 @@ import sqlite3
 from collections.abc import Container, Iterable
 from typing import TYPE_CHECKING
 
-from sqlglot import expressions as exp
+from sqlglot import expressions as exp, parse_one
+from sqlglot.errors import ParseError
 
 if TYPE_CHECKING:
     from .sql_metadata import StatementMetadata
@@ -97,7 +98,7 @@ def load_table_columns(
     *,
     ignored_tables: Container[str] = (),
 ) -> TableColumns:
-    """Return user table names mapped to column names."""
+    """Return non-SQLite table names mapped to columns, excluding ignored tables."""
 
     table_columns: TableColumns = {}
     table_rows = cursor.execute(
@@ -209,14 +210,91 @@ def key_column_sets(cursor: sqlite3.Cursor, table: str) -> tuple[set[str], ...]:
             continue
 
         index_name = str(row_value(index_row, "name", 1))
-        index_columns = {
-            str(row_value(info_row, "name", 2))
-            for info_row in cursor.execute(
-                f"PRAGMA index_info({quote_identifier(index_name)})"
-            ).fetchall()
-            if row_value(info_row, "name", 2) is not None
-        }
+        is_partial = bool(int(row_value(index_row, "partial", 4) or 0))
+        index_columns = _unique_index_key_columns(
+            cursor,
+            index_name,
+            is_partial=is_partial,
+        )
         if index_columns:
             key_sets.append(index_columns)
 
     return tuple(key_sets)
+
+
+def _unique_index_key_columns(
+    cursor: sqlite3.Cursor,
+    index_name: str,
+    *,
+    is_partial: bool,
+) -> set[str]:
+    """Return columns that may affect one unique index."""
+
+    needs_sql_parse = is_partial
+    columns: set[str] = set()
+    # index_xinfo returns both real index key entries and auxiliary entries
+    # such as the rowid. Only rows with key=1 define uniqueness.
+    xinfo_rows = cursor.execute(
+        f"PRAGMA index_xinfo({quote_identifier(index_name)})"
+    ).fetchall()
+
+    for xinfo_row in xinfo_rows:
+        if int(row_value(xinfo_row, "key", 5) or 0) != 1:
+            continue
+
+        column_name = row_value(xinfo_row, "name", 2)
+        column_id = int(row_value(xinfo_row, "cid", 1) or 0)
+        if column_name is None or column_id < 0:
+            # cid=-2 is an expression index entry, so the column dependencies
+            # only exist in the stored CREATE INDEX statement.
+            needs_sql_parse = True
+            continue
+
+        columns.add(str(column_name))
+
+    if not needs_sql_parse:
+        return columns
+
+    parsed_columns = _columns_referenced_by_index_sql(cursor, index_name)
+    if parsed_columns:
+        return parsed_columns
+
+    return {ALL_COLUMNS}
+
+
+def _columns_referenced_by_index_sql(
+    cursor: sqlite3.Cursor,
+    index_name: str,
+) -> set[str] | None:
+    """Parse CREATE INDEX SQL and return referenced columns when possible."""
+
+    # Explicit CREATE INDEX statements have SQL text here. Autoindexes created
+    # for inline UNIQUE/PK constraints usually have NULL SQL; those are handled
+    # by index_xinfo above unless they use features outside our supported scope.
+    row = cursor.execute(
+        """
+        SELECT sql
+        FROM sqlite_schema
+        WHERE type = 'index'
+          AND name = ?
+        """,
+        (index_name,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    sql_text = row_value(row, "sql", 0)
+    if sql_text is None:
+        return None
+
+    try:
+        expression = parse_one(str(sql_text), read="sqlite")
+    except ParseError:
+        return None
+
+    columns = {
+        column.name
+        for column in expression.find_all(exp.Column)
+        if column.name
+    }
+    return columns or None
