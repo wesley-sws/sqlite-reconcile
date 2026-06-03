@@ -12,7 +12,14 @@ from .utils import TableColumns, TableKeyColumnSets, TablePrimaryKeyColumns
 
 BranchName = Literal["ours", "theirs"]
 ConflictScope = Literal["pair", "ours", "theirs", "both"]
-ForeignKeyEdges = tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...]
+ForeignKeyAction = Literal[
+    "NO ACTION",
+    "RESTRICT",
+    "CASCADE",
+    "SET NULL",
+    "SET DEFAULT",
+]
+ForeignKeyEdges = tuple["ForeignKeyEdge", ...]
 ConflictKind = Literal[
     "write_write",
     "write_read",
@@ -21,6 +28,16 @@ ConflictKind = Literal[
     "constraint_resolution",
     "replay_error",
 ]
+
+
+@dataclass(frozen=True)
+class ForeignKeyEdge:
+    child_table: str
+    child_columns: tuple[str, ...]
+    parent_table: str
+    parent_columns: tuple[str, ...]
+    on_update: ForeignKeyAction
+    on_delete: ForeignKeyAction
 
 
 @dataclass(frozen=True)

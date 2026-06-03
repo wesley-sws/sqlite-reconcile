@@ -18,6 +18,7 @@ from merge import (
     static_analysis,
     terminal_mergetool,
 )
+from merge.models import ForeignKeyEdge
 from merge.utils import ALL_COLUMNS
 
 
@@ -709,13 +710,66 @@ def test_context_caches_foreign_key_edges(tmp_path):
         )
         edges = static_analysis.foreign_key_edges(context)
 
-        assert (
-            "orders",
-            ("user_id",),
-            "users",
-            ("id",),
+        assert ForeignKeyEdge(
+            child_table="orders",
+            child_columns=("user_id",),
+            parent_table="users",
+            parent_columns=("id",),
+            on_update="NO ACTION",
+            on_delete="NO ACTION",
         ) in edges
         assert static_analysis.foreign_key_edges(context) is edges
+
+
+def test_foreign_key_edges_include_actions_and_composite_columns(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute(
+            """
+            CREATE TABLE parents (
+                account_id INTEGER,
+                region TEXT,
+                PRIMARY KEY (account_id, region)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE children (
+                id INTEGER PRIMARY KEY,
+                account_id INTEGER,
+                region TEXT,
+                FOREIGN KEY (account_id, region)
+                    REFERENCES parents(account_id, region)
+                    ON UPDATE CASCADE
+                    ON DELETE SET DEFAULT
+            )
+            """
+        )
+        table_columns, primary_key_columns, key_column_sets = (
+            log_merge.load_schema_metadata(con.cursor())
+        )
+        context = log_merge.ConflictCheckContext(
+            base_cursor=con.cursor(),
+            base_db_path=db_path,
+            table_columns=table_columns,
+            primary_key_columns=primary_key_columns,
+            key_column_sets=key_column_sets,
+        )
+
+        edges = static_analysis.foreign_key_edges(context)
+
+    assert edges == (
+        ForeignKeyEdge(
+            child_table="children",
+            child_columns=("account_id", "region"),
+            parent_table="parents",
+            parent_columns=("account_id", "region"),
+            on_update="CASCADE",
+            on_delete="SET DEFAULT",
+        ),
+    )
 
 
 def test_remaining_metadata_index_does_not_cache_schema_constraints(tmp_path):

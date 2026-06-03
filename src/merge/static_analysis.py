@@ -10,6 +10,9 @@ from .models import (
     ConflictCheckContext,
     ConflictKind,
     ConflictCheckResult,
+    ForeignKeyAction,
+    ForeignKeyEdge,
+    ForeignKeyEdges,
     StatementConflict,
 )
 from .sql_metadata import StatementMetadata, TransactionMetadata
@@ -22,6 +25,14 @@ from .utils import (
     quote_identifier,
     row_value,
 )
+
+SQLITE_FOREIGN_KEY_ACTIONS: dict[str, ForeignKeyAction] = {
+    "NO ACTION": "NO ACTION",
+    "RESTRICT": "RESTRICT",
+    "CASCADE": "CASCADE",
+    "SET NULL": "SET NULL",
+    "SET DEFAULT": "SET DEFAULT",
+}
 
 
 def static_analysis_matching(
@@ -168,7 +179,7 @@ def omitted_integer_primary_key_column(
 
 def foreign_key_edges(
     context: ConflictCheckContext,
-) -> tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...]:
+) -> ForeignKeyEdges:
     """Return child columns and parent columns for each foreign-key edge."""
 
     cache_key = "base"
@@ -308,28 +319,26 @@ def _foreign_key_constraint_conflict_possible(
 ) -> bool:
     """Return whether parent-key and child-FK writes may violate an FK edge."""
 
-    for child_table, child_columns, parent_table, parent_columns in (
-        foreign_key_edges(context)
-    ):
+    for edge in foreign_key_edges(context):
         first_changes_parent = _transaction_may_remove_or_change_key(
             first_metadata,
-            parent_table,
-            set(parent_columns),
+            edge.parent_table,
+            set(edge.parent_columns),
         )
         second_changes_parent = _transaction_may_remove_or_change_key(
             second_metadata,
-            parent_table,
-            set(parent_columns),
+            edge.parent_table,
+            set(edge.parent_columns),
         )
         first_writes_child = _transaction_may_create_or_change_key(
             first_metadata,
-            child_table,
-            set(child_columns),
+            edge.child_table,
+            set(edge.child_columns),
         )
         second_writes_child = _transaction_may_create_or_change_key(
             second_metadata,
-            child_table,
-            set(child_columns),
+            edge.child_table,
+            set(edge.child_columns),
         )
         if (
             first_changes_parent
@@ -375,10 +384,10 @@ def _key_column_sets_by_table(
 
 def _foreign_key_edges(
     context: ConflictCheckContext,
-) -> tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...]:
+) -> ForeignKeyEdges:
     """Return child columns and parent columns for each foreign-key edge."""
 
-    edges: list[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = []
+    edges: list[ForeignKeyEdge] = []
     for child_table in context.table_columns:
         rows = context.base_cursor.execute(
             f"PRAGMA foreign_key_list({quote_identifier(child_table)})"
@@ -390,6 +399,8 @@ def _foreign_key_edges(
         for edge_rows in grouped.values():
             ordered_rows = sorted(edge_rows, key=lambda row: int(row_value(row, "seq", 1)))
             parent_table = str(row_value(ordered_rows[0], "table", 2))
+            on_update = _foreign_key_action(ordered_rows[0], "on_update", 5)
+            on_delete = _foreign_key_action(ordered_rows[0], "on_delete", 6)
             parent_pk_columns = context.primary_key_columns.get(parent_table, ())
             # if parent key reference is not specified by SQLite it should refer to its PK columns
             uses_parent_pk_shorthand = any(
@@ -411,13 +422,28 @@ def _foreign_key_edges(
                 )
 
             if parent_columns:
-                edges.append((
-                    child_table,
-                    tuple(child_columns),
-                    parent_table,
-                    tuple(parent_columns),
-                ))
+                edges.append(
+                    ForeignKeyEdge(
+                        child_table=child_table,
+                        child_columns=tuple(child_columns),
+                        parent_table=parent_table,
+                        parent_columns=tuple(parent_columns),
+                        on_update=on_update,
+                        on_delete=on_delete,
+                    )
+                )
     return tuple(edges)
+
+
+def _foreign_key_action(
+    row: sqlite3.Row | tuple,
+    key: str,
+    index: int,
+) -> ForeignKeyAction:
+    """Return one SQLite FK action from PRAGMA foreign_key_list."""
+
+    action = str(row_value(row, key, index)).upper()
+    return SQLITE_FOREIGN_KEY_ACTIONS.get(action, "NO ACTION")
 
 
 def _match_statement_metadata(

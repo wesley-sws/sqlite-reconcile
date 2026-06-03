@@ -388,31 +388,26 @@ def _foreign_key_constraint_conflict_possible_with_index(
 ) -> bool:
     """Return whether parent-key and child-FK writes may violate an FK edge."""
 
-    for (
-        child_table,
-        child_columns,
-        parent_table,
-        parent_columns,
-    ) in foreign_key_edges(context):
-        child_column_set = set(child_columns)
-        parent_column_set = set(parent_columns)
+    for edge in foreign_key_edges(context):
+        child_column_set = set(edge.child_columns)
+        parent_column_set = set(edge.parent_columns)
         current_changes_parent = _transaction_may_remove_or_change_key(
             current,
-            parent_table,
+            edge.parent_table,
             parent_column_set,
         )
         current_writes_child = _transaction_may_create_or_change_key(
             current,
-            child_table,
+            edge.child_table,
             child_column_set,
         )
         if current_changes_parent and remaining_other_index.has_create_or_change_key(
-            child_table,
+            edge.child_table,
             child_column_set,
         ):
             return True
         if current_writes_child and remaining_other_index.has_remove_or_change_key(
-            parent_table,
+            edge.parent_table,
             parent_column_set,
         ):
             return True
