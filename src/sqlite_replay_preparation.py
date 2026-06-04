@@ -50,7 +50,9 @@ DEFAULT_VALUES_PATTERN = re.compile(
 
 PARSE_ERROR_REASON = "statement could not be parsed for replay preparation"
 UNSAFE_NONDETERMINISTIC_REASON = "nondeterministic expression cannot be safely materialized"
-PARAMETERIZED_REWRITE_REASON = "parameterized statement needs nondeterministic rewrite"
+PARAMETERIZED_REWRITE_REASON = (
+    "parameterized statement cannot be replayed without bound parameters"
+)
 
 
 @dataclass(frozen=True)

@@ -54,7 +54,6 @@ TX_TABLE = "_sqlite_merge_transactions"
 METADATA_PARSE_ERROR_REASON = "statement could not be parsed for merge analysis"
 ACKNOWLEDGEABLE_REPLAY_REASONS = (
     "nondeterministic expression cannot be safely materialized",
-    "parameterized statement needs nondeterministic rewrite",
 )
 UPDATE_FROM_DUPLICATE_TARGET_WARNING = (
     "UPDATE FROM has multiple source rows for the same target row"

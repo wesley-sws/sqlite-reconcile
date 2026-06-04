@@ -242,23 +242,20 @@ def test_get_log_since_transaction_id_filters_older_entries(tmp_path, wrapper_mo
         wrapper.close()
 
 
-def test_executemany_logs_each_execution(tmp_path, wrapper_module):
+def test_executemany_rejects_parameterized_dml(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
-        wrapper.executemany(
-            "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
-            [
-                (1, "Alice", "alice@example.com"),
-                (2, "Bob", "bob@example.com"),
-            ],
-        )
+        with pytest.raises(sqlite3.ProgrammingError, match="bound parameters"):
+            wrapper.executemany(
+                "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+                [
+                    (1, "Alice", "alice@example.com"),
+                    (2, "Bob", "bob@example.com"),
+                ],
+            )
 
-        log_entries = wrapper.get_log()
-        assert len(log_entries) == 2
-        assert [entry["sql_text"].rstrip(";") for entry in log_entries] == [
-            "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')",
-            "INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com')",
-        ]
+        assert wrapper.get_log() == []
+        assert wrapper.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
     finally:
         wrapper.close()
 
@@ -419,40 +416,57 @@ def test_replace_into_is_rendered_as_insert_or_replace_when_replay_sql_is_rewrit
         wrapper.close()
 
 
-def test_parameterized_nondeterministic_expression_is_marked_unsafe(tmp_path, wrapper_module):
+def test_parameterized_select_is_allowed(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
         wrapper.execute("INSERT INTO events (id, name, created_at) VALUES (1, 'Alice', '2026-01-01')")
-        wrapper.execute(
-            "UPDATE events SET created_at = datetime('now', ?) WHERE id = 1",
-            ("-7 days",),
-        )
 
-        entry = wrapper.get_log()[1]
-        assert entry["original_sql_text"] == (
-            "UPDATE events SET created_at = datetime('now', '-7 days') WHERE id = 1"
-        )
-        assert entry["to_replay_sql_text"] == entry["original_sql_text"]
-        assert entry["is_replay_safe"] == 0
+        rows = wrapper.execute(
+            "SELECT name FROM events WHERE id = ?",
+            (1,),
+        ).fetchall()
+
+        assert rows == [("Alice",)]
+        assert len(wrapper.get_log()) == 1
     finally:
         wrapper.close()
 
 
-def test_parameterized_statement_that_needs_rewrite_logs_expanded_unsafe_sql(tmp_path, wrapper_module):
+def test_parameterized_dml_is_rejected_before_execution(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
         wrapper.execute("INSERT INTO events (id, name, created_at) VALUES (1, 'Alice', '2026-01-01')")
-        wrapper.execute(
-            "UPDATE events SET name = ? WHERE created_at < datetime('now', '+1 day')",
-            ("expired",),
-        )
+        with pytest.raises(sqlite3.ProgrammingError, match="bound parameters"):
+            wrapper.execute(
+                "UPDATE events SET created_at = datetime('now', ?) WHERE id = 1",
+                ("-7 days",),
+            )
 
-        entry = wrapper.get_log()[1]
-        assert "?" not in entry["original_sql_text"]
-        assert "'expired'" in entry["original_sql_text"]
-        assert "datetime('now', '+1 day')" in entry["original_sql_text"]
-        assert entry["to_replay_sql_text"] == entry["original_sql_text"]
-        assert entry["is_replay_safe"] == 0
+        assert wrapper.execute(
+            "SELECT created_at FROM events WHERE id = 1"
+        ).fetchone()[0] == "2026-01-01"
+        assert len(wrapper.get_log()) == 1
+    finally:
+        wrapper.close()
+
+
+def test_parameterized_statement_that_needs_rewrite_is_rejected(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute("INSERT INTO events (id, name, created_at) VALUES (1, 'Alice', '2026-01-01')")
+        with pytest.raises(sqlite3.ProgrammingError, match="bound parameters"):
+            wrapper.execute(
+                "UPDATE events SET name = ? WHERE created_at < datetime('now', '+1 day')",
+                ("expired",),
+            )
+
+        assert wrapper.execute(
+            "SELECT name FROM events WHERE id = 1"
+        ).fetchone()[0] == "Alice"
+        assert len(wrapper.get_log()) == 1
     finally:
         wrapper.close()
 
@@ -500,27 +514,20 @@ def test_single_values_random_is_materialized(tmp_path, wrapper_module):
         wrapper.close()
 
 
-def test_executemany_rewrite_candidate_is_marked_unsafe_per_execution(tmp_path, wrapper_module):
+def test_executemany_rewrite_candidate_is_rejected(tmp_path, wrapper_module):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
-        wrapper.executemany(
-            "INSERT INTO events (id, name, token) VALUES (?, ?, random())",
-            [
-                (1, "Alice"),
-                (2, "Bob"),
-            ],
-        )
+        with pytest.raises(sqlite3.ProgrammingError, match="bound parameters"):
+            wrapper.executemany(
+                "INSERT INTO events (id, name, token) VALUES (?, ?, random())",
+                [
+                    (1, "Alice"),
+                    (2, "Bob"),
+                ],
+            )
 
-        entries = wrapper.get_log()
-        assert len(entries) == 2
-        assert [entry["is_replay_safe"] for entry in entries] == [0, 0]
-        assert [entry["original_sql_text"] for entry in entries] == [
-            "INSERT INTO events (id, name, token) VALUES (1, 'Alice', random())",
-            "INSERT INTO events (id, name, token) VALUES (2, 'Bob', random())",
-        ]
-        assert [entry["to_replay_sql_text"] for entry in entries] == [
-            entry["original_sql_text"] for entry in entries
-        ]
+        assert wrapper.get_log() == []
+        assert wrapper.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     finally:
         wrapper.close()
 
@@ -538,7 +545,10 @@ def test_row_level_random_update_is_marked_unsafe(tmp_path, wrapper_module):
         wrapper.close()
 
 
-def test_failed_autocommit_statement_is_not_logged_without_trace(tmp_path, wrapper_module):
+def test_failed_autocommit_statement_without_effect_is_not_logged(
+    tmp_path,
+    wrapper_module,
+):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
         wrapper.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
@@ -552,7 +562,40 @@ def test_failed_autocommit_statement_is_not_logged_without_trace(tmp_path, wrapp
         wrapper.close()
 
 
-def test_transaction_statement_error_marks_failed_statement_unsafe(tmp_path, wrapper_module):
+def test_failed_autocommit_statement_with_partial_effect_is_logged_unsafe(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)"
+        )
+        wrapper.execute("INSERT INTO items (id, code) VALUES (1, 1)")
+        wrapper.execute("INSERT INTO items (id, code) VALUES (2, 2)")
+        initial_log_count = len(wrapper.get_log())
+
+        with pytest.raises(sqlite3.IntegrityError):
+            wrapper.execute("UPDATE OR FAIL items SET code = 99")
+
+        entries = wrapper.get_log()
+        assert len(entries) == initial_log_count + 1
+        assert entries[-1]["original_sql_text"] == (
+            "UPDATE OR FAIL items SET code = 99"
+        )
+        assert entries[-1]["is_replay_safe"] == 0
+        assert "execution error" in entries[-1]["replay_block_reason"]
+        assert wrapper.execute(
+            "SELECT id, code FROM items ORDER BY id"
+        ).fetchall() == [(1, 99), (2, 2)]
+    finally:
+        wrapper.close()
+
+
+def test_transaction_statement_error_marks_committed_statements_unsafe(
+    tmp_path,
+    wrapper_module,
+):
     wrapper = make_wrapper(tmp_path, wrapper_module)
     try:
         wrapper.execute("BEGIN")
@@ -562,13 +605,73 @@ def test_transaction_statement_error_marks_failed_statement_unsafe(tmp_path, wra
         wrapper.commit()
 
         entries = wrapper.get_log()
-        assert len(entries) == 2
-        assert {entry["transaction_id"] for entry in entries} == {
-            entries[0]["transaction_id"]
-        }
+        assert len(entries) == 1
         assert entries[0]["is_replay_safe"] == 0
-        assert entries[1]["is_replay_safe"] == 0
         assert "execution error" in entries[0]["replay_block_reason"]
-        assert "execution error" in entries[1]["replay_block_reason"]
+    finally:
+        wrapper.close()
+
+
+def test_transaction_statement_error_with_partial_effect_logs_failed_statement(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)"
+        )
+        wrapper.execute("INSERT INTO items (id, code) VALUES (1, 1)")
+        wrapper.execute("INSERT INTO items (id, code) VALUES (2, 2)")
+        initial_log_count = len(wrapper.get_log())
+
+        wrapper.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError):
+            wrapper.execute("UPDATE OR FAIL items SET code = 77")
+        wrapper.commit()
+
+        entries = wrapper.get_log()
+        new_entries = entries[initial_log_count:]
+        assert len(new_entries) == 1
+        assert new_entries[0]["original_sql_text"] == (
+            "UPDATE OR FAIL items SET code = 77"
+        )
+        assert new_entries[0]["is_replay_safe"] == 0
+        assert "execution error" in new_entries[0]["replay_block_reason"]
+        assert wrapper.execute(
+            "SELECT id, code FROM items ORDER BY id"
+        ).fetchall() == [(1, 77), (2, 2)]
+    finally:
+        wrapper.close()
+
+
+def test_transaction_error_that_rolls_back_discards_buffer(
+    tmp_path,
+    wrapper_module,
+):
+    wrapper = make_wrapper(tmp_path, wrapper_module)
+    try:
+        wrapper.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)"
+        )
+        wrapper.execute("INSERT INTO items (id, code) VALUES (1, 1)")
+        wrapper.execute("INSERT INTO items (id, code) VALUES (2, 2)")
+        initial_log_count = len(wrapper.get_log())
+
+        wrapper.execute("BEGIN")
+        wrapper.execute("INSERT INTO items (id, code) VALUES (3, 3)")
+        with pytest.raises(sqlite3.IntegrityError):
+            wrapper.execute("UPDATE OR ROLLBACK items SET code = 99")
+
+        assert wrapper._conn.in_transaction is False
+        assert wrapper._in_transaction is False
+        assert wrapper._buffer == []
+        assert wrapper.execute(
+            "SELECT id, code FROM items ORDER BY id"
+        ).fetchall() == [(1, 1), (2, 2)]
+        assert len(wrapper.get_log()) == initial_log_count
+
+        wrapper.execute("INSERT INTO items (id, code) VALUES (4, 4)")
+        assert len(wrapper.get_log()) == initial_log_count + 1
     finally:
         wrapper.close()
