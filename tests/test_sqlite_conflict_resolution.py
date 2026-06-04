@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sqlite_conflict_resolution import (  # noqa: E402
     SQLiteConflictResolution,
+    neutralize_rollback_conflict_resolution,
     normalize_sql_for_sqlglot,
     restore_update_conflict_resolution,
     strict_conflict_resolution_rewrite,
@@ -65,6 +66,35 @@ def test_normalize_rewrites_replace_into_as_insert_or_replace():
         "REPLACE",
     )
     assert compatible.stripped_upsert is False
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        (
+            "INSERT OR ROLLBACK INTO users(id) VALUES (1)",
+            "INSERT INTO users(id) VALUES (1)",
+        ),
+        (
+            "UPDATE OR ROLLBACK users SET email = 'a' WHERE id = 1",
+            "UPDATE users SET email = 'a' WHERE id = 1",
+        ),
+        (
+            "WITH target(id) AS (SELECT 1) "
+            "UPDATE OR ROLLBACK users SET email = 'a' "
+            "WHERE id IN (SELECT id FROM target)",
+            "WITH target(id) AS (SELECT 1) "
+            "UPDATE users SET email = 'a' "
+            "WHERE id IN (SELECT id FROM target)",
+        ),
+        (
+            "INSERT OR ABORT INTO users(id) VALUES (1)",
+            "INSERT OR ABORT INTO users(id) VALUES (1)",
+        ),
+    ],
+)
+def test_neutralize_rollback_conflict_resolution(sql, expected):
+    assert neutralize_rollback_conflict_resolution(sql) == expected
 
 
 @pytest.mark.parametrize(
@@ -238,4 +268,3 @@ def test_restore_update_conflict_resolution_ignores_insert_resolution():
         )
         == "INSERT OR REPLACE INTO users(id) VALUES (1)"
     )
-

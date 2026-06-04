@@ -8,6 +8,7 @@ from itertools import groupby
 from pathlib import Path
 
 from sqlglot.errors import ParseError
+from sqlite_conflict_resolution import neutralize_rollback_conflict_resolution
 
 from .cascade_metadata import (
     group_foreign_key_edges_by_table,
@@ -73,12 +74,13 @@ def make_logged_statement(
     accepted_replay_warnings: Sequence[str] | frozenset[str] = (),
     metadata_context: ConflictCheckContext | None = None,
 ) -> LoggedStatement:
+    replay_sql_text = neutralize_rollback_conflict_resolution(sql_text)
     try:
         metadata = (
-            parse_statement_metadata_for_context(sql_text, metadata_context)
+            parse_statement_metadata_for_context(replay_sql_text, metadata_context)
             if metadata_context is not None
             else _parse_statement_metadata(
-                sql_text,
+                replay_sql_text,
                 table_columns=table_columns,
                 metadata_context=None,
             )
@@ -97,7 +99,7 @@ def make_logged_statement(
         transaction_id=transaction_id,
         committed_at=committed_at,
         original_sql_text=original_sql_text or sql_text,
-        to_replay_sql_text=sql_text,
+        to_replay_sql_text=replay_sql_text,
         is_replay_safe=is_replay_safe,
         replay_block_reason=replay_block_reason,
         metadata=metadata,

@@ -29,6 +29,14 @@ UPDATE_OR_PATTERN = re.compile(
     rf"(UPDATE)\s+OR\s+({CONFLICT_ALGORITHMS})\s+",
     flags=re.IGNORECASE,
 )
+INSERT_OR_ROLLBACK_PATTERN = re.compile(
+    r"(INSERT)\s+OR\s+(ROLLBACK)\s+",
+    flags=re.IGNORECASE,
+)
+UPDATE_OR_ROLLBACK_PATTERN = re.compile(
+    r"(UPDATE)\s+OR\s+(ROLLBACK)\s+",
+    flags=re.IGNORECASE,
+)
 REVIEWABLE_INSERT_OR_PATTERN = re.compile(
     rf"(INSERT)\s+OR\s+({REVIEWABLE_ALGORITHMS})\s+",
     flags=re.IGNORECASE,
@@ -111,6 +119,23 @@ def parse_compatible_sql(sql: str) -> str:
     """Return SQL normalized enough for sqlglot to parse SQLite conflict syntax."""
 
     return normalize_sql_for_sqlglot(sql).sql
+
+
+def neutralize_rollback_conflict_resolution(sql: str) -> str:
+    """Remove top-level OR ROLLBACK from SQL used for merge replay.
+
+    Merge checking uses savepoints to undo temporary replay. If SQLite's
+    ROLLBACK conflict algorithm fires inside such a replay, SQLite removes the
+    savepoint boundary itself. Ordinary INSERT/UPDATE still raises the same
+    integrity error, but leaves cleanup under the merge checker.
+    """
+
+    rewritten, _ = _remove_top_level_or_clause(sql, INSERT_OR_ROLLBACK_PATTERN)
+    rewritten, _ = _remove_top_level_or_clause(
+        rewritten,
+        UPDATE_OR_ROLLBACK_PATTERN,
+    )
+    return rewritten
 
 
 def strict_conflict_resolution_rewrite(sql: str) -> StrictReplayRewrite | None:

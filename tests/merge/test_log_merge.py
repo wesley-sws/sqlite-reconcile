@@ -1416,6 +1416,53 @@ def test_apply_accepted_transaction_rolls_back_failed_transaction_group(tmp_path
     assert logs == []
 
 
+def test_apply_accepted_transaction_neutralizes_or_rollback_for_replay(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)")
+        con.execute("INSERT INTO items (id, code) VALUES (1, 1)")
+        con.execute("INSERT INTO items (id, code) VALUES (2, 2)")
+        create_log_tables(con)
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(db_path)
+    )
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=2,
+        committed_at="2026-01-02T00:00:00",
+        sql_text="UPDATE OR ROLLBACK items SET code = 99",
+        table_columns=table_columns,
+    )
+    transaction = txs([statement])[0]
+
+    assert statement.original_sql_text == "UPDATE OR ROLLBACK items SET code = 99"
+    assert statement.sql_text == "UPDATE items SET code = 99"
+
+    with control_db._open_merge_working_context(
+        db_path,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
+    ) as context:
+        error = accepted_replay.apply_accepted_transaction(context, transaction)
+        rows = [
+            tuple(row)
+            for row in context.base_cursor.connection.execute(
+                "SELECT id, code FROM items ORDER BY id"
+            ).fetchall()
+        ]
+        logs = context.base_cursor.connection.execute(
+            f"SELECT * FROM {log_merge.LOG_TABLE}"
+        ).fetchall()
+
+    assert error is not None
+    assert error.kind == "integrity"
+    assert "UNIQUE constraint failed" in error.message
+    assert rows == [(1, 1), (2, 2)]
+    assert logs == []
+
+
 def test_apply_accepted_transaction_reports_deferred_foreign_key_failure(tmp_path):
     db_path = tmp_path / "base.db"
     with closing(sqlite3.connect(db_path)) as con:

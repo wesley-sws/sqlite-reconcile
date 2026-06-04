@@ -1575,6 +1575,30 @@ def test_control_rewrite_restores_update_or_clause_from_statement_metadata():
     )
 
 
+def test_control_rewrite_neutralizes_update_or_rollback_from_statement_metadata():
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="UPDATE OR ROLLBACK users SET name = 'x' WHERE id = 1",
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+    rewritten = control_db._rewrite_sql_for_control_db(
+        statement,
+        table_columns={
+            "users": {"id", "name"},
+        },
+    )
+
+    assert statement.sql_text == "UPDATE users SET name = 'x' WHERE id = 1"
+    assert rewritten == (
+        "UPDATE control.users AS users SET name = 'x' WHERE id = 1"
+    )
+
+
 def test_control_rewrite_rewrites_replace_into_from_statement_metadata():
     statement = log_merge.make_logged_statement(
         branch="ours",
