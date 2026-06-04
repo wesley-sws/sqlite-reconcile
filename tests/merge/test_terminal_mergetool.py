@@ -390,6 +390,95 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
     ]
 
 
+def test_prompt_standalone_transaction_resolution_can_delete_whole_transaction(
+    monkeypatch,
+):
+    statement = log_merge.make_logged_statement(
+        branch="theirs",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT INTO coupons (id, code) VALUES (1, 'DUP')",
+    )
+    conflict = ConflictPair(
+        current_branch="theirs",
+        other_index=None,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            StatementConflict(
+                kind="integrity",
+                message="UNIQUE constraint failed: coupons.code",
+                scope="theirs",
+            ),
+        ),
+        is_standalone=True,
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "delete R1;")
+
+    with closing(replay_conn()) as con:
+        replacement = terminal_ui._prompt_standalone_transaction_resolution(
+            conflict,
+            "theirs",
+            txs([statement])[0],
+            {},
+            con,
+        )
+
+    assert replacement == []
+
+
+def test_prompt_pair_transaction_resolution_can_delete_whole_transaction(
+    monkeypatch,
+):
+    ours = txs([
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE users SET name = 'Alice Local' WHERE id = 1",
+        )
+    ])
+    theirs = txs([
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE users SET name = 'Alice Remote' WHERE id = 1",
+        )
+    ])
+    conflict = ConflictPair(
+        current_branch="ours",
+        other_index=0,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            StatementConflict(
+                kind="write_write",
+                message="L1.1 and R1.1 update/delete overlapping rows",
+            ),
+        ),
+    )
+    monkeypatch.setattr("builtins.input", lambda _: "delete L1;")
+
+    with closing(replay_conn()) as con:
+        resolution = terminal_ui._prompt_pair_transaction_resolution(
+            conflict,
+            ours,
+            theirs,
+            {"users": {"id", "name"}},
+            con,
+        )
+
+    assert resolution.action == "replace"
+    assert resolution.ours is None
+    assert resolution.theirs == theirs[0]
+    assert resolution.changed_ours is True
+    assert resolution.changed_theirs is False
+
+
 def test_transaction_scoped_statement_labels_for_ui(capsys):
     transaction = replace(
         txs([

@@ -105,16 +105,6 @@ def _standalone_conflict_message(conflict: ConflictPair, scope: BranchName) -> s
     )
 
 
-def _edit_label_hint(
-    lookup: dict[str, tuple[str, LoggedTransaction, LoggedStatement]],
-) -> str:
-    """Return a compact hint for the labels that can be edited."""
-
-    if not lookup:
-        return "none"
-    return ", ".join(lookup)
-
-
 def _replace_statement_sql(
     statement: LoggedStatement,
     sql_text: str,
@@ -362,15 +352,20 @@ def _print_transaction_edit_result(
 
 def _print_transaction_edit_help(
     labels: Sequence[str],
+    transaction_labels: Sequence[str] = (),
 ) -> None:
     """Show transaction edit commands for the currently visible labels."""
 
-    edit_hint = " or ".join(f"'edit {label};'" for label in labels)
-    print(
-        f"Use {edit_hint}, 'delete {labels[0]};', "
-        f"'insert before {labels[0]};', or 'insert after {labels[0]};' "
-        "to edit first."
-    )
+    examples = [
+        f"edit {labels[0]};",
+        f"delete {labels[0]};",
+        f"insert after {labels[0]};",
+    ]
+    if transaction_labels:
+        examples.insert(2, f"delete {transaction_labels[0]};")
+    print("Commands: edit <statement>; delete <statement>; delete <transaction>;")
+    print("          insert before <statement>; insert after <statement>;")
+    print(f"Examples: {', '.join(examples)}")
 
 
 def _handle_transaction_edit_command(
@@ -384,7 +379,6 @@ def _handle_transaction_edit_command(
 
     lookup = _statement_lookup(transactions_by_label)
     first_label = next(iter(lookup), None)
-    label_hint = _edit_label_hint(lookup)
 
     delete_label = _parse_delete_command(raw)
     if delete_label is not None:
@@ -394,9 +388,19 @@ def _handle_transaction_edit_command(
         if not delete_label:
             print(f"Choose a statement to delete, e.g. 'delete {first_label}'.")
             return "handled"
+        if delete_label in transactions_by_label:
+            transaction = transactions_by_label[delete_label]
+            updated = _transaction_with_statements(transaction, ())
+            transactions_by_label[delete_label] = updated
+            print(f"{delete_label} transaction deleted.")
+            _print_transaction_edit_result(delete_label, updated)
+            return "changed"
         found = lookup.get(delete_label)
         if found is None:
-            print(f"Unknown label {delete_label}. Valid labels: {label_hint}")
+            print(
+                f"Unknown label {delete_label}. "
+                "Use a shown statement or transaction label."
+            )
             return "handled"
         transaction_label_text, transaction, statement = found
         updated = _replace_transaction_statement(transaction, statement, None)
@@ -413,7 +417,10 @@ def _handle_transaction_edit_command(
         position, anchor_label = insert_command
         found = lookup.get(anchor_label)
         if found is None:
-            print(f"Unknown label {anchor_label}. Valid labels: {label_hint}")
+            print(
+                f"Unknown label {anchor_label}. "
+                "Use a shown statement label."
+            )
             return "handled"
         transaction_label_text, transaction, anchor = found
         edited_sql = _edit_sql_in_editor(f"insert {position} {anchor_label}", "")
@@ -448,7 +455,10 @@ def _handle_transaction_edit_command(
             return "handled"
         found = lookup.get(edit_label)
         if found is None:
-            print(f"Unknown label {edit_label}. Valid labels: {label_hint}")
+            print(
+                f"Unknown label {edit_label}. "
+                "Use a shown statement label."
+            )
             return "handled"
         transaction_label_text, transaction, statement = found
         edited_sql = _edit_sql_in_editor(edit_label, statement.sql_text)
@@ -527,7 +537,10 @@ def _prompt_pair_transaction_resolution(
             print("Press Enter to accept this reviewable conflict and keep checking.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
-        _print_transaction_edit_help(editable_labels)
+        _print_transaction_edit_help(
+            editable_labels,
+            transaction_labels=list(resolved_labels),
+        )
         raw = input("Resolution: ").strip()
 
         if not raw:
@@ -622,7 +635,10 @@ def _prompt_standalone_transaction_resolution(
             print("Press Enter to run the shown transaction, or edit/delete it.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
-        _print_transaction_edit_help(editable_labels)
+        _print_transaction_edit_help(
+            editable_labels,
+            transaction_labels=list(resolved_transaction),
+        )
         raw = input("Resolution: ").strip()
 
         if not raw:
