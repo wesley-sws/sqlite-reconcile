@@ -45,6 +45,7 @@ from .utils import quote_identifier, rollback_savepoint
 MetadataIndexes = dict[BranchName, RemainingMetadataIndex]
 PairSideOutcome = Literal["unchanged", "edited", "deleted"]
 StandaloneReplayOutcome = Literal["current_removed", "current_changed"]
+SUPPORTED_DATABASE_SUFFIXES = {".db", ".sqlite"}
 
 
 @dataclass(frozen=True)
@@ -706,10 +707,72 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(args.paths) in {3, 4}:
         base, ours, theirs = args.paths[:3]
         merged = args.paths[3] if len(args.paths) == 4 else ours
+        if Path(merged).suffix.lower() not in SUPPORTED_DATABASE_SUFFIXES:
+            suffixes = ", ".join(sorted(SUPPORTED_DATABASE_SUFFIXES))
+            print(
+                "sqlite-reconcile only supports SQLite database files "
+                f"({suffixes}): {merged}"
+            )
+            return 1
+
+        sqlite_error = _sqlite_database_preflight(base, ours, theirs)
+        if sqlite_error is not None:
+            print(sqlite_error)
+            return 1
+
         return resolve_direct_merge(base, ours, theirs, merged)
 
     parser.error("expected BASE LOCAL REMOTE [MERGED]")
     return 2
+
+
+def _sqlite_database_preflight(
+    base_db_path: str | Path,
+    ours_db_path: str | Path,
+    theirs_db_path: str | Path,
+) -> MergeNotApplicableError | None:
+    """Return an early error if any Git input is not a readable SQLite DB."""
+
+    for role, db_path in (
+        ("base", base_db_path),
+        ("ours", ours_db_path),
+        ("theirs", theirs_db_path),
+    ):
+        error = _sqlite_database_error(db_path, role)
+        if error is not None:
+            return error
+    return None
+
+
+def _sqlite_database_error(
+    db_path: str | Path,
+    role: str,
+) -> MergeNotApplicableError | None:
+    """Return why one path cannot be opened as SQLite, if applicable."""
+
+    path = Path(db_path)
+    if not path.is_file():
+        return MergeNotApplicableError(path, role, reason="does not exist")
+
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as con:
+            con.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.DatabaseError as exc:
+        return MergeNotApplicableError(
+            path,
+            role,
+            reason="is not a readable SQLite database",
+            details=(str(exc),),
+        )
+    except OSError as exc:
+        return MergeNotApplicableError(
+            path,
+            role,
+            reason="could not be read",
+            details=(str(exc),),
+        )
+    return None
 
 
 if __name__ == "__main__":

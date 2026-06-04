@@ -500,7 +500,6 @@ def _prompt_pair_transaction_resolution(
             theirs_transaction.statements,
         ),
     }
-    changed = False
 
     print()
     print(
@@ -524,9 +523,7 @@ def _prompt_pair_transaction_resolution(
                 changed_theirs=True,
             )
 
-        if changed:
-            print("Press Enter to revalidate the shown transactions.")
-        elif allow_accept:
+        if allow_accept:
             print("Press Enter to accept this reviewable conflict and keep checking.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
@@ -534,21 +531,11 @@ def _prompt_pair_transaction_resolution(
         raw = input("Resolution: ").strip()
 
         if not raw:
-            if allow_accept and not changed:
+            if allow_accept:
                 return PairTransactionResolution(
                     action="accept",
                     ours=ours_transaction,
                     theirs=theirs_transaction,
-                )
-            if changed:
-                ours_updated = resolved_labels[ours_label]
-                theirs_updated = resolved_labels[theirs_label]
-                return PairTransactionResolution(
-                    action="replace",
-                    ours=ours_updated if ours_updated.statements else None,
-                    theirs=theirs_updated if theirs_updated.statements else None,
-                    changed_ours=ours_updated != ours_transaction,
-                    changed_theirs=theirs_updated != theirs_transaction,
                 )
             print("No change made yet.")
             continue
@@ -569,11 +556,36 @@ def _prompt_pair_transaction_resolution(
             metadata_context,
         )
         if edit_result == "changed":
-            changed = True
-            continue
+            return _pair_resolution_from_labels(
+                resolved_labels,
+                ours_label,
+                theirs_label,
+                ours_transaction,
+                theirs_transaction,
+            )
         if edit_result == "handled":
             continue
         print(f"Unknown action. Use 'edit {editable_labels[0]};', DELETE, or ;.")
+
+
+def _pair_resolution_from_labels(
+    resolved_labels: dict[str, LoggedTransaction],
+    ours_label: str,
+    theirs_label: str,
+    ours_transaction: LoggedTransaction,
+    theirs_transaction: LoggedTransaction,
+) -> PairTransactionResolution:
+    """Return edited pair transactions for immediate revalidation."""
+
+    ours_updated = resolved_labels[ours_label]
+    theirs_updated = resolved_labels[theirs_label]
+    return PairTransactionResolution(
+        action="replace",
+        ours=ours_updated if ours_updated.statements else None,
+        theirs=theirs_updated if theirs_updated.statements else None,
+        changed_ours=ours_updated != ours_transaction,
+        changed_theirs=theirs_updated != theirs_transaction,
+    )
 
 
 def _prompt_standalone_transaction_resolution(
@@ -593,7 +605,6 @@ def _prompt_standalone_transaction_resolution(
     resolved_transaction = {
         label: _transaction_with_statements(transaction, transaction.statements),
     }
-    changed = False
     message = _standalone_conflict_message(conflict, scope)
     print()
     print(heading or f"A standalone replay problem came up while applying {label}:")
@@ -607,9 +618,7 @@ def _prompt_standalone_transaction_resolution(
             print(f"{label}: all statements deleted; this transaction will be skipped.")
             return []
 
-        if changed:
-            print("Press Enter to retry the shown transaction, or ';' to skip it.")
-        elif allow_accept:
+        if allow_accept:
             print("Press Enter to run the shown transaction, or edit/delete it.")
         else:
             print("Edit or delete at least one shown statement before retrying.")
@@ -617,7 +626,7 @@ def _prompt_standalone_transaction_resolution(
         raw = input("Resolution: ").strip()
 
         if not raw:
-            if changed or allow_accept:
+            if allow_accept:
                 return list(current_transaction.statements)
             print("No change made yet.")
             continue
@@ -632,8 +641,7 @@ def _prompt_standalone_transaction_resolution(
             metadata_context,
         )
         if edit_result == "changed":
-            changed = True
-            continue
+            return list(resolved_transaction[label].statements)
         if edit_result == "handled":
             continue
         print(f"Unknown action. Use 'edit {editable_labels[0]};', DELETE, or ;.")

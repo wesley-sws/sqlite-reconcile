@@ -68,6 +68,60 @@ def replay_conn():
     return con
 
 
+def test_main_rejects_non_database_target(monkeypatch, capsys):
+    def fail_load_merge_inputs(*args):
+        raise AssertionError("non-database targets should fail before loading logs")
+
+    monkeypatch.setattr(
+        terminal_mergetool,
+        "load_merge_inputs",
+        fail_load_merge_inputs,
+    )
+
+    result = terminal_mergetool.main(
+        [
+            "base.txt",
+            "ours.txt",
+            "theirs.txt",
+            "merged.txt",
+        ]
+    )
+
+    assert result == 1
+    assert "only supports SQLite database files" in capsys.readouterr().out
+
+
+def test_main_rejects_non_sqlite_database(monkeypatch, tmp_path, capsys):
+    def fail_load_merge_inputs(*args):
+        raise AssertionError("non-SQLite inputs should fail before loading logs")
+
+    monkeypatch.setattr(
+        terminal_mergetool,
+        "load_merge_inputs",
+        fail_load_merge_inputs,
+    )
+    base = tmp_path / "base.db"
+    ours = tmp_path / "ours.db"
+    theirs = tmp_path / "theirs.db"
+    merged = tmp_path / "merged.db"
+    for path in (base, ours, theirs, merged):
+        path.write_text("not an sqlite database")
+
+    result = terminal_mergetool.main(
+        [
+            str(base),
+            str(ours),
+            str(theirs),
+            str(merged),
+        ]
+    )
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert "base database is not applicable" in output
+    assert "is not a readable SQLite database" in output
+
+
 def test_configured_editor_uses_git_like_precedence(monkeypatch):
     monkeypatch.delenv("GIT_EDITOR", raising=False)
     monkeypatch.delenv("VISUAL", raising=False)
@@ -120,7 +174,7 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
         ),
         is_standalone=True,
     )
-    responses = iter(["edit L1.1;", ""])
+    responses = iter(["edit L1.1;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -144,7 +198,7 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
     )
 
 
-def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
+def test_prompt_standalone_warning_returns_immediately_after_edit(monkeypatch):
     table_columns = {"audit_events": {"id", "token"}}
     statement = log_merge.make_logged_statement(
         branch="ours",
@@ -171,7 +225,7 @@ def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
         ),
         is_standalone=True,
     )
-    responses = iter(["edit L1.1;", "DELETE"])
+    responses = iter(["edit L1.1;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -189,7 +243,10 @@ def test_prompt_standalone_warning_can_delete_after_edit(monkeypatch):
             allow_accept=True,
         )
 
-    assert replacement is None
+    assert replacement is not None
+    assert replacement[0].sql_text == (
+        "UPDATE audit_events SET token = 'fixed' WHERE id BETWEEN 4 AND 8"
+    )
 
 
 def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatch):
@@ -201,7 +258,7 @@ def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatc
         sql_text="UPDATE audit_events SET token = 'fixed' WHERE id = 1",
         table_columns={"audit_events": {"id", "token"}},
     )
-    responses = iter(["edit L1.1;", ""])
+    responses = iter(["edit L1.1;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -314,7 +371,7 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
         "_edit_sql_in_editor",
         lambda label, sql: "INSERT INTO coupons (id, code) VALUES (2, 'FIXED')",
     )
-    responses = iter(["edit R1.2;", ""])
+    responses = iter(["edit R1.2;"])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     with closing(replay_conn()) as con:

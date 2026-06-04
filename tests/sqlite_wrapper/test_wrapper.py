@@ -1,18 +1,24 @@
-import importlib.util
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
 
+SRC_PATH = Path(__file__).resolve().parents[2] / "src"
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
+import sqlite_wrapper  # noqa: E402
+import sqlite_wrapper.wrapper as sqlite_wrapper_module  # noqa: E402
+
 
 @pytest.fixture(scope="module")
 def wrapper_module():
-    wrapper_path = Path(__file__).resolve().parents[2] / "src" / "sqlite-wrapper" / "wrapper.py"
-    spec = importlib.util.spec_from_file_location("sqlite_wrapper_module", wrapper_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return sqlite_wrapper_module
+
+
+def test_import_friendly_wrapper_package():
+    assert sqlite_wrapper.SQLiteWrapper.__name__ == "SQLiteWrapper"
 
 
 def create_user_db(db_path: Path):
