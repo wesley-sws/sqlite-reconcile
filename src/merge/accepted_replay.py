@@ -28,6 +28,32 @@ from .sql_metadata import parse_statement_metadata_for_context
 from .utils import quote_identifier, rollback_savepoint
 
 
+def conflict_resolution_branch_warning(
+    context: ConflictCheckContext,
+    statement: LoggedStatement,
+) -> str | None:
+    """Return a warning when conflict-resolution syntax is already active."""
+
+    strict_statement = _strict_conflict_resolution_statement(context, statement)
+    if strict_statement is None:
+        return None
+
+    statement_without_resolution, label = strict_statement
+    failure = _savepoint_statement_failure(
+        context,
+        statement_without_resolution,
+        use_control=False,
+        scope=statement.branch,
+        order_label=f"strict {statement_label(statement)}",
+    )
+    if failure is None or failure.kind != "integrity":
+        return None
+    return _conflict_resolution_already_active_warning(
+        label,
+        failure.message,
+    )
+
+
 def apply_accepted_transaction(
     context: ConflictCheckContext,
     transaction: LoggedTransaction,
@@ -185,61 +211,102 @@ def _strict_constraint_resolution_failure(
 ) -> SQLiteReplayFailure | None:
     """Return the strict replay failure, if reviewable syntax was needed."""
 
-    if not statement.metadata.has_reviewable_constraint_resolution:
-        return None
-
     strict_statement = _strict_conflict_resolution_statement(context, statement)
     if strict_statement is None:
         return None
 
-    return _savepoint_control_statement_failure(
+    statement_without_resolution, _ = strict_statement
+    before_failure = _savepoint_statement_failure(
         context,
-        strict_statement,
+        statement_without_resolution,
+        use_control=False,
+        scope="pair",
+        order_label=f"strict {statement_label(statement)} before current",
+    )
+    after_failure = _savepoint_statement_failure(
+        context,
+        statement_without_resolution,
+        use_control=True,
+        scope="pair",
         order_label=(
             f"{transaction_label(current_transaction)} then strict "
             f"{statement_label(statement)}"
         ),
     )
+    if after_failure is None:
+        return None
+
+    # If strict replay already fails on the comparison state without the current
+    # transaction, the OR/REPLACE behavior was active before this pair. Reporting
+    # it here would blame an unrelated opposite-branch transaction.
+    if before_failure is not None and before_failure.kind == "integrity":
+        return None
+    return after_failure
 
 
 def _strict_conflict_resolution_statement(
     context: ConflictCheckContext,
     statement: LoggedStatement,
-) -> LoggedStatement | None:
-    """Return a statement copy with reviewable conflict syntax stripped."""
+) -> tuple[LoggedStatement, str] | None:
+    """Return stricter SQL for reviewable conflict-resolution syntax."""
+
+    if not statement.metadata.has_reviewable_constraint_resolution:
+        return None
 
     rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
     if rewrite is None:
         return None
 
-    return replace(
-        statement,
-        to_replay_sql_text=rewrite.sql,
-        metadata=parse_statement_metadata_for_context(rewrite.sql, context),
-        replay_warnings=(
-            *statement.replay_warnings,
-            f"strict replay removed {rewrite.label}",
+    return (
+        replace(
+            statement,
+            to_replay_sql_text=rewrite.sql,
+            metadata=parse_statement_metadata_for_context(rewrite.sql, context),
+            replay_warnings=(
+                *statement.replay_warnings,
+                f"strict replay removed {rewrite.label}",
+            ),
         ),
+        rewrite.label,
     )
 
 
-def _savepoint_control_statement_failure(
+def _conflict_resolution_already_active_warning(
+    label: str,
+    message: str,
+) -> str:
+    """Return the user-facing branch-local strict replay warning."""
+
+    return (
+        "SQLite conflict-resolution syntax is already active here; "
+        f"strict replay without {label} fails: {message}"
+    )
+
+
+def _savepoint_statement_failure(
     context: ConflictCheckContext,
     statement: LoggedStatement,
     *,
+    use_control: bool,
+    scope: ConflictScope,
     order_label: str,
 ) -> SQLiteReplayFailure | None:
-    """Replay one control statement in a nested savepoint and discard effects."""
+    """Replay one strict statement in a nested savepoint and discard effects."""
 
     savepoint = quote_identifier(
         f"sqlite_merge_remaining_stmt_probe_{uuid.uuid4().hex}"
     )
     context.base_cursor.execute(f"SAVEPOINT {savepoint}")
     try:
-        return _execute_statement_on_control(
+        execute = (
+            _execute_statement_on_control
+            if use_control
+            else _execute_statement_on_main
+        )
+        return execute(
             context,
             statement,
-            scope="pair",
+            scope=scope,
             order_label=order_label,
         )
     finally:

@@ -993,6 +993,47 @@ def test_branch_replay_safety_warns_for_update_from_duplicates(
     assert responses == []
 
 
+def test_branch_replay_safety_warns_when_or_ignore_already_active(
+    tmp_path,
+    monkeypatch,
+):
+    base = tmp_path / "base.db"
+    with closing(sqlite3.connect(base)) as con:
+        con.execute("CREATE TABLE coupons (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        con.execute("INSERT INTO coupons VALUES (1, 'shared')")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(base)
+    )
+    statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=0,
+        transaction_id=1,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT OR IGNORE INTO coupons (id, code) VALUES (2, 'shared')",
+        table_columns=table_columns,
+    )
+    responses = [""]
+    monkeypatch.setattr("builtins.input", lambda _: responses.pop(0))
+
+    resolved = terminal_mergetool._resolve_branch_replay_safety(
+        base,
+        "ours",
+        txs([statement]),
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
+    )
+
+    resolved_statements = flatten_transactions(resolved)
+    assert len(resolved_statements) == 1
+    accepted_warnings = resolved_statements[0].accepted_replay_warnings
+    assert len(accepted_warnings) == 1
+    warning = next(iter(accepted_warnings))
+    assert "SQLite conflict-resolution syntax is already active here" in warning
+    assert "strict replay without INSERT OR IGNORE fails" in warning
+    assert responses == []
+
+
 def test_branch_replay_safety_update_from_warning_uses_transaction_prefix(
     tmp_path,
     monkeypatch,

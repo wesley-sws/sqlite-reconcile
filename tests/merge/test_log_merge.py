@@ -1183,6 +1183,78 @@ def test_remaining_conflict_reports_constraint_resolution_during_integrity_scan(
     assert conflict.conflicts[0].kind == "constraint_resolution"
 
 
+def test_remaining_conflict_suppresses_already_active_constraint_resolution(
+    tmp_path,
+):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("CREATE TABLE coupons (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        con.execute("INSERT INTO coupons VALUES (1, 'shared')")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(db_path)
+    )
+    current = txs([
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="INSERT INTO coupons (id, code) VALUES (2, 'local')",
+            table_columns=table_columns,
+        )
+    ])[0]
+    remaining_statement = log_merge.make_logged_statement(
+        branch="theirs",
+        branch_index=0,
+        transaction_id=2,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="INSERT OR IGNORE INTO coupons (id, code) VALUES (3, 'shared')",
+        table_columns=table_columns,
+    )
+
+    with control_db._open_merge_working_context(
+        db_path,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
+    ) as context:
+        warning = accepted_replay.conflict_resolution_branch_warning(
+            context,
+            remaining_statement,
+        )
+        assert warning is not None
+        remaining = txs([
+            log_merge.make_logged_statement(
+                branch="theirs",
+                branch_index=0,
+                transaction_id=2,
+                committed_at="2026-01-01T00:00:00",
+                sql_text=remaining_statement.sql_text,
+                table_columns=table_columns,
+                accepted_replay_warnings=(warning,),
+            )
+        ])
+        index = remaining_metadata.RemainingMetadataIndex.from_transactions(
+            context,
+            remaining,
+        )
+
+        assert remaining_metadata.remaining_individual_check_kinds(
+            context,
+            current,
+            index,
+        ) == {"integrity"}
+        conflict = log_merge._remaining_conflict_for_current(
+            current,
+            remaining,
+            current_branch="ours",
+            context=context,
+            remaining_other_index=index,
+        )
+
+    assert conflict is None
+
+
 def test_apply_accepted_transaction_advances_live_context(tmp_path):
     db_path = tmp_path / "base.db"
     init_logged_db(db_path)

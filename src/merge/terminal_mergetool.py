@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .accepted_replay import apply_accepted_transaction
+from .accepted_replay import (
+    apply_accepted_transaction,
+    conflict_resolution_branch_warning,
+)
 from .conflict_detection import ConflictResolutionKey
 from .control_db import _load_working_base_copy, _open_merge_working_context
 from .execution_based_analysis import update_from_has_duplicate_target_rows
@@ -122,6 +125,21 @@ def _branch_transaction_replay_issue(
                     transaction.branch,
                     statement,
                     UPDATE_FROM_DUPLICATE_TARGET_WARNING,
+                )
+            conflict_resolution_warning = conflict_resolution_branch_warning(
+                update_from_context,
+                statement,
+            )
+            if (
+                conflict_resolution_warning is not None
+                and conflict_resolution_warning
+                not in statement.accepted_replay_warnings
+            ):
+                rollback_savepoint(con.cursor(), savepoint)
+                return _branch_replay_warning_issue(
+                    transaction.branch,
+                    statement,
+                    conflict_resolution_warning,
                 )
             con.execute(statement.sql_text)
         errors = validate_database(con)
