@@ -3,11 +3,10 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 from sqlglot import expressions as exp
-from sqlite_conflict_resolution import strict_conflict_resolution_rewrite
 
 from .models import (
     ConflictCheckContext,
@@ -19,7 +18,10 @@ from .models import (
     statement_label,
     transaction_label,
 )
-from .sql_metadata import StatementMetadata, parse_statement_metadata
+from .sql_metadata import (
+    StatementMetadata,
+    required_updated_table,
+)
 from .utils import (
     is_update_statement,
     primary_key_columns as schema_primary_key_columns,
@@ -58,26 +60,6 @@ class SQLiteReplayFailure:
     message: str
     order_label: str
     statement: LoggedStatement | None = None
-
-
-def _strict_conflict_resolution_statement(
-    statement: LoggedStatement,
-) -> LoggedStatement | None:
-    """Return a statement copy with reviewable conflict syntax stripped."""
-
-    rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
-    if rewrite is None:
-        return None
-
-    return replace(
-        statement,
-        to_replay_sql_text=rewrite.sql,
-        metadata=parse_statement_metadata(rewrite.sql),
-        replay_warnings=(
-            *statement.replay_warnings,
-            f"strict replay removed {rewrite.label}",
-        ),
-    )
 
 
 def _constraint_resolution_conflict(
@@ -161,10 +143,11 @@ def _target_row_select(
     if not isinstance(expression, (exp.Update, exp.Delete)):
         return None
 
-    table = metadata.table_updated
-    pk_columns = _primary_key_columns(context, table)
+    table = required_updated_table(metadata)
     target_table = table_expression(expression.this)
-    if table is None or not pk_columns or target_table is None:
+    assert target_table is not None
+    pk_columns = _primary_key_columns(context, table)
+    if not pk_columns:
         return None
 
     with_expression = expression.args.get("with")
@@ -204,12 +187,9 @@ def _target_row_select(
 
 def _primary_key_columns(
     context: ConflictCheckContext,
-    table: str | None,
+    table: str,
 ) -> tuple[str, ...]:
     """Return cached primary-key columns, falling back to schema lookup."""
-
-    if table is None:
-        return ()
 
     columns = context.primary_key_columns.get(table)
     if columns is not None:
@@ -462,7 +442,8 @@ def _probe_has_duplicate_target_rows(
 ) -> bool:
     """Return whether probe returns duplicate target PK rows."""
 
-    pk_count = len(_primary_key_columns(context, metadata.table_updated))
+    table = required_updated_table(metadata)
+    pk_count = len(_primary_key_columns(context, table))
     if pk_count == 0:
         return True
 

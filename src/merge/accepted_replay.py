@@ -5,13 +5,14 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import replace
 
+from sqlite_conflict_resolution import strict_conflict_resolution_rewrite
+
 from .control_db import clean_control_schema_references
 from .execution_based_analysis import (
     SQLiteReplayFailure,
     _constraint_resolution_conflict,
     _foreign_key_check_error,
     _sqlite_error_conflict_kind,
-    _strict_conflict_resolution_statement,
 )
 from .models import (
     ConflictCheckContext,
@@ -23,6 +24,7 @@ from .models import (
     transaction_label,
     statement_label,
 )
+from .sql_metadata import parse_statement_metadata_for_context
 from .utils import quote_identifier, rollback_savepoint
 
 
@@ -186,7 +188,7 @@ def _strict_constraint_resolution_failure(
     if not statement.metadata.has_reviewable_constraint_resolution:
         return None
 
-    strict_statement = _strict_conflict_resolution_statement(statement)
+    strict_statement = _strict_conflict_resolution_statement(context, statement)
     if strict_statement is None:
         return None
 
@@ -196,6 +198,27 @@ def _strict_constraint_resolution_failure(
         order_label=(
             f"{transaction_label(current_transaction)} then strict "
             f"{statement_label(statement)}"
+        ),
+    )
+
+
+def _strict_conflict_resolution_statement(
+    context: ConflictCheckContext,
+    statement: LoggedStatement,
+) -> LoggedStatement | None:
+    """Return a statement copy with reviewable conflict syntax stripped."""
+
+    rewrite = strict_conflict_resolution_rewrite(statement.sql_text)
+    if rewrite is None:
+        return None
+
+    return replace(
+        statement,
+        to_replay_sql_text=rewrite.sql,
+        metadata=parse_statement_metadata_for_context(rewrite.sql, context),
+        replay_warnings=(
+            *statement.replay_warnings,
+            f"strict replay removed {rewrite.label}",
         ),
     )
 

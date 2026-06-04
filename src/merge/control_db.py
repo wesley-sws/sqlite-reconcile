@@ -12,7 +12,7 @@ from sqlglot.errors import ParseError
 
 from sqlite_conflict_resolution import restore_update_conflict_resolution
 
-from .models import ConflictCheckContext, LoggedStatement
+from .models import ConflictCheckContext, LoggedStatement, SchemaCache
 from .sql_ast import (
     child_expressions,
     cte_aliases,
@@ -275,23 +275,19 @@ def _qualify_table_reference(table: exp.Table, schema: str) -> None:
 
 def _merge_context(
     working_conn: sqlite3.Connection,
-    table_columns,
-    primary_key_columns,
-    key_column_sets,
+    schema_cache: SchemaCache,
 ) -> ConflictCheckContext:
     """Build the merge-analysis context around the live working copy."""
 
     return ConflictCheckContext(
         base_cursor=working_conn.cursor(),
         base_db_path=":memory:",
-        table_columns=table_columns,
-        primary_key_columns=primary_key_columns,
-        key_column_sets=key_column_sets,
+        schema_cache=schema_cache,
         control_schema=CONTROL_DB_SCHEMA,
         control_sql_rewriter=lambda sql: _rewrite_sql_for_control_db(
             sql,
             CONTROL_DB_SCHEMA,
-            table_columns,
+            schema_cache.table_columns,
         ),
     )
 
@@ -299,16 +295,12 @@ def _merge_context(
 @contextmanager
 def _open_merge_working_context(
     base_path: Path,
-    table_columns,
-    primary_key_columns,
-    key_column_sets,
+    schema_cache: SchemaCache,
 ) -> Iterator[ConflictCheckContext]:
     """Open the live working context used for the whole terminal merge."""
 
     with _open_merge_working_connection(base_path) as working_conn:
         yield _merge_context(
             working_conn,
-            table_columns,
-            primary_key_columns,
-            key_column_sets,
+            schema_cache,
         )

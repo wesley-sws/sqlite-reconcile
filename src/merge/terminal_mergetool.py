@@ -30,6 +30,7 @@ from .models import (
     ConflictPair,
     LoggedStatement,
     LoggedTransaction,
+    SchemaCache,
     StatementConflict,
     transaction_label,
 )
@@ -229,7 +230,6 @@ def _resolve_branch_transaction(
     update_from_context: ConflictCheckContext,
     branch: BranchName,
     transaction: LoggedTransaction,
-    table_columns,
 ) -> LoggedTransaction | None:
     """Resolve and replay one branch-local transaction."""
 
@@ -247,8 +247,9 @@ def _resolve_branch_transaction(
             _standalone_head_conflict(replay_issue.conflict, branch),
             branch,
             current,
-            table_columns,
+            update_from_context.table_columns,
             con,
+            update_from_context,
             allow_accept=replay_issue.allow_accept,
             heading=(
                 f"A replay warning came up while checking {transaction_label(current)}:"
@@ -272,9 +273,7 @@ def _resolve_branch_replay_safety(
     base_path: Path,
     branch: BranchName,
     transactions: list[LoggedTransaction],
-    table_columns,
-    primary_key_columns,
-    key_column_sets,
+    schema_cache: SchemaCache,
 ) -> list[LoggedTransaction]:
     """Resolve wrapper-unsafe or branch-local replay failures before pair checks.
 
@@ -288,9 +287,7 @@ def _resolve_branch_replay_safety(
         update_from_context = ConflictCheckContext(
             base_cursor=branch_conn.cursor(),
             base_db_path=":memory:",
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache,
         )
         for transaction in transactions:
             replayed = _resolve_branch_transaction(
@@ -298,7 +295,6 @@ def _resolve_branch_replay_safety(
                 update_from_context,
                 branch,
                 transaction,
-                table_columns,
             )
             if replayed is not None:
                 resolved.append(replayed)
@@ -330,7 +326,6 @@ def _resolve_standalone_replay(
     remaining_ours: deque[LoggedTransaction],
     remaining_theirs: deque[LoggedTransaction],
     metadata_indexes: MetadataIndexes,
-    table_columns,
 ) -> StandaloneReplayOutcome:
     """Edit/delete the current transaction that failed before pair comparison."""
 
@@ -340,8 +335,9 @@ def _resolve_standalone_replay(
         conflict,
         scope,
         target_transaction,
-        table_columns,
+        context.table_columns,
         context.base_cursor.connection,
+        context,
     )
     replacement = (
         None
@@ -367,7 +363,6 @@ def _resolve_remaining_pair_conflict(
     remaining_ours: deque[LoggedTransaction],
     remaining_theirs: deque[LoggedTransaction],
     metadata_indexes: MetadataIndexes,
-    table_columns,
     *,
     current_branch: BranchName,
 ) -> PairConflictOutcome:
@@ -377,8 +372,9 @@ def _resolve_remaining_pair_conflict(
         conflict,
         remaining_ours,
         remaining_theirs,
-        table_columns,
+        context.table_columns,
         context.base_cursor.connection,
+        context,
         allow_accept=_is_reviewable_pair_conflict(conflict),
     )
     if resolution.action == "accept":
@@ -479,7 +475,6 @@ def _check_accept_current(
     remaining_theirs: deque[LoggedTransaction],
     metadata_indexes: MetadataIndexes,
     context: ConflictCheckContext,
-    table_columns,
 ) -> bool:
     """Resolve at most one fixed-order queue head for this branch."""
 
@@ -506,7 +501,6 @@ def _check_accept_current(
                 remaining_ours,
                 remaining_theirs,
                 metadata_indexes,
-                table_columns,
             )
             if outcome == "current_removed":
                 return True
@@ -536,7 +530,6 @@ def _check_accept_current(
                     remaining_ours,
                     remaining_theirs,
                     metadata_indexes,
-                    table_columns,
                 )
                 scan.close()
                 scan = None
@@ -551,7 +544,6 @@ def _check_accept_current(
                     remaining_ours,
                     remaining_theirs,
                     metadata_indexes,
-                    table_columns,
                     current_branch=current_branch,
                 )
                 if pair_outcome.action == "accepted":
@@ -592,7 +584,6 @@ def _check_accept_current(
                 remaining_ours,
                 remaining_theirs,
                 metadata_indexes,
-                table_columns,
             )
             if outcome == "current_removed":
                 return True
@@ -624,9 +615,7 @@ def _resolve_merge_transactions(
     merged_path: Path,
     ours_transactions: list[LoggedTransaction],
     theirs_transactions: list[LoggedTransaction],
-    table_columns,
-    primary_key_columns,
-    key_column_sets,
+    schema_cache: SchemaCache,
 ) -> int:
     """Resolve loaded branch transactions and write the merged database."""
 
@@ -634,26 +623,20 @@ def _resolve_merge_transactions(
         base_path,
         "ours",
         ours_transactions,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache,
     )
     theirs_transactions = _resolve_branch_replay_safety(
         base_path,
         "theirs",
         theirs_transactions,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache,
     )
 
     remaining_ours: deque[LoggedTransaction] = deque(ours_transactions)
     remaining_theirs: deque[LoggedTransaction] = deque(theirs_transactions)
     with _open_merge_working_context(
         base_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache,
     ) as context:
         metadata_indexes: MetadataIndexes = {
             "ours": RemainingMetadataIndex.from_transactions(
@@ -673,7 +656,6 @@ def _resolve_merge_transactions(
                     remaining_theirs,
                     metadata_indexes,
                     context,
-                    table_columns,
                 ):
                     return 1
         try:
@@ -698,9 +680,7 @@ def resolve_direct_merge(
         (
             ours_transactions,
             theirs_transactions,
-            table_columns,
-            primary_key_columns,
-            key_column_sets,
+            schema_cache,
         ) = load_merge_inputs(base_db_path, ours_db_path, theirs_db_path)
     except MergeNotApplicableError as exc:
         print(exc)
@@ -711,9 +691,7 @@ def resolve_direct_merge(
         merged_path=Path(merged_db_path),
         ours_transactions=ours_transactions,
         theirs_transactions=theirs_transactions,
-        table_columns=table_columns,
-        primary_key_columns=primary_key_columns,
-        key_column_sets=key_column_sets,
+        schema_cache=schema_cache,
     )
 
 

@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from .models import ConflictCheckContext, ConflictKind, LoggedStatement, LoggedTransaction
-from .static_analysis import (
-    foreign_key_edges,
-    omitted_integer_primary_key_column,
+from .cascade_metadata import foreign_key_edges_by_child, foreign_key_edges_by_parent
+from .models import (
+    ConflictCheckContext,
+    ConflictKind,
+    LoggedStatement,
+    LoggedTransaction,
 )
+from .static_analysis import (
+    omitted_integer_primary_key_column,
+    transaction_metadata_may_create_or_change_key,
+    transaction_metadata_may_remove_or_change_key,
+)
+from .cascade_types import CascadeWriteEvent
+from .sql_metadata import StatementMetadata, required_updated_table
 from .utils import ALL_COLUMNS
 
 ColumnCountMap = dict[str, dict[str, int]]
@@ -146,52 +155,54 @@ class RemainingMetadataIndex:
         delta: int,
     ) -> None:
         metadata = statement.metadata
-        if metadata.table_updated is not None:
-            if metadata.statement_kind == "insert":
-                _update_column_counts(
-                    self.create_or_change_key_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-            elif metadata.statement_kind == "update":
-                _update_column_counts(
-                    self.write_write_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-                _update_column_counts(
-                    self.create_or_change_key_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-                _update_column_counts(
-                    self.remove_or_change_key_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-                _update_column_counts(
-                    self.update_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-            elif metadata.statement_kind == "delete":
-                _update_column_counts(
-                    self.write_write_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
-                _update_column_counts(
-                    self.remove_or_change_key_column_counts,
-                    metadata.table_updated,
-                    metadata.columns_updated,
-                    delta=delta,
-                )
+        if metadata.statement_kind == "insert":
+            table = _updated_table(metadata)
+            _update_column_counts(
+                self.create_or_change_key_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+        elif metadata.statement_kind == "update":
+            table = _updated_table(metadata)
+            _update_column_counts(
+                self.write_write_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+            _update_column_counts(
+                self.create_or_change_key_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+            _update_column_counts(
+                self.remove_or_change_key_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+            _update_column_counts(
+                self.update_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+        elif metadata.statement_kind == "delete":
+            table = _updated_table(metadata)
+            _update_column_counts(
+                self.write_write_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
+            _update_column_counts(
+                self.remove_or_change_key_column_counts,
+                table,
+                metadata.columns_updated,
+                delta=delta,
+            )
 
         for table, columns in (
             metadata.tables_referenced_to_columns_referenced.items()
@@ -203,15 +214,54 @@ class RemainingMetadataIndex:
                 delta=delta,
             )
 
-        if metadata.statement_kind == "insert" and metadata.table_updated is not None:
+        for event in metadata.cascade_write_events:
+            self._update_cascade_write_event(event, delta=delta)
+
+        if metadata.statement_kind == "insert":
+            table = _updated_table(metadata)
             omitted_key = omitted_integer_primary_key_column(context, metadata)
             if omitted_key is not None:
                 _update_column_counts(
                     self.omitted_integer_primary_key_counts,
-                    metadata.table_updated,
+                    table,
                     {omitted_key},
                     delta=delta,
                 )
+
+    def _update_cascade_write_event(
+        self,
+        event: CascadeWriteEvent,
+        *,
+        delta: int,
+    ) -> None:
+        """Add or remove hidden child writes caused by FK actions."""
+
+        columns = set(event.columns)
+        _update_column_counts(
+            self.write_write_column_counts,
+            event.table,
+            columns,
+            delta=delta,
+        )
+        _update_column_counts(
+            self.remove_or_change_key_column_counts,
+            event.table,
+            columns,
+            delta=delta,
+        )
+        if event.kind == "update":
+            _update_column_counts(
+                self.create_or_change_key_column_counts,
+                event.table,
+                columns,
+                delta=delta,
+            )
+            _update_column_counts(
+                self.update_column_counts,
+                event.table,
+                columns,
+                delta=delta,
+            )
 
 
 def _update_column_counts(
@@ -263,14 +313,10 @@ def _column_counter_overlap(
     return any(column in table_counts for column in columns)
 
 
-def _column_sets_overlap(left: set[str], right: set[str]) -> bool:
-    """Return whether two column sets overlap, treating '*' as all columns."""
+def _updated_table(metadata: StatementMetadata) -> str:
+    """Return the updated table for DML metadata."""
 
-    if not left or not right:
-        return False
-    if ALL_COLUMNS in left or ALL_COLUMNS in right:
-        return True
-    return bool(left & right)
+    return required_updated_table(metadata)
 
 
 def _write_write_conflict_possible(
@@ -281,22 +327,35 @@ def _write_write_conflict_possible(
 
     for statement in current.statements:
         metadata = statement.metadata
-        table = metadata.table_updated
-        if table is None:
-            continue
-
-        if metadata.statement_kind == "update" and _column_counter_overlap(
-            remaining_other_index.write_write_column_counts,
-            table,
-            metadata.columns_updated,
-        ):
-            return True
-        if metadata.statement_kind == "delete" and _column_counter_overlap(
-            remaining_other_index.update_column_counts,
-            table,
-            {ALL_COLUMNS},
-        ):
-            return True
+        if metadata.statement_kind == "update":
+            table = _updated_table(metadata)
+            if _column_counter_overlap(
+                remaining_other_index.write_write_column_counts,
+                table,
+                metadata.columns_updated,
+            ):
+                return True
+        elif metadata.statement_kind == "delete":
+            table = _updated_table(metadata)
+            if _column_counter_overlap(
+                remaining_other_index.update_column_counts,
+                table,
+                {ALL_COLUMNS},
+            ):
+                return True
+        for event in metadata.cascade_write_events:
+            if event.kind == "update" and _column_counter_overlap(
+                remaining_other_index.write_write_column_counts,
+                event.table,
+                set(event.columns),
+            ):
+                return True
+            if event.kind == "delete" and _column_counter_overlap(
+                remaining_other_index.update_column_counts,
+                event.table,
+                {ALL_COLUMNS},
+            ):
+                return True
     return False
 
 
@@ -308,30 +367,27 @@ def _implicit_insert_key_conflict_possible(
     """Return whether hidden INTEGER PRIMARY KEY assignment needs pair checks."""
 
     for statement in current.statements:
-        table = statement.metadata.table_updated
-        if table is None:
-            continue
-
-        if (
-            statement.metadata.statement_kind == "update"
-            and _column_counter_overlap(
+        metadata = statement.metadata
+        if metadata.statement_kind == "update":
+            table = _updated_table(metadata)
+            if _column_counter_overlap(
                 remaining_other_index.omitted_integer_primary_key_counts,
                 table,
-                statement.metadata.columns_updated,
-            )
-        ):
-            return True
+                metadata.columns_updated,
+            ):
+                return True
 
-        if statement.metadata.statement_kind != "insert":
+        if metadata.statement_kind != "insert":
             continue
 
+        table = _updated_table(metadata)
         if (
             table not in remaining_other_index.omitted_integer_primary_key_counts
             and table not in remaining_other_index.update_column_counts
         ):
             continue
 
-        omitted_key = omitted_integer_primary_key_column(context, statement.metadata)
+        omitted_key = omitted_integer_primary_key_column(context, metadata)
         if omitted_key is not None and (
             remaining_other_index.has_omitted_integer_primary_key(table, omitted_key)
             or remaining_other_index.has_update_write(table, {omitted_key})
@@ -369,8 +425,8 @@ def _key_constraint_conflict_possible_with_index(
         key_sets = context.key_column_sets.get(table, ())
         for key_set in key_sets:
             key_columns = set(key_set)
-            if _transaction_may_create_or_change_key(
-                current,
+            if transaction_metadata_may_create_or_change_key(
+                current.metadata,
                 table,
                 key_columns,
             ) and remaining_other_index.has_create_or_change_key(
@@ -388,69 +444,30 @@ def _foreign_key_constraint_conflict_possible_with_index(
 ) -> bool:
     """Return whether parent-key and child-FK writes may violate an FK edge."""
 
-    for edge in foreign_key_edges(context):
-        child_column_set = set(edge.child_columns)
-        parent_column_set = set(edge.parent_columns)
-        current_changes_parent = _transaction_may_remove_or_change_key(
-            current,
-            edge.parent_table,
-            parent_column_set,
-        )
-        current_writes_child = _transaction_may_create_or_change_key(
-            current,
-            edge.child_table,
-            child_column_set,
-        )
-        if current_changes_parent and remaining_other_index.has_create_or_change_key(
-            edge.child_table,
-            child_column_set,
-        ):
-            return True
-        if current_writes_child and remaining_other_index.has_remove_or_change_key(
-            edge.parent_table,
-            parent_column_set,
-        ):
-            return True
-    return False
+    for table in current.metadata.tables_updated_to_columns_updated:
+        for edge in foreign_key_edges_by_parent(context).get(table, ()):
+            child_column_set = set(edge.child_columns)
+            parent_column_set = set(edge.parent_columns)
+            if transaction_metadata_may_remove_or_change_key(
+                current.metadata,
+                edge.parent_table,
+                parent_column_set,
+            ) and remaining_other_index.has_create_or_change_key(
+                edge.child_table,
+                child_column_set,
+            ):
+                return True
 
-
-def _transaction_may_create_or_change_key(
-    transaction: LoggedTransaction,
-    table: str,
-    key_columns: set[str],
-) -> bool:
-    """Return whether a transaction may insert/update a key value."""
-
-    for statement in transaction.statements:
-        metadata = statement.metadata
-        if metadata.table_updated != table:
-            continue
-        if metadata.statement_kind == "insert":
-            return True
-        if metadata.statement_kind == "update" and _column_sets_overlap(
-            metadata.columns_updated,
-            key_columns,
-        ):
-            return True
-    return False
-
-
-def _transaction_may_remove_or_change_key(
-    transaction: LoggedTransaction,
-    table: str,
-    key_columns: set[str],
-) -> bool:
-    """Return whether a transaction may delete/update a referenced key."""
-
-    for statement in transaction.statements:
-        metadata = statement.metadata
-        if metadata.table_updated != table:
-            continue
-        if metadata.statement_kind == "delete":
-            return True
-        if metadata.statement_kind == "update" and _column_sets_overlap(
-            metadata.columns_updated,
-            key_columns,
-        ):
-            return True
+        for edge in foreign_key_edges_by_child(context).get(table, ()):
+            child_column_set = set(edge.child_columns)
+            parent_column_set = set(edge.parent_columns)
+            if transaction_metadata_may_create_or_change_key(
+                current.metadata,
+                edge.child_table,
+                child_column_set,
+            ) and remaining_other_index.has_remove_or_change_key(
+                edge.parent_table,
+                parent_column_set,
+            ):
+                return True
     return False

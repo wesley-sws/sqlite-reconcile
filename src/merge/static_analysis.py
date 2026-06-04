@@ -1,38 +1,38 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-import sqlite3
 
 from sqlglot import expressions as exp
 
+from .cascade_metadata import (
+    CASCADE_CONFLICT_DETAIL,
+    cascade_event_may_create_or_change_key,
+    cascade_event_may_remove_or_change_key,
+    foreign_key_edges_by_child,
+    foreign_key_edges_by_parent,
+)
+from .conflict_kinds import kind_enabled
 from .models import (
     BranchName,
     ConflictCheckContext,
     ConflictKind,
     ConflictCheckResult,
-    ForeignKeyAction,
-    ForeignKeyEdge,
-    ForeignKeyEdges,
     StatementConflict,
 )
-from .sql_metadata import StatementMetadata, TransactionMetadata
+from .sql_metadata import (
+    StatementMetadata,
+    TransactionMetadata,
+    required_updated_table,
+)
 from .utils import (
     ALL_COLUMNS,
     TableKeyColumnSets,
+    column_overlap,
     is_delete_statement,
     is_insert_statement,
     is_update_statement,
-    quote_identifier,
-    row_value,
+    integer_primary_key_column,
 )
-
-SQLITE_FOREIGN_KEY_ACTIONS: dict[str, ForeignKeyAction] = {
-    "NO ACTION": "NO ACTION",
-    "RESTRICT": "RESTRICT",
-    "CASCADE": "CASCADE",
-    "SET NULL": "SET NULL",
-    "SET DEFAULT": "SET DEFAULT",
-}
 
 
 def static_analysis_matching(
@@ -46,46 +46,41 @@ def static_analysis_matching(
     """Return table/column conflicts, optionally ordered from current to other."""
 
     kinds = set(enabled_kinds) if enabled_kinds is not None else None
-    if len(ours_metadata.statements) == 1 and len(theirs_metadata.statements) == 1:
-        return _match_statement_metadata(
-            context,
-            ours_metadata.statements[0],
-            theirs_metadata.statements[0],
-            enabled_kinds=kinds,
-            current_branch=current_branch,
-        )
-
     result = ConflictCheckResult()
-    if _kind_enabled(
-        kinds,
-        "implicit_insert_key",
-    ) and _transaction_has_implicit_insert_key_conflict(
-        context,
-        ours_metadata,
-        theirs_metadata,
-    ):
+    if kind_enabled(kinds, "implicit_insert_key"):
         result.add_conflicts(
-            StatementConflict(
-                kind="implicit_insert_key",
-                message="transactions may conflict through implicit insert keys",
+            *_transaction_implicit_insert_key_conflicts(
+                context,
+                ours_metadata,
+                theirs_metadata,
             )
         )
 
-    if _kind_enabled(kinds, "write_write") and _transaction_write_write_overlap(
+    if kind_enabled(kinds, "write_write") and _transaction_write_write_overlap(
         ours_metadata,
         theirs_metadata,
     ):
+        has_cascade = _transaction_has_cascade_effects(
+            ours_metadata,
+        ) or _transaction_has_cascade_effects(theirs_metadata)
         result.add_conflicts(
             StatementConflict(
                 kind="write_write",
                 message="transactions write overlapping table columns",
+                details=_cascade_conflict_details(has_cascade),
             )
         )
 
-    if _kind_enabled(kinds, "write_read"):
+    if kind_enabled(kinds, "write_read"):
         if (
             current_branch is None or current_branch == "ours"
-        ) and _transaction_write_read_overlap(ours_metadata, theirs_metadata):
+        ) and _transaction_write_read_overlap(
+            ours_metadata,
+            theirs_metadata,
+        ):
+            has_cascade = _transaction_has_cascade_effects(
+                ours_metadata,
+            ) or _transaction_has_cascade_effects(theirs_metadata)
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
@@ -93,12 +88,22 @@ def static_analysis_matching(
                         "ours transaction writes columns read by "
                         "theirs transaction"
                     ),
-                    details=_write_read_details("ours", "theirs"),
+                    details=_write_read_details(
+                        "ours",
+                        "theirs",
+                        is_cascade=has_cascade,
+                    ),
                 )
             )
         if (
             current_branch is None or current_branch == "theirs"
-        ) and _transaction_write_read_overlap(theirs_metadata, ours_metadata):
+        ) and _transaction_write_read_overlap(
+            theirs_metadata,
+            ours_metadata,
+        ):
+            has_cascade = _transaction_has_cascade_effects(
+                theirs_metadata,
+            ) or _transaction_has_cascade_effects(ours_metadata)
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
@@ -106,22 +111,25 @@ def static_analysis_matching(
                         "theirs transaction writes columns read by "
                         "ours transaction"
                     ),
-                    details=_write_read_details("theirs", "ours"),
+                    details=_write_read_details(
+                        "theirs",
+                        "ours",
+                        is_cascade=has_cascade,
+                    ),
                 )
             )
     return result
 
+def _cascade_conflict_details(
+    has_cascade: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Return static-conflict details for cascade-derived metadata."""
 
-def _kind_enabled(
-    enabled_kinds: set[ConflictKind] | None,
-    kind: ConflictKind,
-) -> bool:
-    """Return whether a static conflict kind should be checked."""
-
-    return enabled_kinds is None or kind in enabled_kinds
+    return (CASCADE_CONFLICT_DETAIL,) if has_cascade else ()
 
 
 def write_write_candidate_pairs(
+    context: ConflictCheckContext,
     ours_metadata: TransactionMetadata,
     theirs_metadata: TransactionMetadata,
 ) -> tuple[tuple[int, int], ...]:
@@ -136,17 +144,19 @@ def write_write_candidate_pairs(
 
 
 def write_read_candidate_indexes(
+    context: ConflictCheckContext,
     writer_metadata: TransactionMetadata,
     reader_metadata: TransactionMetadata,
 ) -> tuple[int, ...]:
     """Return reader statement indexes that may read writer output."""
 
+    written_columns = _transaction_updated_columns(writer_metadata)
     return tuple(
         index
         for index, reader_statement in enumerate(reader_metadata.statements)
         if _metadata_reads_any(
             reader_statement,
-            writer_metadata.tables_updated_to_columns_updated,
+            written_columns,
         )
     )
 
@@ -177,29 +187,63 @@ def omitted_integer_primary_key_column(
     return _omitted_integer_primary_key_column(context, metadata)
 
 
-def foreign_key_edges(
-    context: ConflictCheckContext,
-) -> ForeignKeyEdges:
-    """Return child columns and parent columns for each foreign-key edge."""
-
-    cache_key = "base"
-    if cache_key not in context.foreign_key_edges_cache:
-        context.foreign_key_edges_cache[cache_key] = _foreign_key_edges(context)
-    return context.foreign_key_edges_cache[cache_key]
-
-
-def _transaction_has_implicit_insert_key_conflict(
+def _transaction_implicit_insert_key_conflicts(
     context: ConflictCheckContext,
     ours_metadata: TransactionMetadata,
     theirs_metadata: TransactionMetadata,
-) -> bool:
-    """Return whether any statement pair has an implicit-key risk."""
+) -> tuple[StatementConflict, ...]:
+    """Return implicit-key conflicts across all statement pairs."""
 
-    return any(
-        _implicit_insert_key_conflicts(context, ours_statement, theirs_statement)
+    return tuple(
+        conflict
         for ours_statement in ours_metadata.statements
         for theirs_statement in theirs_metadata.statements
+        for conflict in _implicit_insert_key_conflicts(
+            context,
+            ours_statement,
+            theirs_statement,
+        )
     )
+
+
+def _transaction_updated_columns(
+    metadata: TransactionMetadata,
+) -> dict[str, set[str]]:
+    """Return explicit plus cascade-hidden transaction writes."""
+
+    return metadata.tables_updated_to_columns_updated
+
+
+def _transaction_referenced_columns(
+    metadata: TransactionMetadata,
+) -> dict[str, set[str]]:
+    """Return explicit plus cascade-hidden transaction reads."""
+
+    return metadata.tables_referenced_to_columns_referenced
+
+
+def _statement_updated_columns(
+    metadata: StatementMetadata,
+) -> dict[str, set[str]]:
+    """Return explicit plus cascade-hidden writes for one statement."""
+
+    return metadata.tables_updated_to_columns_updated
+
+
+def _transaction_has_cascade_effects(
+    metadata: TransactionMetadata,
+) -> bool:
+    """Return whether any statement has cascade-hidden reads or writes."""
+
+    return metadata.has_cascade_effects
+
+
+def _statement_has_cascade_effects(
+    metadata: StatementMetadata,
+) -> bool:
+    """Return whether one statement has cascade-hidden reads or writes."""
+
+    return metadata.has_cascade_effects
 
 
 def _transaction_write_write_overlap(
@@ -208,9 +252,10 @@ def _transaction_write_write_overlap(
 ) -> bool:
     """Return whether the two transactions may write the same table columns."""
 
-    return _columns_by_table_overlap(
-        ours_metadata.tables_updated_to_columns_updated,
-        theirs_metadata.tables_updated_to_columns_updated,
+    return any(
+        _metadata_write_write_overlap(ours_statement, theirs_statement)
+        for ours_statement in ours_metadata.statements
+        for theirs_statement in theirs_metadata.statements
     )
 
 
@@ -221,8 +266,8 @@ def _transaction_write_read_overlap(
     """Return whether any reader statement may read writer transaction output."""
 
     return _columns_by_table_overlap(
-        writer_metadata.tables_updated_to_columns_updated,
-        reader_metadata.tables_referenced_to_columns_referenced,
+        _transaction_updated_columns(writer_metadata),
+        _transaction_referenced_columns(reader_metadata),
     )
 
 
@@ -234,7 +279,7 @@ def _columns_by_table_overlap(
 
     for table, left_columns in left.items():
         right_columns = right.get(table)
-        if right_columns is not None and _column_overlap(left_columns, right_columns):
+        if right_columns is not None and column_overlap(left_columns, right_columns):
             return True
     return False
 
@@ -245,7 +290,19 @@ def _metadata_write_write_overlap(
 ) -> bool:
     """Return whether two statements may write overlapping table columns."""
 
-    return _write_write_conflict(ours_metadata, theirs_metadata) is not None
+    if _direct_write_write_overlap(ours_metadata, theirs_metadata):
+        return True
+
+    if not (
+        _statement_has_cascade_effects(ours_metadata)
+        or _statement_has_cascade_effects(theirs_metadata)
+    ):
+        return False
+
+    return _columns_by_table_overlap(
+        _statement_updated_columns(ours_metadata),
+        _statement_updated_columns(theirs_metadata),
+    )
 
 
 def _metadata_reads_any(
@@ -254,9 +311,9 @@ def _metadata_reads_any(
 ) -> bool:
     """Return whether metadata reads any provided table columns."""
 
-    return any(
-        _metadata_read_overlap(metadata, table, columns)
-        for table, columns in columns_by_table.items()
+    return _columns_by_table_overlap(
+        metadata.tables_referenced_to_columns_referenced,
+        columns_by_table,
     )
 
 
@@ -270,11 +327,11 @@ def _key_constraint_conflict_possible(
     key_sets_by_table = _key_column_sets_by_table(context)
     for table, key_sets in key_sets_by_table.items():
         for key_set in key_sets:
-            if _transaction_may_create_or_change_key(
+            if transaction_metadata_may_create_or_change_key(
                 first_metadata,
                 table,
                 key_set,
-            ) and _transaction_may_create_or_change_key(
+            ) and transaction_metadata_may_create_or_change_key(
                 second_metadata,
                 table,
                 key_set,
@@ -283,7 +340,7 @@ def _key_constraint_conflict_possible(
     return False
 
 
-def _transaction_may_create_or_change_key(
+def transaction_metadata_may_create_or_change_key(
     metadata: TransactionMetadata,
     table: str,
     key_columns: set[str],
@@ -293,6 +350,9 @@ def _transaction_may_create_or_change_key(
     return any(
         _statement_may_create_or_change_key(statement, table, key_columns)
         for statement in metadata.statements
+    ) or any(
+        cascade_event_may_create_or_change_key(event, table, key_columns)
+        for event in metadata.cascade_write_events
     )
 
 
@@ -319,38 +379,35 @@ def _foreign_key_constraint_conflict_possible(
 ) -> bool:
     """Return whether parent-key and child-FK writes may violate an FK edge."""
 
-    for edge in foreign_key_edges(context):
-        first_changes_parent = _transaction_may_remove_or_change_key(
-            first_metadata,
-            edge.parent_table,
-            set(edge.parent_columns),
-        )
-        second_changes_parent = _transaction_may_remove_or_change_key(
-            second_metadata,
-            edge.parent_table,
-            set(edge.parent_columns),
-        )
-        first_writes_child = _transaction_may_create_or_change_key(
-            first_metadata,
-            edge.child_table,
-            set(edge.child_columns),
-        )
-        second_writes_child = _transaction_may_create_or_change_key(
-            second_metadata,
-            edge.child_table,
-            set(edge.child_columns),
-        )
-        if (
-            first_changes_parent
-            and second_writes_child
-            or second_changes_parent
-            and first_writes_child
-        ):
-            return True
+    for table in first_metadata.tables_updated_to_columns_updated:
+        for edge in foreign_key_edges_by_parent(context).get(table, ()):
+            if transaction_metadata_may_remove_or_change_key(
+                first_metadata,
+                edge.parent_table,
+                set(edge.parent_columns),
+            ) and transaction_metadata_may_create_or_change_key(
+                second_metadata,
+                edge.child_table,
+                set(edge.child_columns),
+            ):
+                return True
+
+        for edge in foreign_key_edges_by_child(context).get(table, ()):
+            if transaction_metadata_may_create_or_change_key(
+                first_metadata,
+                edge.child_table,
+                set(edge.child_columns),
+            ) and transaction_metadata_may_remove_or_change_key(
+                second_metadata,
+                edge.parent_table,
+                set(edge.parent_columns),
+            ):
+                return True
+
     return False
 
 
-def _transaction_may_remove_or_change_key(
+def transaction_metadata_may_remove_or_change_key(
     metadata: TransactionMetadata,
     table: str,
     key_columns: set[str],
@@ -367,6 +424,9 @@ def _transaction_may_remove_or_change_key(
             )
         )
         for statement in metadata.statements
+    ) or any(
+        cascade_event_may_remove_or_change_key(event, table, key_columns)
+        for event in metadata.cascade_write_events
     )
 
 
@@ -382,193 +442,47 @@ def _key_column_sets_by_table(
     }
 
 
-def _foreign_key_edges(
-    context: ConflictCheckContext,
-) -> ForeignKeyEdges:
-    """Return child columns and parent columns for each foreign-key edge."""
-
-    edges: list[ForeignKeyEdge] = []
-    for child_table in context.table_columns:
-        rows = context.base_cursor.execute(
-            f"PRAGMA foreign_key_list({quote_identifier(child_table)})"
-        ).fetchall()
-        grouped: dict[int, list[sqlite3.Row | tuple]] = {}
-        for row in rows:
-            grouped.setdefault(int(row_value(row, "id", 0)), []).append(row)
-
-        for edge_rows in grouped.values():
-            ordered_rows = sorted(edge_rows, key=lambda row: int(row_value(row, "seq", 1)))
-            parent_table = str(row_value(ordered_rows[0], "table", 2))
-            on_update = _foreign_key_action(ordered_rows[0], "on_update", 5)
-            on_delete = _foreign_key_action(ordered_rows[0], "on_delete", 6)
-            parent_pk_columns = context.primary_key_columns.get(parent_table, ())
-            # if parent key reference is not specified by SQLite it should refer to its PK columns
-            uses_parent_pk_shorthand = any(
-                row_value(row, "to", 4) is None
-                for row in ordered_rows
-            )
-            if uses_parent_pk_shorthand and len(ordered_rows) != len(parent_pk_columns):
-                continue
-
-            child_columns: list[str] = []
-            parent_columns: list[str] = []
-            for index, row in enumerate(ordered_rows):
-                child_columns.append(str(row_value(row, "from", 3)))
-                parent_column = row_value(row, "to", 4)
-                parent_columns.append(
-                    parent_pk_columns[index]
-                    if parent_column is None
-                    else str(parent_column)
-                )
-
-            if parent_columns:
-                edges.append(
-                    ForeignKeyEdge(
-                        child_table=child_table,
-                        child_columns=tuple(child_columns),
-                        parent_table=parent_table,
-                        parent_columns=tuple(parent_columns),
-                        on_update=on_update,
-                        on_delete=on_delete,
-                    )
-                )
-    return tuple(edges)
-
-
-def _foreign_key_action(
-    row: sqlite3.Row | tuple,
-    key: str,
-    index: int,
-) -> ForeignKeyAction:
-    """Return one SQLite FK action from PRAGMA foreign_key_list."""
-
-    action = str(row_value(row, key, index)).upper()
-    return SQLITE_FOREIGN_KEY_ACTIONS.get(action, "NO ACTION")
-
-
-def _match_statement_metadata(
-    context: ConflictCheckContext,
+def _direct_write_write_overlap(
     ours_metadata: StatementMetadata,
     theirs_metadata: StatementMetadata,
-    *,
-    enabled_kinds: set[ConflictKind] | None = None,
-    current_branch: BranchName | None = None,
-) -> ConflictCheckResult:
-    """Compare metadata for write/write and selected write/read directions."""
-
-    conflicts: list[StatementConflict] = []
-    if _kind_enabled(enabled_kinds, "implicit_insert_key"):
-        conflicts.extend(
-            _implicit_insert_key_conflicts(context, ours_metadata, theirs_metadata)
-        )
-
-    if _kind_enabled(enabled_kinds, "write_write"):
-        write_write = _write_write_conflict(ours_metadata, theirs_metadata)
-        if write_write is not None:
-            conflicts.append(write_write)
-
-    if _kind_enabled(enabled_kinds, "write_read"):
-        if current_branch is None or current_branch == "ours":
-            conflicts.extend(
-                _write_read_conflicts(
-                    writer_label="ours",
-                    writer=ours_metadata,
-                    reader_label="theirs",
-                    reader=theirs_metadata,
-                )
-            )
-        if current_branch is None or current_branch == "theirs":
-            conflicts.extend(
-                _write_read_conflicts(
-                    writer_label="theirs",
-                    writer=theirs_metadata,
-                    reader_label="ours",
-                    reader=ours_metadata,
-                )
-            )
-    return ConflictCheckResult(conflicts)
-
-
-def _write_write_conflict(
-    ours_metadata: StatementMetadata,
-    theirs_metadata: StatementMetadata,
-) -> StatementConflict | None:
-    """Return a conflict when both statements write overlapping table columns."""
+) -> bool:
+    """Return whether explicit writes may update/delete overlapping rows."""
 
     if not _same_written_table(ours_metadata, theirs_metadata):
-        return None
+        return False
+    table = required_updated_table(ours_metadata)
 
     if is_delete_statement(ours_metadata) and is_delete_statement(theirs_metadata):
-        return None
+        return False
 
     if is_insert_statement(ours_metadata) or is_insert_statement(theirs_metadata):
-        return None
+        return False
 
     ours_columns = _written_columns(ours_metadata)
-    overlap = _metadata_write_overlap(
-        theirs_metadata,
-        ours_metadata.table_updated,
-        ours_columns,
-    )
-    if not overlap:
-        return None
-
-    return StatementConflict(
-        kind="write_write",
-        message=(
-            "Both statements write "
-            f"{ours_metadata.table_updated}.{_format_columns(overlap)}"
-        ),
-    )
-
-
-def _write_read_conflicts(
-    writer_label: str,
-    writer: StatementMetadata,
-    reader_label: str,
-    reader: StatementMetadata,
-) -> list[StatementConflict]:
-    """Return conflicts where one statement writes columns the other reads."""
-
-    table = writer.table_updated
-    if table is None:
-        return []
-
-    written_columns = _written_columns(writer)
-    if not written_columns:
-        return []
-
-    overlap = _metadata_read_overlap(
-        reader,
-        table,
-        written_columns,
-    )
-    if not overlap:
-        return []
-
-    return [
-        StatementConflict(
-            kind="write_read",
-            message=(
-                f"{writer_label} writes "
-                f"{table}.{_format_columns(overlap)}; "
-                f"{reader_label} reads it"
-            ),
-            details=_write_read_details(writer_label, reader_label),
+    return bool(
+        _metadata_write_overlap(
+            theirs_metadata,
+            table,
+            ours_columns,
         )
-    ]
+    )
 
 
 def _write_read_details(
     writer_label: str,
     reader_label: str,
+    *,
+    is_cascade: bool = False,
 ) -> tuple[tuple[str, str], ...]:
     """Return structured direction data for execution-based refinement."""
 
-    return (
+    details = [
         ("writer", writer_label),
         ("reader", reader_label),
-    )
+    ]
+    if is_cascade:
+        details.append(CASCADE_CONFLICT_DETAIL)
+    return tuple(details)
 
 
 def _implicit_insert_key_conflicts(
@@ -586,6 +500,7 @@ def _implicit_insert_key_conflicts(
         omitted_key = _omitted_integer_primary_key_column(context, insert)
         if omitted_key is None or not _same_written_table(insert, other):
             continue
+        table = required_updated_table(insert)
 
         other_omitted_key = _omitted_integer_primary_key_column(context, other)
         if other_omitted_key is not None:
@@ -593,7 +508,7 @@ def _implicit_insert_key_conflicts(
                 _implicit_insert_key_conflict(
                     insert_label,
                     other_label,
-                    insert.table_updated,
+                    table,
                     omitted_key,
                 )
             )
@@ -622,10 +537,11 @@ def _implicit_insert_key_update_conflict(
 
     if not _same_written_table(insert, other) or not is_update_statement(other):
         return None
+    table = required_updated_table(insert)
 
     written_columns = _metadata_write_overlap(
         other,
-        insert.table_updated,
+        table,
         {omitted_key},
     )
     if not written_columns:
@@ -634,7 +550,7 @@ def _implicit_insert_key_update_conflict(
     return StatementConflict(
         kind="implicit_insert_key",
         message=(
-            f"{insert_label} INSERT omits {insert.table_updated}.{omitted_key}; "
+            f"{insert_label} INSERT omits {table}.{omitted_key}; "
             f"{other_label} UPDATE assigns to the same key column"
         ),
     )
@@ -643,16 +559,16 @@ def _implicit_insert_key_update_conflict(
 def _implicit_insert_key_conflict(
     insert_label: str,
     other_label: str,
-    table: str | None,
+    table: str,
     key_column: str,
 ) -> StatementConflict:
-    """Build a conflict for an implicit-key INSERT against another INSERT."""
+    """Return implicit-key conflict for two omitted INTEGER PRIMARY KEY inserts."""
 
     return StatementConflict(
         kind="implicit_insert_key",
         message=(
             f"{insert_label} INSERT omits {table}.{key_column}; "
-            f"{other_label} INSERT omits the same key"
+            f"{other_label} INSERT also omits the same key"
         ),
     )
 
@@ -663,10 +579,11 @@ def _omitted_integer_primary_key_column(
 ) -> str | None:
     """Return omitted INTEGER PRIMARY KEY column for replay-sensitive INSERTs."""
 
-    if not is_insert_statement(metadata) or metadata.table_updated is None:
+    if not is_insert_statement(metadata):
         return None
+    table = required_updated_table(metadata)
 
-    key_column = _integer_primary_key_column(context, metadata.table_updated)
+    key_column = _integer_primary_key_column(context, table)
     if key_column is None:
         return None
 
@@ -682,28 +599,12 @@ def _integer_primary_key_column(
 ) -> str | None:
     """Return the rowid-alias INTEGER PRIMARY KEY column, if the table has one."""
 
-    if table in context.integer_primary_key_columns:
-        return context.integer_primary_key_columns[table]
+    integer_pk_cache = context.schema_cache.integer_primary_key_columns
+    if table in integer_pk_cache:
+        return integer_pk_cache[table]
 
-    rows = context.base_cursor.execute(
-        f"PRAGMA table_info({quote_identifier(table)})"
-    ).fetchall()
-    primary_key_rows = [
-        row
-        for row in rows
-        if int(row_value(row, "pk", 5) or 0) > 0
-    ]
-    if len(primary_key_rows) != 1:
-        context.integer_primary_key_columns[table] = None
-        return None
-
-    row = primary_key_rows[0]
-    declared_type = str(row_value(row, "type", 2) or "").upper()
-    if declared_type != "INTEGER":
-        context.integer_primary_key_columns[table] = None
-        return None
-    key_column = str(row_value(row, "name", 1))
-    context.integer_primary_key_columns[table] = key_column
+    key_column = integer_primary_key_column(context.base_cursor, table)
+    integer_pk_cache[table] = key_column
     return key_column
 
 
@@ -721,7 +622,8 @@ def _insert_explicit_columns(
             if expression.name
         }
 
-    if metadata.table_updated is not None:
+    if metadata.statement_kind == "insert":
+        required_updated_table(metadata)
         return {ALL_COLUMNS}
 
     return set()
@@ -729,29 +631,26 @@ def _insert_explicit_columns(
 
 def _metadata_write_overlap(
     metadata: StatementMetadata,
-    table: str | None,
+    table: str,
     columns: set[str],
 ) -> set[str]:
     """Return columns metadata writes on table."""
 
-    if table is None or metadata.table_updated != table:
+    if metadata.table_updated != table:
         return set()
 
-    return _column_overlap(metadata.columns_updated, columns)
+    return column_overlap(metadata.columns_updated, columns)
 
 
 def _metadata_read_overlap(
     metadata: StatementMetadata,
-    table: str | None,
+    table: str,
     columns: set[str],
 ) -> set[str]:
     """Return columns metadata reads on table."""
 
-    if table is None:
-        return set()
-
     references = metadata.tables_referenced_to_columns_referenced
-    return _column_overlap(references.get(table, set()), columns)
+    return column_overlap(references.get(table, set()), columns)
 
 
 def _written_columns(
@@ -759,25 +658,8 @@ def _written_columns(
 ) -> set[str]:
     """Return columns written by a statement, with INSERT/DELETE as all columns."""
 
-    table = metadata.table_updated
-    if table is None:
-        return set()
+    required_updated_table(metadata)
     return metadata.columns_updated
-
-
-def _column_overlap(left: set[str], right: set[str]) -> set[str]:
-    """Return overlapping columns, treating '*' as all columns."""
-
-    if not left or not right:
-        return set()
-
-    if ALL_COLUMNS in left and ALL_COLUMNS in right:
-        return {ALL_COLUMNS}
-    if ALL_COLUMNS in left:
-        return set(right)
-    if ALL_COLUMNS in right:
-        return set(left)
-    return left & right
 
 
 def _same_written_table(
@@ -787,11 +669,3 @@ def _same_written_table(
     """Return whether both statements write the same real table."""
 
     return left.table_updated is not None and left.table_updated == right.table_updated
-
-
-def _format_columns(columns: set[str]) -> str:
-    """Format a column set for a human-readable conflict message."""
-
-    if columns == {ALL_COLUMNS}:
-        return ALL_COLUMNS
-    return ", ".join(sorted(columns))

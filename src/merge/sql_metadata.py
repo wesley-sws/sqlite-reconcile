@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import sqlglot
 from sqlglot import expressions as exp
@@ -24,8 +24,19 @@ from sqlite_conflict_resolution import (
     normalize_sql_for_sqlglot,
 )
 
+from .cascade_metadata import CascadeEffects, cascade_effects_for_parsed_statement
+from .cascade_types import CascadeWriteEvent
 from .sql_ast import has_ancestor_before_root, with_ctes
-from .utils import ALL_COLUMNS, TableColumns, table_expression, table_name
+from .utils import (
+    ALL_COLUMNS,
+    TableColumns,
+    add_columns_by_table,
+    table_expression,
+    table_name,
+)
+
+if TYPE_CHECKING:
+    from .models import ConflictCheckContext
 
 IgnoredRelations = dict[str, set[str]]
 StatementKind = Literal["insert", "update", "delete", "other"]
@@ -66,7 +77,10 @@ class StatementMetadata:
     has_reviewable_constraint_resolution: bool
     table_updated: str | None
     columns_updated: set[str]
+    tables_updated_to_columns_updated: dict[str, set[str]]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
+    cascade_write_events: tuple[CascadeWriteEvent, ...] = ()
+    has_cascade_effects: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,23 +93,31 @@ class TransactionMetadata:
     has_delete: bool
     tables_updated_to_columns_updated: dict[str, set[str]]
     tables_referenced_to_columns_referenced: dict[str, set[str]]
+    cascade_write_events: tuple[CascadeWriteEvent, ...] = ()
+    has_cascade_effects: bool = False
 
 
 def transaction_metadata(
-    statements: Sequence[StatementMetadata],
+    statements: Iterable[StatementMetadata],
 ) -> TransactionMetadata:
     """Aggregate statement metadata into transaction-level metadata."""
 
     statement_tuple = tuple(statements)
     updated: defaultdict[str, set[str]] = defaultdict(set)
     referenced: defaultdict[str, set[str]] = defaultdict(set)
+    cascade_write_events: list[CascadeWriteEvent] = []
+    has_cascade_effects = False
     for statement in statement_tuple:
-        if statement.table_updated is not None:
-            updated[statement.table_updated].update(statement.columns_updated)
+        for table, columns in statement.tables_updated_to_columns_updated.items():
+            updated[table].update(columns)
         for table, columns in (
             statement.tables_referenced_to_columns_referenced.items()
         ):
             referenced[table].update(columns)
+        cascade_write_events.extend(statement.cascade_write_events)
+        has_cascade_effects = (
+            has_cascade_effects or statement.has_cascade_effects
+        )
 
     return TransactionMetadata(
         statements=statement_tuple,
@@ -113,32 +135,77 @@ def transaction_metadata(
         ),
         tables_updated_to_columns_updated=dict(updated),
         tables_referenced_to_columns_referenced=dict(referenced),
+        cascade_write_events=tuple(cascade_write_events),
+        has_cascade_effects=has_cascade_effects,
     )
 
 
-def parse_statement_metadata(
+def parse_statement_metadata_for_context(
     sql_text: str,
-    table_columns: TableColumns | None = None,
+    metadata_context: ConflictCheckContext,
+) -> StatementMetadata:
+    """Parse one SQL statement using the merge schema/FK context."""
+
+    return _parse_statement_metadata(
+        sql_text,
+        table_columns=metadata_context.table_columns,
+        metadata_context=metadata_context,
+    )
+
+
+def _parse_statement_metadata(
+    sql_text: str,
+    *,
+    table_columns: TableColumns | None,
+    metadata_context: ConflictCheckContext | None,
 ) -> StatementMetadata:
     """Parse one SQL statement and extract metadata used by conflict checks."""
 
     compatible = normalize_sql_for_sqlglot(sql_text)
     parsed_sql_text = _parse_one(compatible.sql)
+    statement_kind = _statement_kind(parsed_sql_text)
+    table_updated = _target_table_name(parsed_sql_text)
+    columns_updated = _updated_columns(parsed_sql_text)
+    updated = _written_tables_to_columns(
+        statement_kind,
+        table_updated,
+        columns_updated,
+    )
+    referenced = _referenced_tables_to_columns(
+        parsed_sql_text,
+        table_columns,
+    )
+    cascade_effects = _cascade_effects_for_metadata(
+        metadata_context,
+        statement_kind=statement_kind,
+        table_updated=table_updated,
+        columns_updated=columns_updated,
+    )
+    if cascade_effects.has_effects:
+        add_columns_by_table(
+            updated,
+            cascade_effects.tables_updated_to_columns_updated,
+        )
+        add_columns_by_table(
+            referenced,
+            cascade_effects.tables_referenced_to_columns_referenced,
+        )
+
     return StatementMetadata(
         parsed_sql_text=parsed_sql_text,
         compatible_sql=compatible,
-        statement_kind=_statement_kind(parsed_sql_text),
+        statement_kind=statement_kind,
         conflict_resolution=compatible.conflict_resolution,
         has_reviewable_constraint_resolution=(
             compatible.stripped_upsert
             or _is_reviewable_conflict_resolution(compatible.conflict_resolution)
         ),
-        table_updated=_target_table_name(parsed_sql_text),
-        columns_updated=_updated_columns(parsed_sql_text),
-        tables_referenced_to_columns_referenced=_referenced_tables_to_columns(
-            parsed_sql_text,
-            table_columns,
-        ),
+        table_updated=table_updated,
+        columns_updated=columns_updated,
+        tables_updated_to_columns_updated=updated,
+        tables_referenced_to_columns_referenced=referenced,
+        cascade_write_events=cascade_effects.write_events,
+        has_cascade_effects=cascade_effects.has_effects,
     )
 
 
@@ -156,8 +223,59 @@ def unsupported_statement_metadata(sql_text: str) -> StatementMetadata:
         has_reviewable_constraint_resolution=False,
         table_updated=None,
         columns_updated=set(),
+        tables_updated_to_columns_updated={},
         tables_referenced_to_columns_referenced={},
     )
+
+
+def required_updated_table(metadata: StatementMetadata) -> str:
+    """Return the written table for DML metadata.
+
+    StatementMetadata permits table_updated=None only for non-DML/unsupported
+    statements. Callers that have already narrowed to INSERT/UPDATE/DELETE use
+    this helper to make that invariant explicit in one place.
+    """
+
+    assert metadata.table_updated is not None
+    return metadata.table_updated
+
+
+def _cascade_effects_for_metadata(
+    metadata_context: ConflictCheckContext | None,
+    *,
+    statement_kind: StatementKind,
+    table_updated: str | None,
+    columns_updated: set[str],
+) -> CascadeEffects:
+    """Return FK cascade metadata when schema context is available."""
+
+    if metadata_context is None or (
+        statement_kind != "delete" and statement_kind != "update"
+    ):
+        return CascadeEffects({}, {}, ())
+
+    assert table_updated is not None
+    return cascade_effects_for_parsed_statement(
+        metadata_context,
+        statement_kind=statement_kind,
+        table_updated=table_updated,
+        columns_updated=columns_updated,
+    )
+
+
+def _written_tables_to_columns(
+    statement_kind: StatementKind,
+    table: str | None,
+    columns: set[str],
+) -> dict[str, set[str]]:
+    """Return the explicit write map for one parsed DML statement."""
+
+    if statement_kind == "other":
+        assert table is None
+        return {}
+
+    assert table is not None
+    return {table: set(columns)}
 
 
 def _is_reviewable_conflict_resolution(

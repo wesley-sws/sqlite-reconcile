@@ -16,6 +16,48 @@ TablePrimaryKeyColumns = dict[str, tuple[str, ...]]
 TableKeyColumnSets = dict[str, tuple[set[str], ...]]
 
 
+def add_columns_to_column_map(
+    columns_by_table: dict[str, set[str]],
+    table: str,
+    columns: set[str],
+) -> None:
+    """Add columns to a table/column map, preserving '*' as all columns."""
+
+    if not columns:
+        return
+    existing = columns_by_table.setdefault(table, set())
+    if ALL_COLUMNS in existing:
+        return
+    if ALL_COLUMNS in columns:
+        columns_by_table[table] = {ALL_COLUMNS}
+        return
+    existing.update(columns)
+
+
+def add_columns_by_table(
+    columns_by_table: dict[str, set[str]],
+    extra: dict[str, set[str]],
+) -> None:
+    """Merge extra table/column entries into columns_by_table."""
+
+    for table, columns in extra.items():
+        add_columns_to_column_map(columns_by_table, table, columns)
+
+
+def column_overlap(left: set[str], right: set[str]) -> set[str]:
+    """Return overlapping columns, treating '*' as all columns."""
+
+    if not left or not right:
+        return set()
+    if ALL_COLUMNS in left and ALL_COLUMNS in right:
+        return {ALL_COLUMNS}
+    if ALL_COLUMNS in left:
+        return set(right)
+    if ALL_COLUMNS in right:
+        return set(left)
+    return left & right
+
+
 def is_sql_expression(value: object) -> bool:
     """Return whether value is a sqlglot expression."""
 
@@ -136,6 +178,18 @@ def load_primary_key_columns(
     }
 
 
+def load_integer_primary_key_columns(
+    cursor: sqlite3.Cursor,
+    tables: Iterable[str],
+) -> dict[str, str | None]:
+    """Return rowid-alias INTEGER PRIMARY KEY columns for each table."""
+
+    return {
+        table: integer_primary_key_column(cursor, table)
+        for table in tables
+    }
+
+
 def load_key_column_sets(
     cursor: sqlite3.Cursor,
     tables: Iterable[str],
@@ -186,6 +240,27 @@ def primary_key_columns(cursor: sqlite3.Cursor, table: str | None) -> tuple[str,
         if int(row_value(row, "pk", 5) or 0) > 0
     ]
     return tuple(column for _, column in sorted(columns))
+
+
+def integer_primary_key_column(cursor: sqlite3.Cursor, table: str) -> str | None:
+    """Return the rowid-alias INTEGER PRIMARY KEY column, if table has one."""
+
+    rows = cursor.execute(
+        f"PRAGMA table_info({quote_identifier(table)})"
+    ).fetchall()
+    primary_key_rows = [
+        row
+        for row in rows
+        if int(row_value(row, "pk", 5) or 0) > 0
+    ]
+    if len(primary_key_rows) != 1:
+        return None
+
+    row = primary_key_rows[0]
+    declared_type = str(row_value(row, "type", 2) or "").upper()
+    if declared_type != "INTEGER":
+        return None
+    return str(row_value(row, "name", 1))
 
 
 def key_column_sets(cursor: sqlite3.Cursor, table: str) -> tuple[set[str], ...]:

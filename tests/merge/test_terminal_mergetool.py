@@ -23,6 +23,14 @@ def txs(statements):
     return log_merge.group_logged_transactions(statements)
 
 
+def schema_cache(table_columns, primary_key_columns=None, key_column_sets=None):
+    return log_merge.SchemaCache(
+        table_columns=table_columns,
+        primary_key_columns=primary_key_columns or {},
+        key_column_sets=key_column_sets or {},
+    )
+
+
 def flatten_transactions(transactions):
     return [
         statement
@@ -470,7 +478,7 @@ def test_replace_or_delete_transaction_keeps_edited_transaction_for_recheck():
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=":memory:",
-            table_columns={"coupons": {"id", "code"}},
+            schema_cache=schema_cache({"coupons": {"id", "code"}}),
         )
         metadata_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -547,7 +555,7 @@ def test_pair_resolution_deleting_current_removes_only_current_transaction(monke
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=":memory:",
-            table_columns={"coupons": {"id", "code"}},
+            schema_cache=schema_cache({"coupons": {"id", "code"}}),
         )
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -565,7 +573,6 @@ def test_pair_resolution_deleting_current_removes_only_current_transaction(monke
             remaining_ours,
             remaining_theirs,
             metadata_indexes,
-            {},
             current_branch="ours",
         )
 
@@ -628,7 +635,7 @@ def test_pair_resolution_deleting_later_other_keeps_current_for_recheck(monkeypa
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=":memory:",
-            table_columns={"coupons": {"id", "code"}},
+            schema_cache=schema_cache({"coupons": {"id", "code"}}),
         )
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -646,7 +653,6 @@ def test_pair_resolution_deleting_later_other_keeps_current_for_recheck(monkeypa
             remaining_ours,
             remaining_theirs,
             metadata_indexes,
-            {},
             current_branch="ours",
         )
 
@@ -700,7 +706,7 @@ def test_pair_resolution_accepts_reviewable_conflict_without_queue_changes(monke
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=":memory:",
-            table_columns={"coupons": {"id", "code"}},
+            schema_cache=schema_cache({"coupons": {"id", "code"}}),
         )
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -718,7 +724,6 @@ def test_pair_resolution_accepts_reviewable_conflict_without_queue_changes(monke
             remaining_ours,
             remaining_theirs,
             metadata_indexes,
-            {},
             current_branch="ours",
         )
 
@@ -782,9 +787,7 @@ def test_branch_replay_safety_edits_whole_transaction_after_error(
         base,
         "ours",
         txs(statements),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -833,9 +836,7 @@ def test_branch_replay_safety_warns_for_update_from_duplicates(
         base,
         "ours",
         txs([statement]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -893,9 +894,7 @@ def test_branch_replay_safety_update_from_warning_uses_transaction_prefix(
         base,
         "ours",
         txs([setup, update]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -960,9 +959,7 @@ def test_branch_replay_safety_records_warning_when_other_statement_changes(
         base,
         "ours",
         txs([setup, update]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -1011,9 +1008,7 @@ def test_branch_replay_safety_can_accept_nondeterministic_warning(
         base,
         "ours",
         txs([statement, followup]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -1060,9 +1055,7 @@ def test_branch_replay_safety_prompts_stored_nondeterministic_warning(
         base,
         "ours",
         txs([statement]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     resolved_statements = flatten_transactions(resolved)
@@ -1117,9 +1110,7 @@ def test_branch_replay_safety_ignores_stale_update_from_warning(
         base,
         "ours",
         txs([statement]),
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     )
 
     assert flatten_transactions(resolved) == [statement]
@@ -1138,9 +1129,7 @@ def test_merge_working_context_attaches_control_copy(tmp_path):
 
     with control_db._open_merge_working_context(
         base,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         cursor = context.base_cursor
         assert context.control_schema == control_db.CONTROL_DB_SCHEMA
@@ -1532,9 +1521,7 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
 
     with control_db._open_merge_working_context(
         base,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -1553,7 +1540,6 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
                 remaining_theirs,
                 metadata_indexes,
                 context,
-                table_columns,
             )
             assert terminal_mergetool._check_accept_current(
                 "theirs",
@@ -1561,7 +1547,6 @@ def test_check_accept_current_applies_and_pops_fixed_order_heads(tmp_path):
                 remaining_theirs,
                 metadata_indexes,
                 context,
-                table_columns,
             )
         rows = [
             tuple(row)
@@ -1689,9 +1674,7 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
 
     with control_db._open_merge_working_context(
         base,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -1709,7 +1692,6 @@ def test_check_accept_current_continues_scan_after_deleting_other_conflict(
             remaining_theirs,
             metadata_indexes,
             context,
-            table_columns,
         )
 
     assert checked_transaction_ids == [2, 3, 4]
@@ -1799,9 +1781,7 @@ def test_check_accept_current_fast_forwards_after_accepting_reviewable_pair(
 
     with control_db._open_merge_working_context(
         base,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -1819,7 +1799,6 @@ def test_check_accept_current_fast_forwards_after_accepting_reviewable_pair(
             remaining_theirs,
             metadata_indexes,
             context,
-            table_columns,
         )
 
     assert checked_transaction_ids == [2, 3]
@@ -1841,9 +1820,7 @@ def test_write_working_result_backs_up_accepted_database(tmp_path):
 
     with control_db._open_merge_working_context(
         base,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         context.base_cursor.execute(
             "INSERT INTO users (id, name) VALUES (1, 'merged')"

@@ -14,6 +14,7 @@ from typing import Literal
 from .log_merge import make_logged_statement
 from .models import (
     BranchName,
+    ConflictCheckContext,
     ConflictPair,
     LoggedStatement,
     LoggedTransaction,
@@ -119,6 +120,7 @@ def _replace_statement_sql(
     sql_text: str,
     replay_conn: sqlite3.Connection,
     table_columns,
+    metadata_context: ConflictCheckContext | None = None,
 ) -> LoggedStatement:
     """Reparse edited SQL while preserving the statement's merge identity."""
 
@@ -133,6 +135,7 @@ def _replace_statement_sql(
         is_replay_safe=prepared.is_replay_safe,
         replay_block_reason=prepared.replay_block_reason,
         table_columns=table_columns,
+        metadata_context=metadata_context,
     )
 
 
@@ -142,6 +145,7 @@ def _new_statement_sql(
     sql_text: str,
     replay_conn: sqlite3.Connection,
     table_columns,
+    metadata_context: ConflictCheckContext | None = None,
 ) -> LoggedStatement:
     """Create a user-inserted statement inside an existing transaction."""
 
@@ -160,6 +164,7 @@ def _new_statement_sql(
         is_replay_safe=prepared.is_replay_safe,
         replay_block_reason=prepared.replay_block_reason,
         table_columns=table_columns,
+        metadata_context=metadata_context,
     )
 
 
@@ -173,7 +178,7 @@ def _transaction_with_statements(
         transaction,
         statements=tuple(statements),
         metadata=transaction_metadata(
-            tuple(statement.metadata for statement in statements),
+            statement.metadata for statement in statements
         ),
     )
 
@@ -373,6 +378,7 @@ def _handle_transaction_edit_command(
     transactions_by_label: dict[str, LoggedTransaction],
     table_columns,
     replay_conn: sqlite3.Connection,
+    metadata_context: ConflictCheckContext | None = None,
 ) -> str:
     """Apply edit/delete/insert commands to editable transactions."""
 
@@ -420,6 +426,7 @@ def _handle_transaction_edit_command(
             edited_sql,
             replay_conn,
             table_columns,
+            metadata_context,
         )
         updated = _insert_transaction_statement(
             transaction,
@@ -455,6 +462,7 @@ def _handle_transaction_edit_command(
                 edited_sql,
                 replay_conn,
                 table_columns,
+                metadata_context,
             )
         updated = _replace_transaction_statement(transaction, statement, replacement)
         transactions_by_label[transaction_label_text] = updated
@@ -472,6 +480,7 @@ def _prompt_pair_transaction_resolution(
     theirs: Sequence[LoggedTransaction],
     table_columns,
     replay_conn: sqlite3.Connection,
+    metadata_context: ConflictCheckContext | None = None,
     *,
     allow_accept: bool = False,
 ) -> PairTransactionResolution:
@@ -557,6 +566,7 @@ def _prompt_pair_transaction_resolution(
             resolved_labels,
             table_columns,
             replay_conn,
+            metadata_context,
         )
         if edit_result == "changed":
             changed = True
@@ -572,6 +582,7 @@ def _prompt_standalone_transaction_resolution(
     transaction: LoggedTransaction,
     table_columns,
     replay_conn: sqlite3.Connection,
+    metadata_context: ConflictCheckContext | None = None,
     *,
     allow_accept: bool = False,
     heading: str | None = None,
@@ -618,6 +629,7 @@ def _prompt_standalone_transaction_resolution(
             resolved_transaction,
             table_columns,
             replay_conn,
+            metadata_context,
         )
         if edit_result == "changed":
             changed = True

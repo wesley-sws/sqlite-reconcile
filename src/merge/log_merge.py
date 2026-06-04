@@ -9,6 +9,10 @@ from pathlib import Path
 
 from sqlglot.errors import ParseError
 
+from .cascade_metadata import (
+    group_foreign_key_edges_by_table,
+    load_foreign_key_edges,
+)
 from .conflict_detection import (
     ConflictResolutionKey,
     OrderedRemainingConflictScanner,
@@ -21,9 +25,11 @@ from .models import (
     LoggedStatement,
     LoggedTransaction,
     MergeNotApplicableError,
+    SchemaCache,
 )
 from .sql_metadata import (
-    parse_statement_metadata,
+    _parse_statement_metadata,
+    parse_statement_metadata_for_context,
     transaction_metadata,
     unsupported_statement_metadata,
 )
@@ -35,6 +41,7 @@ from .utils import (
     TableKeyColumnSets,
     TableColumns,
     TablePrimaryKeyColumns,
+    load_integer_primary_key_columns,
     load_key_column_sets,
     load_primary_key_columns,
     load_table_columns as load_user_table_columns,
@@ -65,9 +72,18 @@ def make_logged_statement(
     replay_block_reason: str | None = None,
     replay_warnings: Sequence[str] = (),
     accepted_replay_warnings: Sequence[str] | frozenset[str] = (),
+    metadata_context: ConflictCheckContext | None = None,
 ) -> LoggedStatement:
     try:
-        metadata = parse_statement_metadata(sql_text, table_columns=table_columns)
+        metadata = (
+            parse_statement_metadata_for_context(sql_text, metadata_context)
+            if metadata_context is not None
+            else _parse_statement_metadata(
+                sql_text,
+                table_columns=table_columns,
+                metadata_context=None,
+            )
+        )
     except ParseError as exc:
         metadata = unsupported_statement_metadata(sql_text)
         is_replay_safe = False
@@ -181,6 +197,7 @@ def load_logged_statements(
     since_transaction_id: int,
     db_path: str | Path,
     table_columns: TableColumns | None = None,
+    metadata_context: ConflictCheckContext | None = None,
 ) -> list[LoggedStatement]:
     """Load branch log entries after the merge-base transaction watermark."""
     _require_log_tables(cursor, db_path, branch)
@@ -211,6 +228,7 @@ def load_logged_statements(
             is_replay_safe=bool(row["is_replay_safe"]),
             replay_block_reason=row["replay_block_reason"],
             table_columns=table_columns,
+            metadata_context=metadata_context,
         )
         for index, row in enumerate(rows)
     ]
@@ -222,6 +240,7 @@ def load_logged_transactions(
     since_transaction_id: int,
     db_path: str | Path,
     table_columns: TableColumns | None = None,
+    metadata_context: ConflictCheckContext | None = None,
 ) -> list[LoggedTransaction]:
     """Load branch log entries grouped by committed transaction."""
 
@@ -232,6 +251,7 @@ def load_logged_transactions(
             since_transaction_id,
             db_path,
             table_columns,
+            metadata_context=metadata_context,
         )
     )
 
@@ -247,6 +267,38 @@ def load_schema_metadata(
         load_primary_key_columns(cursor, table_columns),
         load_key_column_sets(cursor, table_columns),
     )
+
+
+def load_schema_cache(
+    cursor: sqlite3.Cursor,
+) -> SchemaCache:
+    """Preload reusable schema-derived facts for merge contexts."""
+
+    table_columns, primary_key_columns, key_column_sets = load_schema_metadata(cursor)
+    foreign_key_edges = load_foreign_key_edges(
+        cursor,
+        table_columns,
+        primary_key_columns,
+    )
+    schema_cache = SchemaCache(
+        table_columns=table_columns,
+        primary_key_columns=primary_key_columns,
+        key_column_sets=key_column_sets,
+        integer_primary_key_columns=load_integer_primary_key_columns(
+            cursor,
+            table_columns,
+        ),
+        foreign_key_edges=foreign_key_edges,
+        foreign_key_edges_by_parent=group_foreign_key_edges_by_table(
+            foreign_key_edges,
+            table_role="parent",
+        ),
+        foreign_key_edges_by_child=group_foreign_key_edges_by_table(
+            foreign_key_edges,
+            table_role="child",
+        ),
+    )
+    return schema_cache
 
 
 def load_schema_metadata_from_db(
@@ -265,9 +317,7 @@ def load_merge_inputs(
 ) -> tuple[
     list[LoggedTransaction],
     list[LoggedTransaction],
-    TableColumns,
-    TablePrimaryKeyColumns,
-    TableKeyColumnSets,
+    SchemaCache,
 ]:
     """Load logged branch transactions and schema metadata for one merge."""
 
@@ -279,8 +329,11 @@ def load_merge_inputs(
         theirs_conn.row_factory = sqlite3.Row
 
         base_cursor = base_conn.cursor()
-        table_columns, primary_key_columns, key_column_sets = load_schema_metadata(
-            base_cursor,
+        schema_cache = load_schema_cache(base_cursor)
+        metadata_context = ConflictCheckContext(
+            base_cursor=base_cursor,
+            base_db_path=base_db_path,
+            schema_cache=schema_cache,
         )
         base_transaction_id = get_base_watermark(base_cursor, base_db_path)
         require_valid_base(base_conn, base_db_path)
@@ -289,22 +342,20 @@ def load_merge_inputs(
             "ours",
             base_transaction_id,
             ours_db_path,
-            table_columns=table_columns,
+            metadata_context=metadata_context,
         )
         theirs = load_logged_transactions(
             theirs_conn.cursor(),
             "theirs",
             base_transaction_id,
             theirs_db_path,
-            table_columns=table_columns,
+            metadata_context=metadata_context,
         )
 
     return (
         ours,
         theirs,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache,
     )
 
 
@@ -336,7 +387,7 @@ def _logged_transaction(
         committed_at=first.committed_at,
         statements=tuple(statements),
         metadata=transaction_metadata(
-            tuple(statement.metadata for statement in statements)
+            statement.metadata for statement in statements
         ),
     )
 

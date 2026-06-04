@@ -12,18 +12,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from merge import (
     accepted_replay,
+    cascade_metadata,
     control_db,
     log_merge,
     remaining_metadata,
     static_analysis,
     terminal_mergetool,
 )
-from merge.models import ForeignKeyEdge
+from merge.cascade_types import ForeignKeyEdge
 from merge.utils import ALL_COLUMNS
 
 
 def txs(statements):
     return log_merge.group_logged_transactions(statements)
+
+
+def schema_cache(table_columns, primary_key_columns=None, key_column_sets=None):
+    return log_merge.SchemaCache(
+        table_columns=table_columns,
+        primary_key_columns=primary_key_columns or {},
+        key_column_sets=key_column_sets or {},
+    )
 
 
 def init_logged_db(path):
@@ -169,6 +178,45 @@ def test_invalid_base_database_is_not_applicable(tmp_path):
     assert exc_info.value.role == "base"
     assert exc_info.value.missing_tables == []
     assert any("foreign_key_check" in error for error in exc_info.value.details)
+
+
+def test_load_merge_inputs_prefills_schema_cache(tmp_path):
+    base = tmp_path / "base.db"
+    ours = tmp_path / "ours.db"
+    theirs = tmp_path / "theirs.db"
+    init_logged_db(base)
+    with closing(sqlite3.connect(base)) as con:
+        con.execute(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        con.commit()
+    shutil.copy2(base, ours)
+    shutil.copy2(base, theirs)
+
+    (
+        _ours_transactions,
+        _theirs_transactions,
+        schema_cache,
+    ) = log_merge.load_merge_inputs(base, ours, theirs)
+
+    edge = ForeignKeyEdge(
+        child_table="orders",
+        child_columns=("user_id",),
+        parent_table="users",
+        parent_columns=("id",),
+        on_update="NO ACTION",
+        on_delete="CASCADE",
+    )
+    assert schema_cache.integer_primary_key_columns["users"] == "id"
+    assert schema_cache.integer_primary_key_columns["orders"] == "id"
+    assert schema_cache.foreign_key_edges == (edge,)
+    assert schema_cache.foreign_key_edges_by_parent == {"users": (edge,)}
+    assert schema_cache.foreign_key_edges_by_child == {"orders": (edge,)}
 
 
 def test_load_table_columns_skips_only_internal_log_tables():
@@ -345,9 +393,7 @@ def test_remaining_conflict_checks_current_against_later_remote(tmp_path):
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -412,9 +458,7 @@ def test_remaining_conflict_uses_rolling_control_state_for_later_write_read(tmp_
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -477,9 +521,7 @@ def test_remaining_conflict_uses_current_write_probe_before_suffix(tmp_path):
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -540,9 +582,7 @@ def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_p
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -607,9 +647,7 @@ def test_remaining_conflict_skips_individual_checks_when_aggregate_metadata_is_c
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -660,9 +698,11 @@ def test_remaining_metadata_index_decrements_removed_transaction(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=str(db_path),
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -704,21 +744,30 @@ def test_context_caches_foreign_key_edges(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=db_path,
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
-        edges = static_analysis.foreign_key_edges(context)
+        edges = cascade_metadata.foreign_key_edges(context)
+        by_parent = cascade_metadata.foreign_key_edges_by_parent(context)
+        by_child = cascade_metadata.foreign_key_edges_by_child(context)
 
-        assert ForeignKeyEdge(
+        edge = ForeignKeyEdge(
             child_table="orders",
             child_columns=("user_id",),
             parent_table="users",
             parent_columns=("id",),
             on_update="NO ACTION",
             on_delete="NO ACTION",
-        ) in edges
-        assert static_analysis.foreign_key_edges(context) is edges
+        )
+        assert edge in edges
+        assert by_parent == {"users": (edge,)}
+        assert by_child == {"orders": (edge,)}
+        assert cascade_metadata.foreign_key_edges(context) is edges
+        assert cascade_metadata.foreign_key_edges_by_parent(context) is by_parent
+        assert cascade_metadata.foreign_key_edges_by_child(context) is by_child
 
 
 def test_foreign_key_edges_include_actions_and_composite_columns(tmp_path):
@@ -753,12 +802,14 @@ def test_foreign_key_edges_include_actions_and_composite_columns(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=db_path,
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
 
-        edges = static_analysis.foreign_key_edges(context)
+        edges = cascade_metadata.foreign_key_edges(context)
 
     assert edges == (
         ForeignKeyEdge(
@@ -782,9 +833,11 @@ def test_remaining_metadata_index_does_not_cache_schema_constraints(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=db_path,
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         remaining = txs([
             log_merge.make_logged_statement(
@@ -842,9 +895,11 @@ def test_remaining_individual_check_kinds_reports_write_read_only(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=str(db_path),
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(context, remaining)
 
@@ -887,9 +942,11 @@ def test_remaining_individual_check_kinds_reports_write_write_only(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=str(db_path),
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(context, remaining)
 
@@ -898,6 +955,70 @@ def test_remaining_individual_check_kinds_reports_write_write_only(tmp_path):
             current,
             index,
         ) == {"write_write"}
+
+
+def test_remaining_individual_check_kinds_counts_cascade_hidden_writes(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        con.execute(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT
+            )
+            """
+        )
+        create_log_tables(con)
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(db_path)
+    )
+    with closing(sqlite3.connect(db_path)) as con:
+        context = log_merge.ConflictCheckContext(
+            base_cursor=con.cursor(),
+            base_db_path=str(db_path),
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
+        )
+        current = txs([
+            log_merge.make_logged_statement(
+                branch="ours",
+                branch_index=0,
+                transaction_id=1,
+                committed_at="2026-01-01T00:00:00",
+                sql_text="DELETE FROM users WHERE id = 1",
+                table_columns=table_columns,
+                metadata_context=context,
+            )
+        ])[0]
+        remaining = txs([
+            log_merge.make_logged_statement(
+                branch="theirs",
+                branch_index=0,
+                transaction_id=2,
+                committed_at="2026-01-01T00:00:00",
+                sql_text="UPDATE orders SET status = 'remote' WHERE id = 1",
+                table_columns=table_columns,
+                metadata_context=context,
+            )
+        ])
+        index = remaining_metadata.RemainingMetadataIndex.from_transactions(
+            context,
+            remaining,
+        )
+
+        assert remaining_metadata.remaining_individual_check_kinds(
+            context,
+            current,
+            index,
+        ) == {"write_write", "write_read"}
 
 
 def test_remaining_individual_check_kinds_reports_integrity_only(tmp_path):
@@ -934,9 +1055,11 @@ def test_remaining_individual_check_kinds_reports_integrity_only(tmp_path):
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=str(db_path),
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(context, remaining)
 
@@ -984,9 +1107,11 @@ def test_remaining_individual_check_kinds_does_not_scan_for_current_or_ignore_on
         context = log_merge.ConflictCheckContext(
             base_cursor=con.cursor(),
             base_db_path=str(db_path),
-            table_columns=table_columns,
-            primary_key_columns=primary_key_columns,
-            key_column_sets=key_column_sets,
+            schema_cache=schema_cache(
+                table_columns,
+                primary_key_columns,
+                key_column_sets,
+            ),
         )
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -1034,9 +1159,7 @@ def test_remaining_conflict_reports_constraint_resolution_during_integrity_scan(
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -1080,9 +1203,7 @@ def test_apply_accepted_transaction_advances_live_context(tmp_path):
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         error = accepted_replay.apply_accepted_transaction(
             context,
@@ -1147,9 +1268,7 @@ def test_remaining_conflict_reports_later_remote_integrity_conflict(tmp_path):
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
             context,
@@ -1194,9 +1313,7 @@ def test_apply_accepted_transaction_preserves_transaction_log_boundaries(tmp_pat
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         error = accepted_replay.apply_accepted_transaction(context, transaction)
         rows = context.base_cursor.connection.execute(
@@ -1241,9 +1358,7 @@ def test_apply_accepted_transaction_keeps_same_id_branch_transactions_separate(t
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         errors = [
             accepted_replay.apply_accepted_transaction(context, txs([statement])[0])
@@ -1287,9 +1402,7 @@ def test_apply_accepted_transaction_rolls_back_failed_transaction_group(tmp_path
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         error = accepted_replay.apply_accepted_transaction(context, transaction)
         users = context.base_cursor.connection.execute("SELECT * FROM users").fetchall()
@@ -1343,9 +1456,7 @@ def test_apply_accepted_transaction_reports_deferred_foreign_key_failure(tmp_pat
 
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         first_error = accepted_replay.apply_accepted_transaction(
             context,
@@ -1417,9 +1528,7 @@ def test_current_unsafe_replay_statement_is_resolved_before_pair_scan(
     remaining_theirs = deque()
     with control_db._open_merge_working_context(
         db_path,
-        table_columns,
-        primary_key_columns,
-        key_column_sets,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
     ) as context:
         metadata_indexes: terminal_mergetool.MetadataIndexes = {
             "ours": remaining_metadata.RemainingMetadataIndex.from_transactions(
@@ -1437,7 +1546,6 @@ def test_current_unsafe_replay_statement_is_resolved_before_pair_scan(
             remaining_theirs,
             metadata_indexes,
             context,
-            table_columns,
         )
 
     assert accepted

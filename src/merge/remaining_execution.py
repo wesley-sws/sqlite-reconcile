@@ -13,6 +13,7 @@ from .accepted_replay import (
     _execute_transaction_on_control,
     _replay_failure_conflict,
 )
+from .conflict_kinds import kind_enabled
 from .execution_based_analysis import (
     SQLiteReplayFailure,
     WriteReadProbeResult,
@@ -106,7 +107,7 @@ class OrderedRemainingExecutionScanner:
         self.context.base_cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             result = static_result
-            if _kind_enabled(self.enabled_kinds, "write_write"):
+            if kind_enabled(self.enabled_kinds, "write_write"):
                 result = self._check_write_write(
                     ours_transaction,
                     theirs_transaction,
@@ -116,7 +117,7 @@ class OrderedRemainingExecutionScanner:
                     rollback_savepoint(self.context.base_cursor, savepoint)
                     return result
 
-            if _kind_enabled(self.enabled_kinds, "write_read"):
+            if kind_enabled(self.enabled_kinds, "write_read"):
                 result = self._check_write_read(other_transaction, result)
                 if result.has_kind("write_read"):
                     rollback_savepoint(self.context.base_cursor, savepoint)
@@ -136,7 +137,7 @@ class OrderedRemainingExecutionScanner:
                 ),
                 scope="pair",
                 check_constraint_resolution=(
-                    _kind_enabled(self.enabled_kinds, "integrity")
+                    kind_enabled(self.enabled_kinds, "integrity")
                 ),
             )
             if advance_result.has_conflict:
@@ -200,8 +201,11 @@ class OrderedRemainingExecutionScanner:
 
         if not result.has_kind("write_write"):
             return result
+        if _has_cascade_metadata_conflict(result, "write_write"):
+            return result
 
         candidate_pairs = write_write_candidate_pairs(
+            self.context,
             ours_transaction.metadata,
             theirs_transaction.metadata,
         )
@@ -269,12 +273,13 @@ class OrderedRemainingExecutionScanner:
                 or is_delete_statement(statement.metadata)
             ):
                 target_table = statement.metadata.table_updated
+                assert target_table is not None
                 temp_table = _statement_write_probe_table(
                     self.context,
                     statement,
                     use_control=True,
                 )
-                if target_table is not None and temp_table is not None:
+                if temp_table is not None:
                     self._current_write_probe_tables.setdefault(
                         target_table,
                         {},
@@ -298,6 +303,8 @@ class OrderedRemainingExecutionScanner:
         """Use main/control read probes for current -> opposite read conflicts."""
 
         if not result.has_kind("write_read"):
+            return result
+        if _has_cascade_metadata_conflict(result, "write_read"):
             return result
 
         check = _rolling_write_read_dependency(
@@ -323,14 +330,16 @@ class OrderedRemainingExecutionScanner:
             ),
         )
 
-
-def _kind_enabled(
-    enabled_kinds: Collection[ConflictKind] | None,
+def _has_cascade_metadata_conflict(
+    result: ConflictCheckResult,
     kind: ConflictKind,
 ) -> bool:
-    """Return whether an execution conflict kind should be checked."""
+    """Return whether a static conflict depends on cascade-derived metadata."""
 
-    return enabled_kinds is None or kind in enabled_kinds
+    return any(
+        ("metadata_source", "cascade") in conflict.details
+        for conflict in result.of_kind(kind)
+    )
 
 
 def _statement_write_probe_table(
@@ -427,8 +436,7 @@ def _find_write_write_overlap(
             )
             if matching_pairs:
                 target_table = statement.metadata.table_updated
-                if target_table is None:
-                    return "not_refined"
+                assert target_table is not None
 
                 current_probe_tables = current_write_probe_tables.get(target_table)
                 if current_probe_tables is None:
@@ -566,6 +574,7 @@ def _rolling_write_read_dependency(
 
     indexes = set(
         write_read_candidate_indexes(
+            context,
             writer_transaction.metadata,
             reader_transaction.metadata,
         )

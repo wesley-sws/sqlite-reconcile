@@ -7,19 +7,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .cascade_types import ForeignKeyEdgeMap, ForeignKeyEdges
 from .sql_metadata import StatementMetadata, TransactionMetadata
 from .utils import TableColumns, TableKeyColumnSets, TablePrimaryKeyColumns
 
 BranchName = Literal["ours", "theirs"]
 ConflictScope = Literal["pair", "ours", "theirs", "both"]
-ForeignKeyAction = Literal[
-    "NO ACTION",
-    "RESTRICT",
-    "CASCADE",
-    "SET NULL",
-    "SET DEFAULT",
-]
-ForeignKeyEdges = tuple["ForeignKeyEdge", ...]
 ConflictKind = Literal[
     "write_write",
     "write_read",
@@ -28,17 +21,6 @@ ConflictKind = Literal[
     "constraint_resolution",
     "replay_error",
 ]
-
-
-@dataclass(frozen=True)
-class ForeignKeyEdge:
-    child_table: str
-    child_columns: tuple[str, ...]
-    parent_table: str
-    parent_columns: tuple[str, ...]
-    on_update: ForeignKeyAction
-    on_delete: ForeignKeyAction
-
 
 @dataclass(frozen=True)
 class LoggedStatement:
@@ -105,17 +87,36 @@ class ConflictPair:
         return self.other_index
 
 
-@dataclass(frozen=True)
-class ConflictCheckContext:
-    base_cursor: sqlite3.Cursor
-    base_db_path: str | Path
-    table_columns: TableColumns
+@dataclass
+class SchemaCache:
+    table_columns: TableColumns = field(default_factory=dict)
     primary_key_columns: TablePrimaryKeyColumns = field(default_factory=dict)
     key_column_sets: TableKeyColumnSets = field(default_factory=dict)
     integer_primary_key_columns: dict[str, str | None] = field(default_factory=dict)
-    foreign_key_edges_cache: dict[str, ForeignKeyEdges] = field(default_factory=dict)
+    foreign_key_edges: ForeignKeyEdges | None = None
+    foreign_key_edges_by_parent: ForeignKeyEdgeMap | None = None
+    foreign_key_edges_by_child: ForeignKeyEdgeMap | None = None
+
+
+@dataclass
+class ConflictCheckContext:
+    base_cursor: sqlite3.Cursor
+    base_db_path: str | Path
+    schema_cache: SchemaCache
     control_schema: str | None = None
     control_sql_rewriter: Callable[[str | LoggedStatement], str | None] | None = None
+
+    @property
+    def table_columns(self) -> TableColumns:
+        return self.schema_cache.table_columns
+
+    @property
+    def primary_key_columns(self) -> TablePrimaryKeyColumns:
+        return self.schema_cache.primary_key_columns
+
+    @property
+    def key_column_sets(self) -> TableKeyColumnSets:
+        return self.schema_cache.key_column_sets
 
 
 @dataclass(frozen=True)
