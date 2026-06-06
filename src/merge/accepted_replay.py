@@ -446,7 +446,19 @@ def _control_sql_for(
 
     if context.control_sql_rewriter is None:
         return None
-    return context.control_sql_rewriter(sql)
+
+    cache_key = _control_sql_cache_key(sql)
+    if cache_key not in context.control_sql_cache:
+        context.control_sql_cache[cache_key] = context.control_sql_rewriter(sql)
+    return context.control_sql_cache[cache_key]
+
+
+def _control_sql_cache_key(sql: str | LoggedStatement) -> tuple[str, str]:
+    """Return a per-context cache key for control-database SQL rewrites."""
+
+    if isinstance(sql, LoggedStatement):
+        return ("statement", str(id(sql)))
+    return ("sql", sql)
 
 
 def _clean_control_conflict(

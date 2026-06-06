@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-import tempfile
+import uuid
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -42,7 +42,7 @@ def clean_control_schema_references(message: str, schema: str | None) -> str:
 def _load_working_base_copy(base_path: Path) -> sqlite3.Connection:
     """Return an open in-memory copy of base; the caller must close it."""
 
-    working_conn = sqlite3.connect(":memory:")
+    working_conn = sqlite3.connect(":memory:", uri=True)
     try:
         with closing(sqlite3.connect(base_path)) as base_conn:
             base_conn.backup(working_conn)
@@ -59,24 +59,20 @@ def _open_merge_working_connection(base_path: Path) -> Iterator[sqlite3.Connecti
     """Open the mutable base copy with one attached control copy."""
 
     working_conn = _load_working_base_copy(base_path)
-    control_path: Path | None = None
+    control_conn: sqlite3.Connection | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            prefix="sqlite_merge_control_",
-            suffix=".db",
-            delete=False,
-        ) as control_file:
-            control_path = Path(control_file.name)
-
-        with (
-            closing(sqlite3.connect(base_path)) as base_conn,
-            closing(sqlite3.connect(control_path)) as control_conn,
-        ):
+        # SQLite supports named in-memory databases via URI filenames. Keep a
+        # connection open so the attached control DB survives for this context.
+        control_uri = (
+            f"file:sqlite_merge_control_{uuid.uuid4().hex}?mode=memory&cache=shared"
+        )
+        control_conn = sqlite3.connect(control_uri, uri=True)
+        with closing(sqlite3.connect(base_path)) as base_conn:
             base_conn.backup(control_conn)
 
         working_conn.execute(
             f"ATTACH DATABASE ? AS {CONTROL_DB_SCHEMA}",
-            (str(control_path),),
+            (control_uri,),
         )
         yield working_conn
     finally:
@@ -85,8 +81,8 @@ def _open_merge_working_connection(base_path: Path) -> Iterator[sqlite3.Connecti
         except sqlite3.Error:
             pass
         working_conn.close()
-        if control_path is not None:
-            control_path.unlink(missing_ok=True)
+        if control_conn is not None:
+            control_conn.close()
 
 
 def _rewrite_sql_for_control_db(

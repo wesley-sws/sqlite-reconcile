@@ -3,6 +3,10 @@ venv/
 temp/
 *__pycache__
 tools/
+!tools/
+tools/*
+!tools/run_evaluation.py
 *.json
+!evaluation/results/*.json
 *.db
 .DS_Store

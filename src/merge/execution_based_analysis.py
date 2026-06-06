@@ -129,7 +129,13 @@ def _affected_primary_key_select(
 ) -> str | None:
     """Build a SELECT returning primary keys affected by UPDATE/DELETE."""
 
-    return _target_row_select(context, metadata)
+    cache_key = id(metadata)
+    if cache_key not in context.affected_pk_probe_cache:
+        context.affected_pk_probe_cache[cache_key] = _target_row_select(
+            context,
+            metadata,
+        )
+    return context.affected_pk_probe_cache[cache_key]
 
 
 def _target_row_select(
@@ -204,14 +210,51 @@ def _read_probe_result(
 ) -> ReadProbeResult:
     """Build a read probe, or report that no probe is needed/supported."""
 
+    cache_key = id(metadata)
+    cached = context.read_probe_result_cache.get(cache_key)
+    if cached is not None:
+        status, sql, reason = cached
+        return ReadProbeResult(status, sql, reason)
+
     expression = metadata.parsed_sql_text
     if isinstance(expression, exp.Update):
-        return _probe_result(_update_read_probe_select(context, metadata))
+        return _cache_read_probe_result(
+            context,
+            metadata,
+            _probe_result(_update_read_probe_select(context, metadata)),
+        )
     if isinstance(expression, exp.Delete):
-        return _probe_result(_affected_primary_key_select(context, metadata))
+        return _cache_read_probe_result(
+            context,
+            metadata,
+            _probe_result(_affected_primary_key_select(context, metadata)),
+        )
     if isinstance(expression, exp.Insert):
-        return _insert_probe_select(context, expression)
-    return ReadProbeResult("not_refined", reason="reader statement has no supported probe")
+        return _cache_read_probe_result(
+            context,
+            metadata,
+            _insert_probe_select(context, expression),
+        )
+    return _cache_read_probe_result(
+        context,
+        metadata,
+        ReadProbeResult("not_refined", reason="reader statement has no supported probe"),
+    )
+
+
+def _cache_read_probe_result(
+    context: ConflictCheckContext,
+    metadata: StatementMetadata,
+    result: ReadProbeResult,
+) -> ReadProbeResult:
+    """Remember generated read probe SQL for this merge context."""
+
+    context.read_probe_result_cache[id(metadata)] = (
+        result.status,
+        result.sql,
+        result.reason,
+    )
+    return result
 
 
 def _probe_result(sql: str | None) -> ReadProbeResult:

@@ -13,6 +13,7 @@ from .utils import TableColumns, TableKeyColumnSets, TablePrimaryKeyColumns
 
 BranchName = Literal["ours", "theirs"]
 ConflictScope = Literal["pair", "ours", "theirs", "both"]
+ReadProbeCacheStatus = Literal["ok", "no_read_dependency", "not_refined"]
 ConflictKind = Literal[
     "write_write",
     "write_read",
@@ -105,6 +106,12 @@ class ConflictCheckContext:
     schema_cache: SchemaCache
     control_schema: str | None = None
     control_sql_rewriter: Callable[[str | LoggedStatement], str | None] | None = None
+    affected_pk_probe_cache: dict[int, str | None] = field(default_factory=dict)
+    read_probe_result_cache: dict[
+        int,
+        tuple[ReadProbeCacheStatus, str | None, str | None],
+    ] = field(default_factory=dict)
+    control_sql_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
 
     @property
     def table_columns(self) -> TableColumns:
