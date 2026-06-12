@@ -6,6 +6,8 @@ applications execute writes through a small SQLite wrapper. The wrapper logs
 committed SQL transactions, and the terminal mergetool later uses those logs to
 replay, check, and resolve changes from two Git branches.
 
+This project was developed as part of a university final-year project.
+
 ## Setup
 
 Run setup from the project root:
@@ -243,3 +245,7 @@ the SQLite conflict-resolution compatibility helpers in
 and maintenance tasks such as updating this README and setup script. These parts
 remain part of the submitted implementation and are covered by the same tests and
 evaluation checks as the rest of the project.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
