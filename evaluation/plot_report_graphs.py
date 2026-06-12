@@ -181,8 +181,8 @@ def main():
         metric="probe_refinement",
         title="Probe-Based Refinement Time vs Scale Parameter",
         ylabel="Probe refinement time (ms)",
-        ylim=(0.01, 250),
-        yticks=[0.01, 0.1, 1, 10, 100],
+        ylim=(0.09, 250),
+        yticks=[0.1, 1, 10, 100],
         stem="graph_probe_refinement",
     )
 
@@ -191,8 +191,8 @@ def main():
         metric="pair_check_pipeline",
         title="Pair-Check Pipeline Time vs Scale Parameter",
         ylabel="Pair-check pipeline time (ms)",
-        ylim=(0.9, 600),
-        yticks=[1, 10, 100, 500],
+        ylim=(0.45, 600),
+        yticks=[0.5, 1, 10, 100, 500],
         stem="graph_pair_check_pipeline",
     )
 

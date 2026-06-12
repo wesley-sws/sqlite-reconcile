@@ -231,7 +231,6 @@ def _measure_statement_pair_case(
 
 def _statement_pairs(row_count: int) -> tuple[StatementPair, ...]:
     current_range = f"id BETWEEN 1 AND {row_count}"
-    other_range = f"id BETWEEN {row_count + 1} AND {row_count * 2}"
     return (
         StatementPair(
             name="simple_write_write",
@@ -243,7 +242,7 @@ def _statement_pairs(row_count: int) -> tuple[StatementPair, ...]:
             other_sql=(
                 "UPDATE items "
                 "SET value = value + 1 "
-                f"WHERE {other_range}"
+                f"WHERE {current_range}"
             ),
             static_kinds=("write_write",),
         ),
