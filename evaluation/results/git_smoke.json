@@ -1,0 +1,8 @@
+{
+  "status": "pass",
+  "final_name": "Alice Remote",
+  "git_status": "M  app.db",
+  "merge_output_excerpt": "warning: Cannot merge binary files: app.db (HEAD vs. remote)\nAuto-merging app.db\nCONFLICT (content): Merge conflict in app.db\nAutomatic merge failed; fix conflicts and then commit the result.",
+  "mergetool_output_excerpt": "  L1.1:\n    UPDATE users SET name = 'Alice Local' WHERE id = 1\nRemote transaction R1:\n  R1.1:\n    UPDATE users SET name = 'Alice Remote' WHERE id = 1\nA = local transaction L1\nB = remote transaction R1\nPress Enter to accept this reviewable conflict and keep checking.\nCommands: edit <statement>; delete <statement>; delete <transaction>;\n          insert before <statement>; insert after <statement>;\nExamples: edit L1.1;, delete L1.1;, delete L1;, insert after L1.1;\nResolution: Resolved SQLite merge written to app.db",
+  "temp_repo": "removed after run; pass --keep-smoke-repo to keep it"
+}

@@ -83,20 +83,6 @@ configure_attributes() {
     echo "ok: SQLite database files are marked binary in .gitattributes"
 }
 
-clear_legacy_merge_driver_config() {
-    # Older versions of this project configured a row-level Git merge driver.
-    # The current implementation is a terminal mergetool, so remove stale local
-    # driver keys from this checkout to avoid accidentally testing the old path.
-    for key in \
-        merge.sqlite.name \
-        merge.sqlite.driver \
-        merge.sqlite-reconcile.name \
-        merge.sqlite-reconcile.driver
-    do
-        git config --unset-all "$key" >/dev/null 2>&1 || true
-    done
-}
-
 configure_git_mergetool() {
     chmod +x "$REPO_ROOT/src/sqlite-reconcile" "$MERGETOOL_ENTRY"
 
@@ -117,7 +103,6 @@ require_python
 ensure_venv
 check_python_sqlite
 configure_attributes
-clear_legacy_merge_driver_config
 configure_git_mergetool
 
 echo

@@ -1,12 +1,19 @@
-# Virtual environment
+# Python / virtual environment
 venv/
 temp/
-*__pycache__
-tools/
-!tools/
-tools/*
-!tools/run_evaluation.py
+__pycache__/
+*__pycache__/
+
+# Local SQLite databases
+*.db
+
+# Generated JSON outside tracked evaluation results
 *.json
 !evaluation/results/*.json
-*.db
+
+# Local tool/vendor scratch directories
+tools/bin/
+tools/git-sqlite-src/
+
+# macOS
 .DS_Store

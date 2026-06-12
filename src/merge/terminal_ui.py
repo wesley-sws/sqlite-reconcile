@@ -519,8 +519,6 @@ def _prompt_pair_transaction_resolution(
     print(_conflict_messages(conflict))
     _print_statement_group(ours_label, ours_transaction.statements)
     _print_statement_group(theirs_label, theirs_transaction.statements)
-    print(f"A = local transaction {ours_label}")
-    print(f"B = remote transaction {theirs_label}")
 
     while True:
         editable_labels = list(_statement_lookup(resolved_labels))

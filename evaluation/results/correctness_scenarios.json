@@ -1,0 +1,99 @@
+[
+  {
+    "scenario": "Clean non-overlapping transactions",
+    "expected": "The fixed-order merge applies both branch heads without prompting.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_terminal_mergetool.py::test_check_accept_current_applies_and_pops_fixed_order_heads"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Write-write conflict",
+    "expected": "Overlapping updates/deletes are reported as write-write conflicts.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_static_analysis.py::test_static_analysis_flags_update_same_column_write_write",
+      "tests/merge/test_log_merge.py::test_remaining_conflict_uses_current_write_probe_before_suffix"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Write-read conflict",
+    "expected": "A later statement reading values changed by the current transaction is reported.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_static_analysis.py::test_static_analysis_flags_write_read",
+      "tests/merge/test_log_merge.py::test_remaining_conflict_uses_rolling_control_state_for_later_write_read"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Integrity conflict",
+    "expected": "Constraint failures that only appear after branch replay are reported.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_log_merge.py::test_remaining_conflict_reports_later_remote_integrity_conflict"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Branch-local replay problem",
+    "expected": "Unsafe or failing branch-local transactions are resolved before pair scanning.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_log_merge.py::test_current_unsafe_replay_statement_is_resolved_before_pair_scan",
+      "tests/merge/test_terminal_mergetool.py::test_branch_replay_safety_can_accept_nondeterministic_warning"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "OR IGNORE / OR REPLACE reviewable conflict",
+    "expected": "Strict replay reports conflict-resolution behavior without hard-failing original SQL.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_log_merge.py::test_remaining_conflict_reports_constraint_resolution_during_integrity_scan",
+      "tests/merge/test_log_merge.py::test_remaining_conflict_suppresses_already_active_constraint_resolution"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Omitted INTEGER PRIMARY KEY",
+    "expected": "Implicit rowid assignment is reported as a direct conflict.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_static_analysis.py::test_static_analysis_implicit_key_insert_conflicts_with_other_implicit_insert",
+      "tests/merge/test_static_analysis.py::test_static_analysis_implicit_key_insert_conflicts_with_key_update"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "UPDATE FROM duplicate source rows",
+    "expected": "Duplicate source-row ambiguity is warned about and not used to clear conflicts.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_terminal_mergetool.py::test_branch_replay_safety_warns_for_update_from_duplicates"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Foreign-key cascade static metadata",
+    "expected": "Cascade-hidden reads/writes are included in static metadata and filters.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_static_analysis.py::test_cascade_metadata_is_stored_on_statement_and_transaction_metadata",
+      "tests/merge/test_static_analysis.py::test_static_analysis_flags_cascade_write_read_overlap"
+    ],
+    "status": "pass"
+  },
+  {
+    "scenario": "Logged SQL parse/rewrite limitation",
+    "expected": "Unparseable logged SQL or limited rewrites are handled conservatively.",
+    "actual": "Selected tests passed.",
+    "evidence": [
+      "tests/merge/test_log_merge.py::test_make_logged_statement_marks_unparseable_sql_unsafe",
+      "tests/merge/test_terminal_mergetool.py::test_control_rewrite_uses_strict_insert_for_upsert_statement_metadata"
+    ],
+    "status": "pass"
+  }
+]

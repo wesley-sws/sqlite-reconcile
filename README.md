@@ -1,14 +1,10 @@
 # sqlite-reconcile
 
-`sqlite-reconcile` is an experimental Git mergetool for SQLite database files.
-Instead of diffing raw database pages, applications execute writes through a
-small SQLite wrapper. The wrapper logs committed SQL transactions, and the
-terminal mergetool later uses those logs to replay, check, and resolve changes
-from two Git branches.
-
-The current implementation is transaction-log based. The older row-diff merge
-driver code under `src/row_merge/` is kept for reference, but it is not the
-main merge path.
+`sqlite-reconcile` is an experimental Git mergetool for transaction-level
+merging of SQLite database files. Instead of diffing raw database pages,
+applications execute writes through a small SQLite wrapper. The wrapper logs
+committed SQL transactions, and the terminal mergetool later uses those logs to
+replay, check, and resolve changes from two Git branches.
 
 ## Setup
 
@@ -37,6 +33,10 @@ The setup script intentionally configures a **Git mergetool**, not a merge
 driver. Git first detects the SQLite file as conflicted, then the user invokes
 the mergetool to resolve it. The tool is not made the default mergetool, because
 Git does not choose mergetools by file extension.
+
+The setup script configures Git for the repository where it is run. To use
+`sqlite-reconcile` from another repository, configure that repository to point at
+this checkout as shown in the usage section below.
 
 ## Required Logging Model
 
@@ -226,14 +226,20 @@ Useful entry points:
 
 ## Use of AI Assistance
 
-AI assistance was used as part of the development workflow. The main merge
-model, correctness tradeoffs, and report argument were developed through
-iterative human review: AI suggestions were inspected, revised, tested, and
-often rejected or simplified before being kept.
+Generative AI tools, including ChatGPT-5 and Codex by OpenAI, were used during
+development as interactive assistants for design discussion, debugging,
+implementation suggestions, code review, test-case ideas, synthetic evaluation
+workload ideas, and documentation support.
 
-AI was used more heavily for syntax-heavy and repetitive work, especially the
-SQLite conflict-resolution compatibility helpers in
-`src/sqlite_conflict_resolution.py`, additional test generation, and maintenance
-tasks such as updating this README and setup script. These areas were still
-reviewed and checked against the project behavior rather than treated as
-authoritative output.
+AI outputs were not treated as authoritative. Code suggestions were integrated
+iteratively and checked through the project test suite, manual inspection of key
+paths, and comparison with expected behaviour. Evaluation results reported for the
+project were produced by running the implementation and evaluation scripts, not by
+AI-generated values.
+
+AI support was used more heavily for syntax-heavy and repetitive work, especially
+the SQLite conflict-resolution compatibility helpers in
+`src/sqlite_conflict_resolution.py`, test scaffolding, evaluation-support scripts,
+and maintenance tasks such as updating this README and setup script. These parts
+remain part of the submitted implementation and are covered by the same tests and
+evaluation checks as the rest of the project.
