@@ -42,6 +42,8 @@ def static_analysis_matching(
     *,
     enabled_kinds: Collection[ConflictKind] | None = None,
     current_branch: BranchName | None = None,
+    ours_label: str | None = None,
+    theirs_label: str | None = None,
 ) -> ConflictCheckResult:
     """Return table/column conflicts, optionally ordered from current to other."""
 
@@ -84,9 +86,11 @@ def static_analysis_matching(
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
-                    message=(
-                        "ours transaction writes columns read by "
-                        "theirs transaction"
+                    message=_write_read_message(
+                        "ours",
+                        "theirs",
+                        ours_label=ours_label,
+                        theirs_label=theirs_label,
                     ),
                     details=_write_read_details(
                         "ours",
@@ -107,9 +111,11 @@ def static_analysis_matching(
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
-                    message=(
-                        "theirs transaction writes columns read by "
-                        "ours transaction"
+                    message=_write_read_message(
+                        "theirs",
+                        "ours",
+                        ours_label=ours_label,
+                        theirs_label=theirs_label,
                     ),
                     details=_write_read_details(
                         "theirs",
@@ -119,6 +125,34 @@ def static_analysis_matching(
                 )
             )
     return result
+
+
+def _write_read_message(
+    writer: BranchName,
+    reader: BranchName,
+    *,
+    ours_label: str | None,
+    theirs_label: str | None,
+) -> str:
+    """Return a write/read message, using transaction labels when available."""
+
+    return (
+        f"{_branch_display_label(writer, ours_label, theirs_label)} writes columns "
+        f"read by {_branch_display_label(reader, ours_label, theirs_label)}"
+    )
+
+
+def _branch_display_label(
+    branch: BranchName,
+    ours_label: str | None,
+    theirs_label: str | None,
+) -> str:
+    """Return a display label for a branch in static conflict messages."""
+
+    if branch == "ours":
+        return ours_label or "local transaction"
+    return theirs_label or "remote transaction"
+
 
 def _cascade_conflict_details(
     has_cascade: bool,

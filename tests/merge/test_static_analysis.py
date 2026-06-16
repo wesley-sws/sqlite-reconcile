@@ -55,12 +55,22 @@ def conflict_kinds(result):
     return [conflict.kind for conflict in result.conflicts]
 
 
-def static_match(context, ours, theirs, *, current_branch=None):
+def static_match(
+    context,
+    ours,
+    theirs,
+    *,
+    current_branch=None,
+    ours_label=None,
+    theirs_label=None,
+):
     return static_analysis.static_analysis_matching(
         context,
         log_merge.group_logged_transactions([ours])[0].metadata,
         log_merge.group_logged_transactions([theirs])[0].metadata,
         current_branch=current_branch,
+        ours_label=ours_label,
+        theirs_label=theirs_label,
     )
 
 
@@ -421,6 +431,9 @@ def test_static_analysis_flags_write_read():
     result = static_match(context, ours, theirs)
 
     assert conflict_kinds(result) == ["write_read"]
+    assert result.conflicts[0].message == (
+        "local transaction writes columns read by remote transaction"
+    )
     assert result.conflicts[0].details == (("writer", "ours"), ("reader", "theirs"))
 
 
@@ -443,18 +456,33 @@ def test_static_analysis_can_limit_write_read_to_one_direction():
     both = static_match(context, ours, theirs)
     ours_current = static_match(context, ours, theirs, current_branch="ours")
     theirs_current = static_match(context, ours, theirs, current_branch="theirs")
+    labelled = static_match(
+        context,
+        ours,
+        theirs,
+        current_branch="theirs",
+        ours_label="L4",
+        theirs_label="R3",
+    )
 
     assert conflict_kinds(both) == ["write_read", "write_read"]
     assert conflict_kinds(ours_current) == ["write_read"]
+    assert ours_current.conflicts[-1].message == (
+        "local transaction writes columns read by remote transaction"
+    )
     assert ours_current.conflicts[-1].details == (
         ("writer", "ours"),
         ("reader", "theirs"),
     )
     assert conflict_kinds(theirs_current) == ["write_read"]
+    assert theirs_current.conflicts[-1].message == (
+        "remote transaction writes columns read by local transaction"
+    )
     assert theirs_current.conflicts[-1].details == (
         ("writer", "theirs"),
         ("reader", "ours"),
     )
+    assert labelled.conflicts[-1].message == "R3 writes columns read by L4"
 
 
 def test_static_analysis_treats_insert_as_writing_all_columns_for_write_read():

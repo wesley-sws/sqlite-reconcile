@@ -174,7 +174,7 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
         ),
         is_standalone=True,
     )
-    responses = iter(["edit L1.1;"])
+    responses = iter(["edit L1.1;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -198,7 +198,7 @@ def test_prompt_standalone_warning_uses_transaction_editor(monkeypatch):
     )
 
 
-def test_prompt_standalone_warning_returns_immediately_after_edit(monkeypatch):
+def test_prompt_standalone_warning_returns_after_edit_and_enter(monkeypatch):
     table_columns = {"audit_events": {"id", "token"}}
     statement = log_merge.make_logged_statement(
         branch="ours",
@@ -225,7 +225,7 @@ def test_prompt_standalone_warning_returns_immediately_after_edit(monkeypatch):
         ),
         is_standalone=True,
     )
-    responses = iter(["edit L1.1;"])
+    responses = iter(["edit L1.1;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -258,7 +258,7 @@ def test_transaction_resolution_rechecks_replay_safety_for_edited_sql(monkeypatc
         sql_text="UPDATE audit_events SET token = 'fixed' WHERE id = 1",
         table_columns={"audit_events": {"id", "token"}},
     )
-    responses = iter(["edit L1.1;"])
+    responses = iter(["edit L1.1;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
     monkeypatch.setattr(
         terminal_ui,
@@ -371,7 +371,7 @@ def test_prompt_standalone_transaction_resolution_edits_recorded_statement_in_tr
         "_edit_sql_in_editor",
         lambda label, sql: "INSERT INTO coupons (id, code) VALUES (2, 'FIXED')",
     )
-    responses = iter(["edit R1.2;"])
+    responses = iter(["edit R1.2;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     with closing(replay_conn()) as con:
@@ -461,7 +461,8 @@ def test_prompt_pair_transaction_resolution_can_delete_whole_transaction(
             ),
         ),
     )
-    monkeypatch.setattr("builtins.input", lambda _: "delete L1;")
+    responses = iter(["delete L1;", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     with closing(replay_conn()) as con:
         resolution = terminal_ui._prompt_pair_transaction_resolution(
@@ -513,7 +514,7 @@ def test_pair_resolution_uses_transaction_labels_not_branch_aliases(
             ),
         ),
     )
-    responses = iter(["delete A;", "delete L1;"])
+    responses = iter(["delete A;", "delete L1;", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(responses))
 
     with closing(replay_conn()) as con:
@@ -532,6 +533,58 @@ def test_pair_resolution_uses_transaction_labels_not_branch_aliases(
     assert resolution.action == "replace"
     assert resolution.ours is None
     assert resolution.theirs == theirs[0]
+
+
+def test_pair_resolution_prints_current_transaction_first(monkeypatch, capsys):
+    ours = txs([
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE users SET name = 'Alice Local' WHERE id = 1",
+        )
+    ])
+    theirs = txs([
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE users SET name = 'Alice Remote' WHERE id = 1",
+        )
+    ])
+    conflict = ConflictPair(
+        current_branch="theirs",
+        other_index=0,
+        ours_sql="",
+        theirs_sql="",
+        conflicts=(
+            StatementConflict(
+                kind="write_write",
+                message="R1.1 and L1.1 update/delete overlapping rows",
+            ),
+        ),
+    )
+    monkeypatch.setattr("builtins.input", lambda _: ";")
+
+    with closing(replay_conn()) as con:
+        terminal_ui._prompt_pair_transaction_resolution(
+            conflict,
+            ours,
+            theirs,
+            {"users": {"id", "name"}},
+            con,
+        )
+
+    output = capsys.readouterr().out
+    assert (
+        "Remote transaction R1 and Local transaction L1 conflict:"
+        in output
+    )
+    assert output.index("Remote transaction R1:") < output.index(
+        "Local transaction L1:"
+    )
 
 
 def test_transaction_scoped_statement_labels_for_ui(capsys):

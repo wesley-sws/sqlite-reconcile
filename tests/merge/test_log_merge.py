@@ -14,12 +14,15 @@ from merge import (
     accepted_replay,
     cascade_metadata,
     control_db,
+    execution_based_analysis,
     log_merge,
     remaining_metadata,
     static_analysis,
     terminal_mergetool,
 )
 from merge.cascade_types import ForeignKeyEdge
+from merge.models import LoggedTransaction
+from merge.sql_metadata import transaction_metadata
 from merge.utils import ALL_COLUMNS
 
 
@@ -59,6 +62,61 @@ def init_logged_db(path):
             """
         )
         con.commit()
+
+
+def test_write_read_message_uses_transaction_scoped_statement_label():
+    table_columns = {
+        "users": {"id", "name"},
+        "audit": {"id", "user_id", "message"},
+    }
+    writer_statement = log_merge.make_logged_statement(
+        branch="ours",
+        branch_index=1,
+        transaction_id=10,
+        committed_at="2026-01-01T00:00:00",
+        sql_text="UPDATE users SET name = 'Alice Local' WHERE id = 1",
+        table_columns=table_columns,
+    )
+    reader_statement = log_merge.make_logged_statement(
+        branch="theirs",
+        branch_index=4,
+        transaction_id=20,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "UPDATE audit SET message = "
+            "(SELECT name FROM users WHERE id = 1) WHERE id = 1"
+        ),
+        table_columns=table_columns,
+    )
+    writer_transaction = LoggedTransaction(
+        branch="ours",
+        branch_index=1,
+        transaction_id=10,
+        committed_at="2026-01-01T00:00:00",
+        statements=(writer_statement,),
+        metadata=transaction_metadata((writer_statement.metadata,)),
+    )
+    reader_transaction = LoggedTransaction(
+        branch="theirs",
+        branch_index=3,
+        transaction_id=20,
+        committed_at="2026-01-01T00:00:00",
+        statements=(reader_statement,),
+        metadata=transaction_metadata((reader_statement.metadata,)),
+    )
+    result = execution_based_analysis.WriteReadProbeResult(
+        "affected",
+        affected_reader_indexes=(0,),
+    )
+
+    assert (
+        execution_based_analysis._write_read_conflict_message(
+            writer_transaction,
+            reader_transaction,
+            result,
+        )
+        == "R4.1 reads values affected by L2"
+    )
 
 
 def append_log(
@@ -536,6 +594,59 @@ def test_remaining_conflict_uses_current_write_probe_before_suffix(tmp_path):
         )
 
     assert conflict is None
+
+
+def test_remaining_conflict_labels_static_write_read_with_transaction_labels(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
+        con.execute("INSERT INTO accounts (id, balance) VALUES (1, 100)")
+        con.commit()
+
+    table_columns, primary_key_columns, key_column_sets = (
+        log_merge.load_schema_metadata_from_db(db_path)
+    )
+    local = txs([
+        log_merge.make_logged_statement(
+            branch="ours",
+            branch_index=0,
+            transaction_id=1,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE accounts SET balance = balance + 30 WHERE id = 1",
+            table_columns=table_columns,
+        )
+    ])[0]
+    remote = txs([
+        log_merge.make_logged_statement(
+            branch="theirs",
+            branch_index=0,
+            transaction_id=2,
+            committed_at="2026-01-01T00:00:00",
+            sql_text="UPDATE accounts SET balance = balance + 20 WHERE id = 1",
+            table_columns=table_columns,
+        )
+    ])[0]
+
+    with control_db._open_merge_working_context(
+        db_path,
+        schema_cache(table_columns, primary_key_columns, key_column_sets),
+    ) as context:
+        remaining_index = remaining_metadata.RemainingMetadataIndex.from_transactions(
+            context,
+            [local],
+        )
+        conflict = log_merge._remaining_conflict_for_current(
+            remote,
+            [local],
+            current_branch="theirs",
+            context=context,
+            remaining_other_index=remaining_index,
+        )
+
+    assert conflict is not None
+    messages = [conflict.message for conflict in conflict.conflicts]
+    assert "R1 writes columns read by L1" in messages
+    assert any("L1.1 and R1.1 update/delete overlapping rows" in msg for msg in messages)
 
 
 def test_remaining_conflict_keeps_same_table_current_write_probes_separate(tmp_path):

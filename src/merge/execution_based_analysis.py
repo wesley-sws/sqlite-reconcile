@@ -15,7 +15,6 @@ from .models import (
     LoggedTransaction,
     LoggedStatement,
     StatementConflict,
-    statement_label,
     transaction_label,
 )
 from .sql_metadata import (
@@ -107,7 +106,7 @@ def _write_read_conflict_message(
         for index in result.affected_reader_indexes
     )
     reader_label = (
-        _statement_list_label(reader_statements)
+        _transaction_statement_list_label(reader_transaction, reader_statements)
         if reader_statements
         else transaction_label(reader_transaction)
     )
@@ -117,10 +116,22 @@ def _write_read_conflict_message(
     )
 
 
-def _statement_list_label(statements: Sequence[LoggedStatement]) -> str:
-    """Return comma-separated labels for non-contiguous statement lists."""
+def _transaction_statement_list_label(
+    transaction: LoggedTransaction,
+    statements: Sequence[LoggedStatement],
+) -> str:
+    """Return transaction-scoped statement labels for UI conflict messages."""
 
-    return ", ".join(statement_label(statement) for statement in statements)
+    transaction_prefix = transaction_label(transaction)
+    labels: list[str] = []
+    for statement in statements:
+        try:
+            statement_index = transaction.statements.index(statement) + 1
+        except ValueError:
+            labels.append(transaction_prefix)
+        else:
+            labels.append(f"{transaction_prefix}.{statement_index}")
+    return ", ".join(labels)
 
 
 def _affected_primary_key_select(

@@ -9,6 +9,7 @@ from .models import (
     ConflictCheckResult,
     LoggedTransaction,
     StatementConflict,
+    transaction_label,
 )
 from .remaining_execution import OrderedRemainingExecutionScanner
 from .static_analysis import static_analysis_matching
@@ -138,6 +139,8 @@ class OrderedRemainingConflictScanner:
                 theirs_transaction.metadata,
                 enabled_kinds=self.enabled_kinds,
                 current_branch=self.current_branch,
+                ours_label=transaction_label(ours_transaction),
+                theirs_label=transaction_label(theirs_transaction),
             )
             result = self._scanner.check_next(
                 ours_transaction,
