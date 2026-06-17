@@ -313,41 +313,6 @@ def _savepoint_statement_failure(
         rollback_savepoint(context.base_cursor, savepoint)
 
 
-def _execute_transaction_on_control(
-    context: ConflictCheckContext,
-    transaction: LoggedTransaction,
-    *,
-    scope: ConflictScope,
-    order_label: str,
-) -> SQLiteReplayFailure | None:
-    """Replay a transaction against the attached control database."""
-
-    for statement in transaction.statements:
-        failure = _execute_statement_on_control(
-            context,
-            statement,
-            scope=scope,
-            order_label=order_label,
-            check_deferred_foreign_keys=False,
-        )
-        if failure is not None:
-            return failure
-
-    foreign_key_error = _foreign_key_check_error(
-        context.base_cursor,
-        schema=context.control_schema,
-    )
-    if foreign_key_error is None:
-        return None
-    return SQLiteReplayFailure(
-        kind="integrity",
-        scope=scope,
-        message=foreign_key_error,
-        order_label=order_label,
-        statement=transaction.statements[-1],
-    )
-
-
 def _execute_statement_on_main(
     context: ConflictCheckContext,
     statement: LoggedStatement,
@@ -397,7 +362,27 @@ def _execute_statement_on_control(
         foreign_key_schema=context.control_schema,
         check_deferred_foreign_keys=check_deferred_foreign_keys,
     )
-    return _clean_control_failure(context, failure)
+    failure = _clean_control_failure(context, failure)
+    if (
+        failure is not None
+        and statement.metadata.compatible_sql.stripped_upsert
+        and _is_unique_constraint_failure(failure)
+    ):
+        return replace(
+            failure,
+            message=(
+                "UPSERT is not fully supported for automatic merge "
+                "checking; control replay without ON CONFLICT failed: "
+                f"{failure.message}. Edit or delete the transaction to continue."
+            ),
+        )
+    return failure
+
+
+def _is_unique_constraint_failure(failure: SQLiteReplayFailure) -> bool:
+    """Return whether a strict INSERT failed on the kind of conflict UPSERT handles."""
+
+    return failure.kind == "integrity" and "UNIQUE constraint failed" in failure.message
 
 
 def _execute_sql_for_replay(

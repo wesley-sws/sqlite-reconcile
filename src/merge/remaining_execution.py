@@ -10,7 +10,6 @@ from .accepted_replay import (
     _control_sql_for,
     _execute_statement_on_control,
     _execute_statement_on_main,
-    _execute_transaction_on_control,
     _replay_failure_conflict,
 )
 from .conflict_kinds import kind_enabled

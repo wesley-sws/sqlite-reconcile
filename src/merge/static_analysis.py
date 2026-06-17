@@ -62,9 +62,10 @@ def static_analysis_matching(
         ours_metadata,
         theirs_metadata,
     ):
-        has_cascade = _transaction_has_cascade_effects(
-            ours_metadata,
-        ) or _transaction_has_cascade_effects(theirs_metadata)
+        has_cascade = (
+            ours_metadata.has_cascade_effects
+            or theirs_metadata.has_cascade_effects
+        )
         result.add_conflicts(
             StatementConflict(
                 kind="write_write",
@@ -80,9 +81,10 @@ def static_analysis_matching(
             ours_metadata,
             theirs_metadata,
         ):
-            has_cascade = _transaction_has_cascade_effects(
-                ours_metadata,
-            ) or _transaction_has_cascade_effects(theirs_metadata)
+            has_cascade = (
+                ours_metadata.has_cascade_effects
+                or theirs_metadata.has_cascade_effects
+            )
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
@@ -105,9 +107,10 @@ def static_analysis_matching(
             theirs_metadata,
             ours_metadata,
         ):
-            has_cascade = _transaction_has_cascade_effects(
-                theirs_metadata,
-            ) or _transaction_has_cascade_effects(ours_metadata)
+            has_cascade = (
+                theirs_metadata.has_cascade_effects
+                or ours_metadata.has_cascade_effects
+            )
             result.add_conflicts(
                 StatementConflict(
                     kind="write_read",
@@ -184,7 +187,7 @@ def write_read_candidate_indexes(
 ) -> tuple[int, ...]:
     """Return reader statement indexes that may read writer output."""
 
-    written_columns = _transaction_updated_columns(writer_metadata)
+    written_columns = writer_metadata.tables_updated_to_columns_updated
     return tuple(
         index
         for index, reader_statement in enumerate(reader_metadata.statements)
@@ -240,46 +243,6 @@ def _transaction_implicit_insert_key_conflicts(
     )
 
 
-def _transaction_updated_columns(
-    metadata: TransactionMetadata,
-) -> dict[str, set[str]]:
-    """Return explicit plus cascade-hidden transaction writes."""
-
-    return metadata.tables_updated_to_columns_updated
-
-
-def _transaction_referenced_columns(
-    metadata: TransactionMetadata,
-) -> dict[str, set[str]]:
-    """Return explicit plus cascade-hidden transaction reads."""
-
-    return metadata.tables_referenced_to_columns_referenced
-
-
-def _statement_updated_columns(
-    metadata: StatementMetadata,
-) -> dict[str, set[str]]:
-    """Return explicit plus cascade-hidden writes for one statement."""
-
-    return metadata.tables_updated_to_columns_updated
-
-
-def _transaction_has_cascade_effects(
-    metadata: TransactionMetadata,
-) -> bool:
-    """Return whether any statement has cascade-hidden reads or writes."""
-
-    return metadata.has_cascade_effects
-
-
-def _statement_has_cascade_effects(
-    metadata: StatementMetadata,
-) -> bool:
-    """Return whether one statement has cascade-hidden reads or writes."""
-
-    return metadata.has_cascade_effects
-
-
 def _transaction_write_write_overlap(
     ours_metadata: TransactionMetadata,
     theirs_metadata: TransactionMetadata,
@@ -300,8 +263,8 @@ def _transaction_write_read_overlap(
     """Return whether any reader statement may read writer transaction output."""
 
     return _columns_by_table_overlap(
-        _transaction_updated_columns(writer_metadata),
-        _transaction_referenced_columns(reader_metadata),
+        writer_metadata.tables_updated_to_columns_updated,
+        reader_metadata.tables_referenced_to_columns_referenced,
     )
 
 
@@ -328,14 +291,14 @@ def _metadata_write_write_overlap(
         return True
 
     if not (
-        _statement_has_cascade_effects(ours_metadata)
-        or _statement_has_cascade_effects(theirs_metadata)
+        ours_metadata.has_cascade_effects
+        or theirs_metadata.has_cascade_effects
     ):
         return False
 
     return _columns_by_table_overlap(
-        _statement_updated_columns(ours_metadata),
-        _statement_updated_columns(theirs_metadata),
+        ours_metadata.tables_updated_to_columns_updated,
+        theirs_metadata.tables_updated_to_columns_updated,
     )
 
 

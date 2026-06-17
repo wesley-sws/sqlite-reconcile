@@ -1366,6 +1366,82 @@ def test_remaining_conflict_suppresses_already_active_constraint_resolution(
     assert conflict is None
 
 
+def test_control_replay_upsert_failure_explains_partial_support(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, score INTEGER)")
+        con.execute("INSERT INTO users (id, score) VALUES (1, 1)")
+        con.commit()
+
+    table_columns = {"users": {"id", "score"}}
+    statement = log_merge.make_logged_statement(
+        branch="theirs",
+        branch_index=0,
+        transaction_id=2,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "INSERT INTO users(id, score) VALUES (1, 5) "
+            "ON CONFLICT(id) DO UPDATE SET score=excluded.score"
+        ),
+        table_columns=table_columns,
+    )
+
+    with control_db._open_merge_working_context(
+        db_path,
+        schema_cache(table_columns),
+    ) as context:
+        failure = accepted_replay._execute_statement_on_control(
+            context,
+            statement,
+            scope="pair",
+            order_label="test replay",
+        )
+
+    assert failure is not None
+    assert failure.kind == "integrity"
+    assert "UPSERT is not fully supported" in failure.message
+    assert "control replay without ON CONFLICT failed" in failure.message
+    assert "UNIQUE constraint failed" in failure.message
+
+
+def test_control_replay_upsert_non_unique_failure_keeps_sqlite_message(tmp_path):
+    db_path = tmp_path / "base.db"
+    with closing(sqlite3.connect(db_path)) as con:
+        con.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)"
+        )
+        con.commit()
+
+    table_columns = {"users": {"id", "score"}}
+    statement = log_merge.make_logged_statement(
+        branch="theirs",
+        branch_index=0,
+        transaction_id=2,
+        committed_at="2026-01-01T00:00:00",
+        sql_text=(
+            "INSERT INTO users(id) VALUES (2) "
+            "ON CONFLICT(id) DO UPDATE SET score=excluded.score"
+        ),
+        table_columns=table_columns,
+    )
+
+    with control_db._open_merge_working_context(
+        db_path,
+        schema_cache(table_columns),
+    ) as context:
+        failure = accepted_replay._execute_statement_on_control(
+            context,
+            statement,
+            scope="pair",
+            order_label="test replay",
+        )
+
+    assert failure is not None
+    assert failure.kind == "integrity"
+    assert "UPSERT is not fully supported" not in failure.message
+    assert "NOT NULL constraint failed" in failure.message
+
+
 def test_apply_accepted_transaction_advances_live_context(tmp_path):
     db_path = tmp_path / "base.db"
     init_logged_db(db_path)
